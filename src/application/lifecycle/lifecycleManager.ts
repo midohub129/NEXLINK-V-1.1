@@ -28,11 +28,13 @@ export class LifecycleManager {
   }
 
   async startup(): Promise<void> {
+    if (this.startPromise) {
+      await this.startPromise;
+    }
     if (this.stopPromise) {
       await this.stopPromise;
     }
     if (this.phase === 'RUNNING') return;
-    if (this.startPromise) return this.startPromise;
 
     this.phase = 'STARTING';
     this.notify();
@@ -63,33 +65,37 @@ export class LifecycleManager {
   }
 
   async shutdown(): Promise<void> {
-    if (this.startPromise) {
-      await this.startPromise.catch(() => undefined);
-    }
-    if (this.phase === 'STOPPED') return;
     if (this.stopPromise) return this.stopPromise;
 
-    this.phase = 'STOPPING';
-    this.notify();
-
     this.stopPromise = (async () => {
-      const reversed = [...this.participants].reverse();
-      for (const participant of reversed) {
-        try {
-          this.logger.debug('LIFECYCLE', `إيقاف ${participant.name}`);
-          await participant.stop();
-        } catch (err) {
-          this.errorManager.capture(
-            err,
-            'LIFECYCLE',
-            `حدث خطأ أثناء إيقاف ${participant.name}.`
-          );
+      try {
+        if (this.startPromise) {
+          await this.startPromise.catch(() => undefined);
         }
+        if (this.phase === 'STOPPED') return;
+
+        this.phase = 'STOPPING';
+        this.notify();
+
+        const reversed = [...this.participants].reverse();
+        for (const participant of reversed) {
+          try {
+            this.logger.debug('LIFECYCLE', `إيقاف ${participant.name}`);
+            await participant.stop();
+          } catch (err) {
+            this.errorManager.capture(
+              err,
+              'LIFECYCLE',
+              `حدث خطأ أثناء إيقاف ${participant.name}.`
+            );
+          }
+        }
+        this.phase = 'STOPPED';
+        this.logger.info('LIFECYCLE', 'تم إيقاف الخدمات بشكل منظم');
+      } finally {
+        this.stopPromise = null;
+        this.notify();
       }
-      this.phase = 'STOPPED';
-      this.stopPromise = null;
-      this.logger.info('LIFECYCLE', 'تم إيقاف الخدمات بشكل منظم');
-      this.notify();
     })();
 
     return this.stopPromise;

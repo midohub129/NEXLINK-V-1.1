@@ -16,13 +16,7 @@ describe('SecurityManager & RotatingLogger Tests', () => {
 
     // 1. Unauthenticated -> denied even for admin role
     await assert.rejects(
-      () =>
-        security.assertAuthorized(
-          'admin',
-          'dev-1',
-          'manageDevices',
-          'ربط جهاز'
-        ),
+      () => security.assertAuthorized('admin', 'dev-1', 'manageDevices', 'ربط جهاز'),
       (err: unknown) =>
         err instanceof SecurityError && err.code === 'SESSION_UNAUTHENTICATED'
     );
@@ -37,13 +31,7 @@ describe('SecurityManager & RotatingLogger Tests', () => {
     );
 
     await assert.rejects(
-      () =>
-        security.assertAuthorized(
-          'basic',
-          'dev-1',
-          'deleteEvents',
-          'حذف السجل'
-        ),
+      () => security.assertAuthorized('basic', 'dev-1', 'deleteEvents', 'حذف السجل'),
       (err: unknown) =>
         err instanceof SecurityError && err.code === 'AUTHORIZATION_DENIED'
     );
@@ -57,7 +45,9 @@ describe('SecurityManager & RotatingLogger Tests', () => {
 
     const audits = security.getAuditLog();
     assert.equal(audits.length, 3);
-    assert.ok(audits.every((a) => a.action === 'ACCESS_DENIED' && a.outcome === 'DENIED'));
+    assert.ok(
+      audits.every((a) => a.action === 'ACCESS_DENIED' && a.outcome === 'DENIED')
+    );
   });
 
   it('rotates logs via ring buffer and redacts sensitive fields', () => {

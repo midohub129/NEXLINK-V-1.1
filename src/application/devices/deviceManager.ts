@@ -13,15 +13,9 @@ import type {
   LinkedDevice,
   PairingRequest,
 } from '../../domain/models/device';
+import type { RelayServerSession } from '../../domain/models/security';
 import type { SecurityManager } from '../security/securityManager';
 import type { SettingsService } from '../settings/settingsService';
-
-function generatePublicDeviceId(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
-  }
-  return `dev-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-}
 
 export class DeviceManager implements ILifecycleParticipant {
   readonly name = 'DeviceManager';
@@ -36,8 +30,10 @@ export class DeviceManager implements ILifecycleParticipant {
   private identity: DeviceIdentityProfile | null = null;
   private linkedDevices: LinkedDevice[] = [];
   private activePairingRequest: PairingRequest | null = null;
+  private pendingApprovals: PairingRequest[] = [];
   private listeners = new Set<() => void>();
   private unsubTransport: (() => void) | null = null;
+  private unsubPairing: (() => void) | null = null;
 
   constructor(deps: {
     deviceRepo: IDeviceRepository;
@@ -55,6 +51,16 @@ export class DeviceManager implements ILifecycleParticipant {
     this.logger = deps.logger;
   }
 
+  private generatePublicDeviceId(): string {
+    if (
+      typeof globalThis.crypto !== 'undefined' &&
+      typeof globalThis.crypto.randomUUID === 'function'
+    ) {
+      return globalThis.crypto.randomUUID();
+    }
+    return `dev-${this.crypto.randomHex(16)}`;
+  }
+
   async start(): Promise<void> {
     await this.deviceRepo.initialize();
 
@@ -63,20 +69,23 @@ export class DeviceManager implements ILifecycleParticipant {
 
     if (!saved) {
       saved = {
-        publicId: generatePublicDeviceId(),
+        publicId: this.generatePublicDeviceId(),
         cryptoKeyId: keyPair.cryptoKeyId,
         publicKeyJwk: keyPair.publicKeyJwk,
+        ecdhPublicKeyJwk: keyPair.ecdhPublicKeyJwk,
         createdAt: Date.now(),
       };
       await this.deviceRepo.saveIdentity(saved);
     } else if (
       saved.cryptoKeyId !== keyPair.cryptoKeyId ||
-      (!saved.publicKeyJwk && keyPair.publicKeyJwk)
+      (!saved.publicKeyJwk && keyPair.publicKeyJwk) ||
+      (!saved.ecdhPublicKeyJwk && keyPair.ecdhPublicKeyJwk)
     ) {
       saved = {
         ...saved,
         cryptoKeyId: keyPair.cryptoKeyId,
         publicKeyJwk: keyPair.publicKeyJwk,
+        ecdhPublicKeyJwk: keyPair.ecdhPublicKeyJwk,
       };
       await this.deviceRepo.saveIdentity(saved);
     }
@@ -90,7 +99,16 @@ export class DeviceManager implements ILifecycleParticipant {
       });
     }
 
-    this.logger.info('DEVICES', 'تمت تهيئة هوية الجهاز المنفصلة', {
+    if (!this.unsubPairing) {
+      this.unsubPairing = this.transport.subscribePairingUpdates(() => {
+        if (this.transport.getState() === 'CONNECTED') {
+          void this.refreshLinkedDevicesFromRelay().catch(() => {});
+          void this.refreshPendingPairingApprovals().catch(() => {});
+        }
+      });
+    }
+
+    this.logger.info('DEVICES', 'تمت تهيئة هوية الجهاز المنفصلة ومفاتيح ECDH/ECDSA', {
       publicId: saved.publicId,
       cryptoKeyId: saved.cryptoKeyId,
     });
@@ -102,6 +120,10 @@ export class DeviceManager implements ILifecycleParticipant {
     if (this.unsubTransport) {
       this.unsubTransport();
       this.unsubTransport = null;
+    }
+    if (this.unsubPairing) {
+      this.unsubPairing();
+      this.unsubPairing = null;
     }
   }
 
@@ -117,8 +139,16 @@ export class DeviceManager implements ILifecycleParticipant {
     return this.activePairingRequest ? { ...this.activePairingRequest } : null;
   }
 
+  getPendingPairingApprovals(): PairingRequest[] {
+    return [...this.pendingApprovals];
+  }
+
   getConnectionState(): ConnectionState {
     return this.transport.getState();
+  }
+
+  getServerSession(): RelayServerSession | null {
+    return this.transport.getServerSession();
   }
 
   async connectRelay(role: DeviceRole, label = 'متصفح NEXLINK'): Promise<void> {
@@ -131,24 +161,30 @@ export class DeviceManager implements ILifecycleParticipant {
       );
     }
 
-    const challengePayload = `${this.identity.publicId}:${this.identity.cryptoKeyId}:${role}`;
-    const signature = await this.crypto.signPayload(challengePayload);
-
     await this.transport.connect({
       publicId: this.identity.publicId,
       cryptoKeyId: this.identity.cryptoKeyId,
       publicKeyJwk: this.identity.publicKeyJwk,
+      ecdhPublicKeyJwk: this.identity.ecdhPublicKeyJwk,
       role,
       label,
-      signature,
     });
 
-    await this.refreshLinkedDevicesFromRelay();
+    await Promise.all([
+      this.refreshLinkedDevicesFromRelay(),
+      this.refreshPendingPairingApprovals(),
+    ]);
     this.notify();
   }
 
   async disconnectRelay(): Promise<void> {
     await this.transport.disconnect();
+    this.notify();
+  }
+
+  async revokeRelaySession(): Promise<void> {
+    if (!this.identity) return;
+    await this.transport.revokeServerSession(this.identity.publicId);
     this.notify();
   }
 
@@ -175,8 +211,9 @@ export class DeviceManager implements ILifecycleParticipant {
       this.identity.cryptoKeyId
     );
     this.activePairingRequest = request;
-    this.logger.info('DEVICES', 'تم إنشاء طلب اقتران عبر خادم المرحل', {
+    this.logger.info('DEVICES', 'تم إنشاء طلب اقتران مزدوج التحقق عبر خادم المرحل', {
       expiresAt: request.expiresAt,
+      pairingId: request.pairingId,
     });
     this.notify();
     return request;
@@ -186,7 +223,7 @@ export class DeviceManager implements ILifecycleParticipant {
     pairingCode: string,
     role: DeviceRole,
     label = 'جهاز NEXLINK مرتبط'
-  ): Promise<LinkedDevice> {
+  ): Promise<PairingRequest> {
     if (!this.identity) {
       throw new TransportError(
         'IDENTITY_NOT_READY',
@@ -196,29 +233,89 @@ export class DeviceManager implements ILifecycleParticipant {
       );
     }
 
-    const challengePayload = `${this.identity.publicId}:${this.identity.cryptoKeyId}:${pairingCode}`;
-    const signature = await this.crypto.signPayload(challengePayload);
-
-    const peer = await this.transport.acceptPairingRequest(pairingCode.trim(), {
+    const req = await this.transport.acceptPairingRequest(pairingCode.trim(), {
       publicId: this.identity.publicId,
       cryptoKeyId: this.identity.cryptoKeyId,
       publicKeyJwk: this.identity.publicKeyJwk,
+      ecdhPublicKeyJwk: this.identity.ecdhPublicKeyJwk,
       role,
       label,
-      signature,
     });
 
-    await this.deviceRepo.upsertLinkedDevice(peer);
-    this.linkedDevices = await this.deviceRepo.getLinkedDevices();
+    this.logger.info(
+      'DEVICES',
+      'تم إرسال طلب قبول الاقتران وبانتظار موافقة الجهاز الرئيسي',
+      {
+        pairingId: req.pairingId,
+        targetDeviceId: req.requesterDeviceId,
+      }
+    );
+    this.notify();
+    return req;
+  }
 
-    await this.security.recordAudit({
-      action: 'DEVICE_PAIRED',
-      actorRole: role,
-      deviceId: this.identity.publicId,
-      outcome: 'ALLOWED',
-      details: `تم الاقتران الفعلي مع الجهاز ${peer.publicId} عبر المرحل`,
-    });
+  async refreshPendingPairingApprovals(): Promise<PairingRequest[]> {
+    if (!this.identity || this.transport.getState() !== 'CONNECTED') {
+      this.pendingApprovals = [];
+      return [];
+    }
+    if (this.settings.getSnapshot().role !== 'admin') {
+      this.pendingApprovals = [];
+      return [];
+    }
+    try {
+      this.pendingApprovals = await this.transport.fetchPendingPairingApprovals(
+        this.identity.publicId
+      );
+      this.notify();
+      return this.pendingApprovals;
+    } catch {
+      return this.pendingApprovals;
+    }
+  }
 
+  async confirmPairingApproval(
+    pairingId: string,
+    approve: boolean,
+    expectedResponderCryptoKeyId?: string
+  ): Promise<LinkedDevice | null> {
+    if (!this.identity) return null;
+    const role = this.settings.getSnapshot().role;
+
+    await this.security.assertAuthorized(
+      role,
+      this.identity.publicId,
+      'manageDevices',
+      approve ? 'تأكيد وقبول اقتران جهاز' : 'رفض طلب اقتران جهاز'
+    );
+
+    const peer = await this.transport.confirmPairingRequest(
+      pairingId,
+      approve,
+      expectedResponderCryptoKeyId
+    );
+
+    if (approve && peer) {
+      await this.deviceRepo.upsertLinkedDevice(peer);
+      await this.security.recordAudit({
+        action: 'PAIRING_CONFIRMED',
+        actorRole: role ?? 'none',
+        deviceId: this.identity.publicId,
+        outcome: 'ALLOWED',
+        details: `تمت الموافقة المتبادلة والتحقق من بصمة ${peer.cryptoKeyId} للجهاز ${peer.publicId}`,
+      });
+    } else {
+      await this.security.recordAudit({
+        action: 'PAIRING_REJECTED',
+        actorRole: role ?? 'none',
+        deviceId: this.identity.publicId,
+        outcome: 'DENIED',
+        details: `تم رفض طلب الاقتران ${pairingId}`,
+      });
+    }
+
+    await this.refreshPendingPairingApprovals();
+    await this.refreshLinkedDevicesFromRelay();
     this.notify();
     return peer;
   }
@@ -233,7 +330,6 @@ export class DeviceManager implements ILifecycleParticipant {
       this.identity.publicId
     );
 
-    // Sync authoritative relay state to local device repository
     for (const remote of remoteDevices) {
       await this.deviceRepo.upsertLinkedDevice(remote);
     }
@@ -249,7 +345,10 @@ export class DeviceManager implements ILifecycleParticipant {
     return this.linkedDevices;
   }
 
-  async revokeLinkedDevice(targetDeviceId: string): Promise<void> {
+  async revokeLinkedDevice(
+    targetDeviceId: string,
+    revokeDeviceTrust = false
+  ): Promise<void> {
     if (!this.identity) return;
     const role = this.settings.getSnapshot().role;
 
@@ -261,7 +360,11 @@ export class DeviceManager implements ILifecycleParticipant {
     );
 
     if (this.transport.getState() === 'CONNECTED') {
-      await this.transport.revokeDeviceLink(this.identity.publicId, targetDeviceId);
+      await this.transport.revokeDeviceLink(
+        this.identity.publicId,
+        targetDeviceId,
+        revokeDeviceTrust
+      );
     }
 
     const existing = this.linkedDevices.find((d) => d.publicId === targetDeviceId);
@@ -279,7 +382,9 @@ export class DeviceManager implements ILifecycleParticipant {
       actorRole: role ?? 'none',
       deviceId: this.identity.publicId,
       outcome: 'ALLOWED',
-      details: `تم سحب تفويض الجهاز ${targetDeviceId}`,
+      details: revokeDeviceTrust
+        ? `تم سحب تفويض الجهاز ${targetDeviceId} وإنهاء جلساته على الخادم`
+        : `تم إلغاء ارتباط الجهاز ${targetDeviceId}`,
     });
 
     this.notify();
@@ -297,7 +402,11 @@ export class DeviceManager implements ILifecycleParticipant {
     );
 
     if (this.transport.getState() === 'CONNECTED') {
-      await this.transport.revokeDeviceLink(this.identity.publicId, targetDeviceId);
+      await this.transport.revokeDeviceLink(
+        this.identity.publicId,
+        targetDeviceId,
+        false
+      );
     }
 
     await this.deviceRepo.removeLinkedDevice(targetDeviceId);

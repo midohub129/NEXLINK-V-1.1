@@ -151,9 +151,13 @@ export function NotificationHistoryView({
       setFeedback('خادم المرحل غير متصل؛ ستبقى الأحداث في طابور PENDING.');
     } else if (summary.skippedReason === 'SESSION_EXPIRED') {
       setFeedback('انتهت الجلسة؛ جدّد الجلسة لتنفيذ المزامنة.');
+    } else if (summary.skippedReason === 'UNPAIRED') {
+      setFeedback(
+        'لا يوجد جهاز مقترن موثوق لإرسال الأحداث إليه عبر E2EE. اربط جهازاً أولاً.'
+      );
     } else {
       setFeedback(
-        `نتيجة المزامنة: تمت معالجة ${summary.attempted} · نجاح مؤكد ${summary.synced} · مكرر ${summary.duplicates} · فشل ${summary.failed}`
+        `نتيجة المزامنة: تمت معالجة ${summary.attempted} · تسليم مؤكد ${summary.synced} · بانتظار الطرف المقابل ${summary.awaitingPeerAck} · مكرر ${summary.duplicates} · فشل ${summary.failed}`
       );
     }
   };
@@ -548,13 +552,31 @@ export function NotificationHistoryView({
                     <span className="font-mono text-xs font-normal text-[#A5B1C6] tabular-nums">
                       #{event.id}
                     </span>
-                    {event.encrypted && (
+                    {event.e2eeProtected ? (
                       <>
                         <span aria-hidden="true" className="text-[#A5B1C6]">
                           ·
                         </span>
                         <span className="text-xs font-normal text-emerald-400">
-                          AES-256-GCM
+                          E2EE (ECDH+HKDF+AES-GCM)
+                        </span>
+                      </>
+                    ) : event.encrypted ? (
+                      <>
+                        <span aria-hidden="true" className="text-[#A5B1C6]">
+                          ·
+                        </span>
+                        <span className="text-xs font-normal text-[#4B91FF]">
+                          مشفّر محلياً (AES-GCM)
+                        </span>
+                      </>
+                    ) : (
+                      <>
+                        <span aria-hidden="true" className="text-[#A5B1C6]">
+                          ·
+                        </span>
+                        <span className="text-xs font-normal text-[#A5B1C6]">
+                          غير مشفّر
                         </span>
                       </>
                     )}
@@ -573,6 +595,11 @@ export function NotificationHistoryView({
                       }
                     >
                       الحالة: {getStatusLabel(event.status)}
+                      {event.status === 'IN_PROGRESS' && event.relayAcceptedAt
+                        ? ' (بانتظار تأكيد الطرف المقابل)'
+                        : event.status === 'SYNCED' && event.deliveredAt
+                          ? ' (استلمه الطرف المقابل)'
+                          : ''}
                     </span>
                     <span aria-hidden="true" className="text-[#A5B1C6]">
                       ·

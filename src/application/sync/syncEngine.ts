@@ -1,4 +1,4 @@
-import { SyncError } from '../../domain/errors/appError';
+import { SecurityError, SyncError } from '../../domain/errors/appError';
 import type { ISyncEventRepository } from '../../domain/interfaces/repositories';
 import type {
   ICryptoProvider,
@@ -6,6 +6,7 @@ import type {
   ILogger,
   ITransportClient,
 } from '../../domain/interfaces/services';
+import type { LinkedDevice } from '../../domain/models/device';
 import type {
   NotificationPayload,
   SyncEvent,
@@ -64,8 +65,10 @@ export class SyncEngine implements ILifecycleParticipant {
   private isProcessing = false;
   private lastSuccessfulSyncAt: number | null = null;
   private lastRunSummary: SyncRunSummary | null = null;
+  private seenE2eeNonces = new Set<string>();
   private listeners = new Set<() => void>();
   private unsubInbound: (() => void) | null = null;
+  private unsubDeliveryAcks: (() => void) | null = null;
 
   constructor(deps: {
     repo: ISyncEventRepository;
@@ -91,10 +94,8 @@ export class SyncEngine implements ILifecycleParticipant {
     if (recoveredCount > 0) {
       this.logger.warn(
         'SYNC',
-        'تمت استعادة أحداث متوقفة إلى PENDING بعد إعادة التشغيل',
-        {
-          recoveredCount,
-        }
+        'تمت استعادة أحداث غير مؤكدة إلى PENDING بعد إعادة التشغيل لضمان عدم الفقدان',
+        { recoveredCount }
       );
     }
 
@@ -106,6 +107,14 @@ export class SyncEngine implements ILifecycleParticipant {
       });
     }
 
+    if (!this.unsubDeliveryAcks) {
+      this.unsubDeliveryAcks = this.transport.subscribeDeliveryAcks(
+        (clientEventIds, serverTimestamp) => {
+          void this.handleDeliveryAcks(clientEventIds, serverTimestamp);
+        }
+      );
+    }
+
     this.notify();
   }
 
@@ -113,6 +122,10 @@ export class SyncEngine implements ILifecycleParticipant {
     if (this.unsubInbound) {
       this.unsubInbound();
       this.unsubInbound = null;
+    }
+    if (this.unsubDeliveryAcks) {
+      this.unsubDeliveryAcks();
+      this.unsubDeliveryAcks = null;
     }
     this.isProcessing = false;
     this.notify();
@@ -132,6 +145,25 @@ export class SyncEngine implements ILifecycleParticipant {
 
   isSyncRunning(): boolean {
     return this.isProcessing;
+  }
+
+  private resolveTargetPeer(): LinkedDevice | null {
+    const currentSettings = this.settings.getSnapshot();
+    const peers = this.devices
+      .getLinkedDevices()
+      .filter(
+        (d) =>
+          d.pairingState === 'PAIRED' &&
+          d.verifiedByRelay &&
+          Boolean(d.publicKeyJwk) &&
+          Boolean(d.ecdhPublicKeyJwk)
+      );
+
+    if (peers.length === 0) return null;
+    if (currentSettings.targetDeviceId) {
+      return peers.find((p) => p.publicId === currentSettings.targetDeviceId) ?? null;
+    }
+    return peers[0];
   }
 
   async enqueueNotification(input: EnqueueNotificationInput): Promise<EnqueueOutcome> {
@@ -205,6 +237,8 @@ export class SyncEngine implements ILifecycleParticipant {
       idempotencyKey,
       notificationKey,
       payloadHash,
+      sourceDeviceId: deviceId,
+      e2eeProtected: false,
       createdAt: postedAt,
     });
 
@@ -217,7 +251,124 @@ export class SyncEngine implements ILifecycleParticipant {
     return { status: 'SAVED', event };
   }
 
-  private async ingestInboundEvent(remoteEvent: SyncEvent): Promise<void> {
+  async handleDeliveryAcks(
+    clientEventIds: number[],
+    serverTimestamp = Date.now()
+  ): Promise<void> {
+    if (clientEventIds.length === 0) return;
+    let changed = false;
+    for (const id of clientEventIds) {
+      const existing = await this.repo.findById(id);
+      if (existing && existing.status === 'IN_PROGRESS') {
+        await this.repo.updateEvent(id, {
+          status: 'SYNCED',
+          deliveredAt: serverTimestamp,
+          syncedAt: serverTimestamp,
+          nextRetryAt: null,
+          lastError: null,
+        });
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.lastSuccessfulSyncAt = serverTimestamp;
+      this.eventsCache = await this.repo.getAll();
+      this.notify();
+    }
+  }
+
+  async pullInboundEvents(): Promise<number> {
+    const identity = this.devices.getIdentity();
+    if (!identity || this.transport.getState() !== 'CONNECTED') return 0;
+
+    const inbound = await this.transport.fetchInboundEvents(identity.publicId);
+    let ingested = 0;
+    for (const evt of inbound) {
+      const ok = await this.ingestInboundEvent(evt);
+      if (ok) ingested += 1;
+    }
+    return ingested;
+  }
+
+  async ingestInboundEvent(remoteEvent: SyncEvent): Promise<boolean> {
+    const identity = this.devices.getIdentity();
+    const role = this.settings.getSnapshot().role ?? 'none';
+    if (!identity) return false;
+
+    const envelope = remoteEvent.e2eeEnvelope;
+    if (!envelope) {
+      await this.security.recordAudit({
+        action: 'E2EE_DECRYPT_FAILED',
+        actorRole: role,
+        deviceId: identity.publicId,
+        outcome: 'DENIED',
+        details: `رفض حدث وارد #${remoteEvent.id} لعدم وجود مغلف E2EE`,
+      });
+      return false;
+    }
+
+    if (this.seenE2eeNonces.has(envelope.messageNonce)) {
+      await this.security.recordAudit({
+        action: 'REPLAY_BLOCKED',
+        actorRole: role,
+        deviceId: identity.publicId,
+        outcome: 'DENIED',
+        details: `تم رفض إعادة إرسال رسالة E2EE بالرمز المتكرر ${envelope.messageNonce.slice(0, 12)}`,
+      });
+      return false;
+    }
+
+    const senderPeer = this.devices
+      .getLinkedDevices()
+      .find(
+        (d) =>
+          d.publicId === envelope.senderDeviceId &&
+          d.pairingState === 'PAIRED' &&
+          d.verifiedByRelay &&
+          d.publicKeyJwk &&
+          d.ecdhPublicKeyJwk
+      );
+
+    if (
+      !senderPeer ||
+      !senderPeer.publicKeyJwk ||
+      !senderPeer.ecdhPublicKeyJwk ||
+      senderPeer.cryptoKeyId !== envelope.senderCryptoKeyId
+    ) {
+      await this.security.recordAudit({
+        action: 'ACCESS_DENIED',
+        actorRole: role,
+        deviceId: identity.publicId,
+        outcome: 'DENIED',
+        details: `رفض رسالة من مرسل غير موثوق أو مسحوب الصلاحية (${envelope.senderDeviceId})`,
+      });
+      return false;
+    }
+
+    let decryptedPlaintext: string;
+    try {
+      decryptedPlaintext = await this.crypto.decryptFromPeer({
+        envelope,
+        senderEcdsaPublicKeyJwk: senderPeer.publicKeyJwk,
+        senderEcdhPublicKeyJwk: senderPeer.ecdhPublicKeyJwk,
+        expectedRecipientDeviceId: identity.publicId,
+        expectedRecipientCryptoKeyId: identity.cryptoKeyId,
+      });
+    } catch (err) {
+      const msg =
+        err instanceof SecurityError ? err.message : 'فشل التحقق وفك التشفير E2EE';
+      await this.security.recordAudit({
+        action: 'E2EE_DECRYPT_FAILED',
+        actorRole: role,
+        deviceId: identity.publicId,
+        outcome: 'DENIED',
+        details: `${msg} (مرسل: ${senderPeer.publicId})`,
+      });
+      return false;
+    }
+
+    this.seenE2eeNonces.add(envelope.messageNonce);
+
     const existing = await this.repo.findRecentDuplicate(
       remoteEvent.type,
       remoteEvent.notificationKey ?? remoteEvent.idempotencyKey,
@@ -225,33 +376,66 @@ export class SyncEngine implements ILifecycleParticipant {
       DEDUP_WINDOW_MS * 10,
       Date.now()
     );
-    if (existing) return;
+
+    if (existing) {
+      if (this.transport.getState() === 'CONNECTED') {
+        await this.transport
+          .acknowledgeInboundDelivery(identity.publicId, [remoteEvent.id])
+          .catch(() => {});
+      }
+      return true;
+    }
 
     const inserted = await this.repo.insert({
       type: remoteEvent.type,
-      payload: remoteEvent.payload,
+      payload: decryptedPlaintext,
       idempotencyKey: remoteEvent.idempotencyKey,
       notificationKey: remoteEvent.notificationKey,
       payloadHash: remoteEvent.payloadHash,
+      sourceDeviceId: senderPeer.publicId,
+      targetDeviceId: identity.publicId,
+      e2eeProtected: true,
       createdAt: remoteEvent.createdAt,
     });
+
+    const now = Date.now();
     await this.repo.updateEvent(inserted.id, {
       status: 'SYNCED',
-      syncedAt: Date.now(),
+      syncedAt: now,
+      deliveredAt: now,
+      e2eeProtected: true,
     });
+
+    if (this.transport.getState() === 'CONNECTED') {
+      await this.transport
+        .acknowledgeInboundDelivery(identity.publicId, [remoteEvent.id])
+        .catch(() => {});
+    }
+
+    await this.security.recordAudit({
+      action: 'E2EE_VERIFIED',
+      actorRole: role,
+      deviceId: identity.publicId,
+      outcome: 'ALLOWED',
+      details: `تم فك تشفير حدث وارد وتوثيق مصدره E2EE من ${senderPeer.publicId}`,
+    });
+
     this.eventsCache = await this.repo.getAll();
     this.notify();
+    return true;
   }
 
   /**
    * Executes one full synchronization cycle in chronological FIFO order.
-   * Never marks any event SYNCED without explicit server/relay confirmation.
+   * Requires an active verified paired peer, encrypts every event E2EE before dispatch,
+   * and respects the configured SyncDeliveryPolicy (`PEER_CONFIRMED` vs `RELAY_QUEUED`).
    */
   async runSyncCycle(nowMs = Date.now()): Promise<SyncRunSummary> {
     if (this.isProcessing) {
       const summary: SyncRunSummary = {
         attempted: 0,
         synced: 0,
+        awaitingPeerAck: 0,
         duplicates: 0,
         failed: 0,
         skippedReason: 'LOCKED',
@@ -267,6 +451,7 @@ export class SyncEngine implements ILifecycleParticipant {
       const summary: SyncRunSummary = {
         attempted: 0,
         synced: 0,
+        awaitingPeerAck: 0,
         duplicates: 0,
         failed: 0,
         skippedReason: 'SESSION_EXPIRED',
@@ -281,6 +466,7 @@ export class SyncEngine implements ILifecycleParticipant {
       const summary: SyncRunSummary = {
         attempted: 0,
         synced: 0,
+        awaitingPeerAck: 0,
         duplicates: 0,
         failed: 0,
         skippedReason: 'OFFLINE',
@@ -291,19 +477,45 @@ export class SyncEngine implements ILifecycleParticipant {
       return summary;
     }
 
-    const activePeer = this.devices
-      .getLinkedDevices()
-      .find((d) => d.pairingState === 'PAIRED' && d.verifiedByRelay);
+    const activePeer = this.resolveTargetPeer();
+    if (!activePeer || !activePeer.publicKeyJwk || !activePeer.ecdhPublicKeyJwk) {
+      const summary: SyncRunSummary = {
+        attempted: 0,
+        synced: 0,
+        awaitingPeerAck: 0,
+        duplicates: 0,
+        failed: 0,
+        skippedReason: 'UNPAIRED',
+        completedAt: nowMs,
+      };
+      this.lastRunSummary = summary;
+      this.notify();
+      return summary;
+    }
 
     this.isProcessing = true;
     this.notify();
 
     try {
+      // Refresh delivery receipts for relay-accepted IN_PROGRESS events
+      if (currentSettings.syncDeliveryPolicy === 'PEER_CONFIRMED') {
+        const waitingDelivery = (await this.repo.getByStatus('IN_PROGRESS'))
+          .filter((e) => e.relayAcceptedAt != null)
+          .map((e) => e.id);
+        if (waitingDelivery.length > 0) {
+          const delivered = await this.transport
+            .fetchSyncDeliveryStatus(identity.publicId, waitingDelivery)
+            .catch(() => []);
+          await this.handleDeliveryAcks(delivered, Date.now());
+        }
+      }
+
       const dueEvents = await this.repo.getDuePendingEvents(nowMs);
       if (dueEvents.length === 0) {
         const emptySummary: SyncRunSummary = {
           attempted: 0,
           synced: 0,
+          awaitingPeerAck: 0,
           duplicates: 0,
           failed: 0,
           completedAt: Date.now(),
@@ -312,22 +524,51 @@ export class SyncEngine implements ILifecycleParticipant {
         return emptySummary;
       }
 
-      // Preserve chronological FIFO order
       const orderedBatch = [...dueEvents].sort(
         (a, b) => a.createdAt - b.createdAt || a.id - b.id
       );
 
       for (const evt of orderedBatch) {
-        await this.repo.updateEvent(evt.id, { status: 'IN_PROGRESS' });
+        await this.repo.updateEvent(evt.id, {
+          status: 'IN_PROGRESS',
+          targetDeviceId: activePeer.publicId,
+        });
       }
       this.eventsCache = await this.repo.getAll();
       this.notify();
 
+      const sessionId =
+        this.transport.getServerSession()?.sessionId ??
+        this.security.getSession()?.sessionId ??
+        'e2ee-session';
+
       try {
+        const outboundBatch: SyncEvent[] = [];
+        for (const evt of orderedBatch) {
+          const e2eeEnvelope = await this.crypto.encryptForPeer({
+            plaintext: evt.payload,
+            senderDeviceId: identity.publicId,
+            recipientDeviceId: activePeer.publicId,
+            senderCryptoKeyId: identity.cryptoKeyId,
+            recipientCryptoKeyId: activePeer.cryptoKeyId,
+            recipientEcdhPublicKeyJwk: activePeer.ecdhPublicKeyJwk,
+            sessionId,
+            idempotencyKey: evt.idempotencyKey,
+          });
+          outboundBatch.push({
+            ...evt,
+            payload: '[E2EE_CIPHERTEXT]',
+            sourceDeviceId: identity.publicId,
+            targetDeviceId: activePeer.publicId,
+            e2eeProtected: true,
+            e2eeEnvelope,
+          });
+        }
+
         const ack = await this.transport.sendSyncBatch(
           identity.publicId,
-          activePeer?.publicId ?? null,
-          orderedBatch
+          activePeer.publicId,
+          outboundBatch
         );
 
         if (!ack.acknowledged) {
@@ -341,15 +582,36 @@ export class SyncEngine implements ILifecycleParticipant {
 
         const acceptedSet = new Set(ack.acceptedIds);
         const duplicateSet = new Set(ack.duplicateIds);
+        const deliveredSet = new Set(ack.deliveredIds ?? []);
         let synced = 0;
+        let awaitingPeerAck = 0;
         let duplicates = 0;
         let failed = 0;
 
         for (const evt of orderedBatch) {
-          if (acceptedSet.has(evt.id) || duplicateSet.has(evt.id)) {
+          const acceptedOrDuplicate =
+            acceptedSet.has(evt.id) || duplicateSet.has(evt.id);
+          if (!acceptedOrDuplicate) {
+            failed += 1;
+            await this.scheduleRetryOrFail(
+              evt,
+              currentSettings.maxSyncRetries,
+              'لم يدرج الخادم الحدث ضمن قائمة التأكيد.'
+            );
+            continue;
+          }
+
+          if (
+            deliveredSet.has(evt.id) ||
+            currentSettings.syncDeliveryPolicy === 'RELAY_QUEUED'
+          ) {
             await this.repo.updateEvent(evt.id, {
               status: 'SYNCED',
               syncedAt: ack.serverTimestamp,
+              relayAcceptedAt: ack.serverTimestamp,
+              deliveredAt: deliveredSet.has(evt.id) ? ack.serverTimestamp : null,
+              targetDeviceId: activePeer.publicId,
+              e2eeProtected: true,
               nextRetryAt: null,
               lastError: null,
             });
@@ -359,30 +621,39 @@ export class SyncEngine implements ILifecycleParticipant {
               synced += 1;
             }
           } else {
-            failed += 1;
-            await this.scheduleRetryOrFail(
-              evt,
-              currentSettings.maxSyncRetries,
-              'لم يدرج الخادم الحدث ضمن قائمة التأكيد.'
-            );
+            await this.repo.updateEvent(evt.id, {
+              status: 'IN_PROGRESS',
+              relayAcceptedAt: ack.serverTimestamp,
+              targetDeviceId: activePeer.publicId,
+              e2eeProtected: true,
+              nextRetryAt: null,
+              lastError: null,
+            });
+            if (duplicateSet.has(evt.id)) {
+              duplicates += 1;
+            } else {
+              awaitingPeerAck += 1;
+            }
           }
         }
 
-        if (synced > 0 || duplicates > 0) {
+        if (synced > 0) {
           this.lastSuccessfulSyncAt = ack.serverTimestamp;
         }
 
         const summary: SyncRunSummary = {
           attempted: orderedBatch.length,
           synced,
+          awaitingPeerAck,
           duplicates,
           failed,
           completedAt: Date.now(),
         };
         this.lastRunSummary = summary;
-        this.logger.info('SYNC', 'اكتملت دورة المزامنة بتأكيد الخادم', {
+        this.logger.info('SYNC', 'اكتملت دورة إرسال E2EE عبر المرحل', {
           attempted: summary.attempted,
           synced: summary.synced,
+          awaitingPeerAck: summary.awaitingPeerAck,
           duplicates: summary.duplicates,
           failed: summary.failed,
         });
@@ -395,6 +666,7 @@ export class SyncEngine implements ILifecycleParticipant {
         const failSummary: SyncRunSummary = {
           attempted: orderedBatch.length,
           synced: 0,
+          awaitingPeerAck: 0,
           duplicates: 0,
           failed: orderedBatch.length,
           completedAt: Date.now(),

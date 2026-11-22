@@ -25,11 +25,13 @@ import type {
 } from '../../domain/models/device';
 import type { SystemHealthSnapshot } from '../../domain/models/health';
 import type {
+  RelayServerSession,
   RoleCapabilities,
   SecurityAuditAction,
   SecurityAuditEntry,
 } from '../../domain/models/security';
 import type { AppSettings } from '../../domain/models/settings';
+import type { SyncDeliveryPolicy } from '../../domain/models/syncEvent';
 import { formatForegroundDuration } from '../../infrastructure/datasources/deviceDataSources';
 import type { DashboardModalType } from '../types/ui';
 
@@ -42,8 +44,10 @@ interface ActionModalProps {
   connectionState: ConnectionState;
   linkedDevices: LinkedDevice[];
   activePairingRequest: PairingRequest | null;
+  pendingPairingApprovals: PairingRequest[];
   sessionValid: boolean;
   remainingSessionSeconds: number;
+  serverSession: RelayServerSession | null;
   cryptoSupported: boolean;
   health: SystemHealthSnapshot;
   auditEntries: SecurityAuditEntry[];
@@ -65,9 +69,14 @@ interface ActionModalProps {
   onConnectRelay: () => Promise<void>;
   onDisconnectRelay: () => Promise<void>;
   onCreatePairingRequest: () => Promise<PairingRequest>;
-  onAcceptPairingCode: (code: string, label: string) => Promise<LinkedDevice>;
+  onAcceptPairingCode: (code: string, label: string) => Promise<PairingRequest>;
+  onConfirmPairingApproval: (
+    pairingId: string,
+    approve: boolean,
+    expectedResponderCryptoKeyId?: string
+  ) => Promise<LinkedDevice | null>;
   onRefreshLinkedDevices: () => Promise<void>;
-  onRevokeLinkedDevice: (publicId: string) => Promise<void>;
+  onRevokeLinkedDevice: (publicId: string, revokeTrust?: boolean) => Promise<void>;
   onRemoveLinkedDevice: (publicId: string) => Promise<void>;
   onExportBackupJson: () => Promise<string>;
   onRestoreBackupJson: (raw: string) => Promise<void>;
@@ -109,8 +118,18 @@ function getAuditActionLabel(action: SecurityAuditAction): string {
       return 'استعادة نسخة احتياطية';
     case 'DEVICE_PAIRED':
       return 'اقتران جهاز';
+    case 'PAIRING_CONFIRMED':
+      return 'موافقة متبادلة على الاقتران';
+    case 'PAIRING_REJECTED':
+      return 'رفض طلب اقتران';
     case 'DEVICE_REVOKED':
       return 'سحب ثقة جهاز';
+    case 'E2EE_VERIFIED':
+      return 'توثيق وفك تشفير E2EE';
+    case 'E2EE_DECRYPT_FAILED':
+      return 'فشل التحقق أو فك تشفير E2EE';
+    case 'REPLAY_BLOCKED':
+      return 'منع هجوم إعادة الإرسال';
     case 'SECURE_WIPE':
       return 'مسح آمن';
   }
@@ -125,8 +144,10 @@ export function ActionModal({
   connectionState,
   linkedDevices,
   activePairingRequest,
+  pendingPairingApprovals,
   sessionValid,
   remainingSessionSeconds,
+  serverSession,
   cryptoSupported,
   health,
   auditEntries,
@@ -149,6 +170,7 @@ export function ActionModal({
   onDisconnectRelay,
   onCreatePairingRequest,
   onAcceptPairingCode,
+  onConfirmPairingApproval,
   onRefreshLinkedDevices,
   onRevokeLinkedDevice,
   onRemoveLinkedDevice,
@@ -176,6 +198,12 @@ export function ActionModal({
   );
   const [maxRetriesStr, setMaxRetriesStr] = useState(String(settings.maxSyncRetries));
   const [relayEndpointInput, setRelayEndpointInput] = useState(settings.relayEndpoint);
+  const [deliveryPolicyInput, setDeliveryPolicyInput] = useState<SyncDeliveryPolicy>(
+    settings.syncDeliveryPolicy
+  );
+  const [targetDeviceInput, setTargetDeviceInput] = useState(
+    settings.targetDeviceId ?? ''
+  );
 
   // Backup state
   const [backupPreview, setBackupPreview] = useState('');
@@ -185,6 +213,8 @@ export function ActionModal({
     setSyncIntervalSecStr(String(Math.round(settings.syncIntervalMs / 1000)));
     setMaxRetriesStr(String(settings.maxSyncRetries));
     setRelayEndpointInput(settings.relayEndpoint);
+    setDeliveryPolicyInput(settings.syncDeliveryPolicy);
+    setTargetDeviceInput(settings.targetDeviceId ?? '');
   }, [settings]);
 
   useEffect(() => {
@@ -500,6 +530,65 @@ export function ActionModal({
                   </span>
                 </div>
               )}
+              {capabilities.manageDevices && pendingPairingApprovals.length > 0 && (
+                <div className="space-y-2 pt-2 border-t border-white/10">
+                  <p className="text-xs font-bold text-[#FFBE50]">
+                    طلبات بانتظار موافقتك المتبادلة ({pendingPairingApprovals.length})
+                  </p>
+                  {pendingPairingApprovals.map((pending) => (
+                    <div
+                      key={pending.pairingId}
+                      className="p-3 bg-[#192131] border border-[#FFBE50]/40 rounded-lg flex flex-wrap items-center justify-between gap-3"
+                    >
+                      <div className="min-w-0">
+                        <p className="text-xs font-bold text-white">
+                          {pending.responderLabel ?? 'جهاز طالب اقتران'}
+                        </p>
+                        <p className="font-mono text-[11px] text-[#A5B1C6] break-all mt-0.5">
+                          Device: {pending.responderDeviceId}
+                        </p>
+                        <p className="font-mono text-[11px] text-[#4B91FF] break-all mt-0.5">
+                          بصمة المفتاح: {pending.responderCryptoKeyId}
+                        </p>
+                      </div>
+                      <div className="flex gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void runAction(async () => {
+                              const peer = await onConfirmPairingApproval(
+                                pending.pairingId,
+                                true,
+                                pending.responderCryptoKeyId
+                              );
+                              if (peer) {
+                                setStatusMessage(
+                                  `تم الاقتران المتبادل والمصادقة مع ${peer.label}`
+                                );
+                              }
+                            })
+                          }
+                          className="min-h-[36px] px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-lg cursor-pointer"
+                        >
+                          تأكيد وقبول
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void runAction(async () => {
+                              await onConfirmPairingApproval(pending.pairingId, false);
+                              setStatusMessage('تم رفض طلب الاقتران.');
+                            })
+                          }
+                          className="min-h-[36px] px-3 py-1.5 bg-[#243047] hover:bg-red-900/50 text-red-300 text-xs font-semibold rounded-lg cursor-pointer"
+                        >
+                          رفض
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
 
             {/* Enter Pairing Code */}
@@ -515,13 +604,13 @@ export function ActionModal({
                     if (connectionState !== 'CONNECTED') {
                       await onConnectRelay();
                     }
-                    const peer = await onAcceptPairingCode(
+                    const req = await onAcceptPairingCode(
                       pairingCodeInput.trim(),
                       deviceLabelInput.trim() || 'متصفح NEXLINK'
                     );
                     setPairingCodeInput('');
                     setStatusMessage(
-                      `تم تأكيد الاقتران الفعلي مع ${peer.label} (${peer.publicId.slice(0, 8)}...)`
+                      `تم إرسال طلب الاقتران (${req.pairingId.slice(0, 12)}...) — بانتظار موافقة الجهاز الرئيسي والتحقق المتبادل من البصمة.`
                     );
                   } finally {
                     setPairingBusy(false);
@@ -530,7 +619,7 @@ export function ActionModal({
               }}
               className="bg-[#0D121E] rounded-lg p-4 space-y-3"
             >
-              <p className="text-sm font-bold text-white">قبول اقتران عبر الرمز</p>
+              <p className="text-sm font-bold text-white">إرسال طلب اقتران عبر الرمز</p>
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                 <input
                   type="text"
@@ -554,7 +643,7 @@ export function ActionModal({
                   className="min-h-[44px] px-4 py-2 bg-[#4B91FF] hover:bg-[#3a7ee8] disabled:opacity-50 text-white text-xs font-bold rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer"
                 >
                   <Link2 className="w-4 h-4" />
-                  تأكيد الاقتران
+                  إرسال للموافقة المتبادلة
                 </button>
               </div>
             </form>
@@ -602,22 +691,39 @@ export function ActionModal({
                           }`}
                         >
                           {dev.pairingState === 'PAIRED' && dev.verifiedByRelay
-                            ? 'مقترن ومؤكد من المرحل'
+                            ? 'مقترن ومؤكد عبر المرحل (E2EE جاهز)'
                             : 'تم سحب التفويض'}
                         </p>
                       </div>
 
-                      <div className="flex gap-2">
+                      <div className="flex flex-wrap gap-2">
                         {dev.pairingState === 'PAIRED' && (
-                          <button
-                            type="button"
-                            onClick={() =>
-                              void runAction(() => onRevokeLinkedDevice(dev.publicId))
-                            }
-                            className="min-h-[36px] px-3 py-1.5 bg-[#243047] hover:bg-red-900/50 text-red-300 text-xs font-semibold rounded-lg cursor-pointer"
-                          >
-                            سحب الثقة
-                          </button>
+                          <>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void runAction(() =>
+                                  onRevokeLinkedDevice(dev.publicId, false)
+                                )
+                              }
+                              className="min-h-[36px] px-3 py-1.5 bg-[#243047] hover:bg-red-900/50 text-red-300 text-xs font-semibold rounded-lg cursor-pointer"
+                            >
+                              إلغاء الارتباط
+                            </button>
+                            {capabilities.manageDevices && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void runAction(() =>
+                                    onRevokeLinkedDevice(dev.publicId, true)
+                                  )
+                                }
+                                className="min-h-[36px] px-3 py-1.5 bg-red-900/40 hover:bg-red-900/70 text-red-200 text-xs font-semibold rounded-lg cursor-pointer"
+                              >
+                                سحب الثقة نهائياً
+                              </button>
+                            )}
+                          </>
                         )}
                         {capabilities.manageDevices && (
                           <button
@@ -694,7 +800,7 @@ export function ActionModal({
                   <div className="pt-3 border-t border-white/10 flex flex-wrap items-center justify-between gap-3">
                     <div>
                       <p className="text-xs text-[#A5B1C6]">
-                        صلاحية الجلسة (AuthN — في الذاكرة فقط)
+                        صلاحية الجلسة المحلية (LOCAL_UI — في الذاكرة فقط)
                       </p>
                       <p
                         className={`text-sm font-bold tabular-nums mt-0.5 ${
@@ -704,6 +810,12 @@ export function ActionModal({
                         {sessionValid
                           ? `نشطة · متبقي ${formatDurationSeconds(remainingSessionSeconds)}`
                           : 'منتهية الصلاحية — العمليات الحساسة متوقفة'}
+                      </p>
+                      <p className="text-[11px] text-[#A5B1C6] mt-1 font-mono">
+                        جلسة خادم المرحل (RELAY_SERVER):{' '}
+                        {serverSession
+                          ? `مصادقة نشطة (${serverSession.sessionId.slice(0, 12)}...)`
+                          : 'غير مصادق عليها حالياً'}
                       </p>
                     </div>
                     <div className="flex flex-wrap gap-2">
@@ -736,7 +848,7 @@ export function ActionModal({
                   </div>
                   <p className="text-xs text-[#A5B1C6] leading-relaxed">
                     {cryptoSupported
-                      ? 'يتم حفظ مفتاح AES-256-GCM ومفتاح التوقيع ECDSA P-256 كعناصر غير قابلة للاستخراج داخل nexlink_keystore المنفصل دون أي تخزين للأسرار في localStorage.'
+                      ? 'يتم حفظ مفتاح AES-256-GCM ومفاتيح ECDSA P-256 + ECDH P-256 كعناصر غير قابلة للاستخراج داخل nexlink_keystore المنفصل (ملاحظة: في بيئة Android يتم استخدام Android Keystore العتادي بدلاً من المتصفح).'
                       : 'واجهة Web Crypto غير مدعومة في هذا السياق.'}
                   </p>
                   <div className="flex flex-wrap gap-2">
@@ -857,6 +969,8 @@ export function ActionModal({
                         syncIntervalMs: Number(syncIntervalSecStr) * 1000,
                         maxSyncRetries: Number(maxRetriesStr),
                         relayEndpoint: relayEndpointInput,
+                        syncDeliveryPolicy: deliveryPolicyInput,
+                        targetDeviceId: targetDeviceInput.trim() || null,
                       });
                       setStatusMessage(
                         'تم التحقق من القيم وحفظ الإعدادات في قاعدة البيانات.'
@@ -912,6 +1026,44 @@ export function ActionModal({
                         onChange={(e) => setRelayEndpointInput(e.target.value)}
                         className="w-full min-h-[40px] px-3 py-2 bg-[#192131] border border-white/10 rounded-lg text-white font-mono"
                       />
+                    </label>
+                    <label className="space-y-1">
+                      <span className="text-[#A5B1C6] block">
+                        سياسة تأكيد المزامنة (Delivery Policy)
+                      </span>
+                      <select
+                        value={deliveryPolicyInput}
+                        onChange={(e) =>
+                          setDeliveryPolicyInput(e.target.value as SyncDeliveryPolicy)
+                        }
+                        className="w-full min-h-[40px] px-3 py-2 bg-[#192131] border border-white/10 rounded-lg text-white"
+                      >
+                        <option value="PEER_CONFIRMED">
+                          PEER_CONFIRMED (انتظار تأكيد الطرف المقابل)
+                        </option>
+                        <option value="RELAY_QUEUED">
+                          RELAY_QUEUED (الاعتماد عند استلام المرحل)
+                        </option>
+                      </select>
+                    </label>
+                    <label className="space-y-1">
+                      <span className="text-[#A5B1C6] block">
+                        الجهاز المستهدف للمزامنة
+                      </span>
+                      <select
+                        value={targetDeviceInput}
+                        onChange={(e) => setTargetDeviceInput(e.target.value)}
+                        className="w-full min-h-[40px] px-3 py-2 bg-[#192131] border border-white/10 rounded-lg text-white"
+                      >
+                        <option value="">تلقائي (أول جهاز مقترن موثوق)</option>
+                        {linkedDevices
+                          .filter((d) => d.pairingState === 'PAIRED')
+                          .map((dev) => (
+                            <option key={dev.publicId} value={dev.publicId}>
+                              {dev.label} ({dev.publicId.slice(0, 8)}...)
+                            </option>
+                          ))}
+                      </select>
                     </label>
                   </div>
                   <button

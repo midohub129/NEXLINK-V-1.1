@@ -73,6 +73,7 @@ export function createAppContainer(): AppContainer {
     baseUrl: '/api/relay',
     requestTimeoutMs: 8000,
     logger,
+    crypto,
   });
 
   const deviceManager = new DeviceManager({
@@ -168,6 +169,7 @@ export function createAppContainer(): AppContainer {
             transportClient.getState() === 'CONNECTED'
           ) {
             void syncEngine.runSyncCycle();
+            void syncEngine.pullInboundEvents();
           }
         }, intervalMs);
       };
@@ -272,7 +274,7 @@ export function createAppContainer(): AppContainer {
     async resetInitialSetup(): Promise<void> {
       const prevRole = settingsService.getSnapshot().role ?? 'none';
       const identity = deviceManager.getIdentity();
-      await deviceManager.disconnectRelay();
+      await deviceManager.revokeRelaySession();
       await settingsService.update({
         role: null,
         connectionServiceEnabled: false,
@@ -293,6 +295,7 @@ export function createAppContainer(): AppContainer {
       if (enabled && current.role) {
         try {
           await deviceManager.connectRelay(current.role);
+          await syncEngine.pullInboundEvents();
           await syncEngine.runSyncCycle();
         } catch (err) {
           errorManager.capture(
@@ -344,7 +347,7 @@ export function createAppContainer(): AppContainer {
     async revokeAllAuthorizations(): Promise<void> {
       const current = settingsService.getSnapshot();
       const identity = deviceManager.getIdentity();
-      await deviceManager.disconnectRelay();
+      await deviceManager.revokeRelaySession();
       await settingsService.update({
         connectionServiceEnabled: false,
         notificationAccessGranted: false,

@@ -1,4 +1,5 @@
 import type { DeviceRole } from './device';
+import type { SyncDeliveryPolicy } from './syncEvent';
 
 export interface AppSettings {
   role: DeviceRole | null;
@@ -10,6 +11,8 @@ export interface AppSettings {
   syncIntervalMs: number;
   maxSyncRetries: number;
   relayEndpoint: string;
+  syncDeliveryPolicy: SyncDeliveryPolicy;
+  targetDeviceId: string | null;
   testFixtureModeEnabled: boolean;
 }
 
@@ -23,5 +26,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   syncIntervalMs: 10000,
   maxSyncRetries: 5,
   relayEndpoint: '/api/relay',
+  syncDeliveryPolicy: 'PEER_CONFIRMED',
+  targetDeviceId: null,
   testFixtureModeEnabled: false,
 };

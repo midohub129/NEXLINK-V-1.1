@@ -153,7 +153,9 @@ export function DashboardView({
               ? 'خادم المرحل غير متصل — بقيت الأحداث في الانتظار'
               : lastSyncSummary.skippedReason === 'SESSION_EXPIRED'
                 ? 'الجلسة منتهية — جدّد الجلسة لإرسال الأحداث'
-                : `تمت معالجة ${lastSyncSummary.attempted} · نجاح مؤكد ${lastSyncSummary.synced} · مكرر ${lastSyncSummary.duplicates} · فشل ${lastSyncSummary.failed}`}
+                : lastSyncSummary.skippedReason === 'UNPAIRED'
+                  ? 'لا يوجد جهاز مقترن موثوق — أتمم الاقتران المتبادل أولاً'
+                  : `تمت معالجة ${lastSyncSummary.attempted} · تسليم مؤكد ${lastSyncSummary.synced} · بانتظار الطرف المقابل ${lastSyncSummary.awaitingPeerAck} · مكرر ${lastSyncSummary.duplicates} · فشل ${lastSyncSummary.failed}`}
           </span>
           <span className="text-white font-semibold">
             {new Intl.DateTimeFormat('ar', { timeStyle: 'medium' }).format(

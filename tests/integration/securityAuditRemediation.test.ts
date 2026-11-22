@@ -1,0 +1,588 @@
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
+import http from 'node:http';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { describe, it } from 'node:test';
+import express from 'express';
+import { WebSocket } from 'ws';
+import { SqliteRelayDatabase } from '../../server/db/sqliteRelayDb';
+import { attachRelayUpgrade, createRelayServer } from '../../server/relay/relayRouter';
+import { SecurityError } from '../../src/domain/errors/appError';
+import { NodeTestCryptoProvider } from '../helpers/nodeCryptoProvider';
+
+function sha256(val: string): string {
+  return createHash('sha256').update(val, 'utf8').digest('hex');
+}
+
+async function createTestRelayServer() {
+  const dir = mkdtempSync(path.join(tmpdir(), 'nexlink-sec-'));
+  const db = new SqliteRelayDatabase(path.join(dir, 'relay.sqlite'));
+  const relay = createRelayServer(db);
+  const app = express();
+  app.use('/api/relay', relay.router);
+  const server = http.createServer(app);
+  attachRelayUpgrade(server, relay);
+
+  await new Promise<void>((resolve) => {
+    server.listen(0, '127.0.0.1', () => resolve());
+  });
+  const addr = server.address();
+  assert.ok(addr && typeof addr !== 'string');
+  const port = addr.port;
+  const baseUrl = `http://127.0.0.1:${port}/api/relay`;
+  const wsBaseUrl = `ws://127.0.0.1:${port}/ws/relay`;
+
+  return {
+    baseUrl,
+    wsBaseUrl,
+    db,
+    relay,
+    close: async () => {
+      await relay.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+async function registerAndAuthenticate(
+  baseUrl: string,
+  publicId: string,
+  role: 'admin' | 'basic',
+  label: string
+) {
+  const crypto = new NodeTestCryptoProvider();
+  const keys = await crypto.getOrCreateDeviceKeyPair();
+  const ts = Date.now();
+  const nonce = crypto.randomHex(16);
+  const ecdhHash = sha256(JSON.stringify(keys.ecdhPublicKeyJwk));
+  const regMsg = `REGISTER|${publicId}|${keys.cryptoKeyId}|${ecdhHash}|${role}|${ts}|${nonce}`;
+  const regSig = await crypto.signPayload(regMsg);
+
+  const regRes = await fetch(`${baseUrl}/devices/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      publicId,
+      cryptoKeyId: keys.cryptoKeyId,
+      publicKeyJwk: keys.publicKeyJwk,
+      ecdhPublicKeyJwk: keys.ecdhPublicKeyJwk,
+      role,
+      label,
+      timestamp: ts,
+      nonce,
+      signature: regSig,
+    }),
+  });
+  assert.equal(regRes.status, 200);
+
+  const chalRes = await fetch(`${baseUrl}/auth/challenge`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ publicId }),
+  });
+  assert.equal(chalRes.status, 200);
+  const { challenge } = (await chalRes.json()) as { challenge: string };
+
+  const authTs = Date.now();
+  const authNonce = crypto.randomHex(16);
+  const authSig = await crypto.signPayload(
+    `AUTH|${publicId}|${challenge}|${authTs}|${authNonce}`
+  );
+  const sessRes = await fetch(`${baseUrl}/auth/session`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      publicId,
+      challenge,
+      timestamp: authTs,
+      nonce: authNonce,
+      signature: authSig,
+    }),
+  });
+  assert.equal(sessRes.status, 200);
+  const session = (await sessRes.json()) as {
+    sessionId: string;
+    token: string;
+  };
+
+  async function signedFetch(
+    method: string,
+    subPath: string,
+    bodyObj?: unknown
+  ): Promise<Response> {
+    const bodyString = bodyObj === undefined ? '' : JSON.stringify(bodyObj);
+    const fullUrl = `${baseUrl}${subPath}`;
+    const canonicalPath = new URL(fullUrl).pathname + new URL(fullUrl).search;
+    const reqTs = Date.now();
+    const reqNonce = crypto.randomHex(16);
+    const msg = `${method.toUpperCase()}|${canonicalPath}|${sha256(bodyString)}|${reqTs}|${reqNonce}`;
+    const sig = await crypto.signPayload(msg);
+
+    return fetch(fullUrl, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${session.token}`,
+        'X-Nexlink-Timestamp': String(reqTs),
+        'X-Nexlink-Nonce': reqNonce,
+        'X-Nexlink-Signature': sig,
+      },
+      body: method === 'GET' ? undefined : bodyString || '{}',
+    });
+  }
+
+  return { publicId, crypto, keys, session, signedFetch };
+}
+
+describe('P0/P1 Negative Security, E2EE & Reliability Audit Suite', () => {
+  it('1. Unauthorized Device Registration & 2. Forged Device Identity', async () => {
+    const srv = await createTestRelayServer();
+    try {
+      const attackerCrypto = new NodeTestCryptoProvider();
+      const attackerKeys = await attackerCrypto.getOrCreateDeviceKeyPair();
+
+      // Unsigned / mismatched registration signature rejected 401
+      const badReg = await fetch(`${srv.baseUrl}/devices/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          publicId: 'victim-device',
+          cryptoKeyId: attackerKeys.cryptoKeyId,
+          publicKeyJwk: attackerKeys.publicKeyJwk,
+          ecdhPublicKeyJwk: attackerKeys.ecdhPublicKeyJwk,
+          role: 'admin',
+          label: 'Unsigned',
+          timestamp: Date.now(),
+          nonce: attackerCrypto.randomHex(16),
+          signature: Buffer.alloc(64).toString('base64'),
+        }),
+      });
+      assert.equal(badReg.status, 401);
+
+      // Register real victim device
+      const victim = await registerAndAuthenticate(
+        srv.baseUrl,
+        'victim-device',
+        'admin',
+        'Victim'
+      );
+
+      // Forged identity re-registration of existing publicId with different keypair rejected 403 IDENTITY_CONFLICT
+      const ts = Date.now();
+      const nonce = attackerCrypto.randomHex(16);
+      const ecdhHash = sha256(JSON.stringify(attackerKeys.ecdhPublicKeyJwk));
+      const hijackSig = await attackerCrypto.signPayload(
+        `REGISTER|victim-device|${attackerKeys.cryptoKeyId}|${ecdhHash}|admin|${ts}|${nonce}`
+      );
+      const hijackRes = await fetch(`${srv.baseUrl}/devices/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          publicId: 'victim-device',
+          cryptoKeyId: attackerKeys.cryptoKeyId,
+          publicKeyJwk: attackerKeys.publicKeyJwk,
+          ecdhPublicKeyJwk: attackerKeys.ecdhPublicKeyJwk,
+          role: 'admin',
+          label: 'Hijacker',
+          timestamp: ts,
+          nonce,
+          signature: hijackSig,
+        }),
+      });
+      assert.equal(hijackRes.status, 403);
+
+      // Authenticated attacker cannot read victim links or inbox (ownership check)
+      const attacker = await registerAndAuthenticate(
+        srv.baseUrl,
+        'attacker-device',
+        'basic',
+        'Attacker'
+      );
+      const readVictimLinks = await attacker.signedFetch(
+        'GET',
+        `/devices/${victim.publicId}/links`
+      );
+      assert.equal(readVictimLinks.status, 403);
+
+      const readVictimInbox = await attacker.signedFetch(
+        'GET',
+        `/sync/${victim.publicId}/inbox`
+      );
+      assert.equal(readVictimInbox.status, 403);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('3. Unauthorized Device Revocation & 4. Pairing Replay Attack & 5. Invalid Signature Rejection', async () => {
+    const srv = await createTestRelayServer();
+    try {
+      const admin = await registerAndAuthenticate(
+        srv.baseUrl,
+        'admin-dev',
+        'admin',
+        'Admin'
+      );
+      const basic = await registerAndAuthenticate(
+        srv.baseUrl,
+        'basic-dev',
+        'basic',
+        'Basic'
+      );
+      const intruder = await registerAndAuthenticate(
+        srv.baseUrl,
+        'intruder-dev',
+        'admin',
+        'Intruder'
+      );
+
+      // Basic device cannot create pairing request (403 FORBIDDEN_ROLE)
+      const basicPairReq = await basic.signedFetch('POST', '/pairing/request', {});
+      assert.equal(basicPairReq.status, 403);
+
+      // Admin creates pairing code
+      const pairRes = await admin.signedFetch('POST', '/pairing/request', {});
+      assert.equal(pairRes.status, 200);
+      const pairing = (await pairRes.json()) as {
+        pairingId: string;
+        pairingCode: string;
+      };
+
+      // Basic submits pairing code acceptance -> AWAITING_REQUESTER_CONFIRMATION
+      const accept1 = await basic.signedFetch('POST', '/pairing/accept', {
+        pairingCode: pairing.pairingCode,
+      });
+      assert.equal(accept1.status, 200);
+
+      // Replay attack: intruder tries reusing the same pairing code -> rejected 409 ALREADY_CONSUMED
+      const replayPairing = await intruder.signedFetch('POST', '/pairing/accept', {
+        pairingCode: pairing.pairingCode,
+      });
+      assert.equal(replayPairing.status, 409);
+
+      // Intruder tries confirming admin's pairing request -> rejected 403 FORBIDDEN_OWNERSHIP
+      const hijackConfirm = await intruder.signedFetch('POST', '/pairing/confirm', {
+        pairingId: pairing.pairingId,
+        approve: true,
+      });
+      assert.equal(hijackConfirm.status, 403);
+
+      // Admin confirms with WRONG key fingerprint -> rejected 409 KEY_FINGERPRINT_MISMATCH
+      const mismatchConfirm = await admin.signedFetch('POST', '/pairing/confirm', {
+        pairingId: pairing.pairingId,
+        approve: true,
+        expectedResponderCryptoKeyId: 'ecdsa-wrongfingerprint',
+      });
+      assert.equal(mismatchConfirm.status, 409);
+
+      // Admin confirms with valid peer fingerprint -> PAIRED
+      const validConfirm = await admin.signedFetch('POST', '/pairing/confirm', {
+        pairingId: pairing.pairingId,
+        approve: true,
+        expectedResponderCryptoKeyId: basic.keys.cryptoKeyId,
+      });
+      assert.equal(validConfirm.status, 200);
+
+      // 3. Unauthorized Device Revocation: intruder cannot revoke admin's device link
+      const intruderRevoke = await intruder.signedFetch(
+        'POST',
+        `/devices/${admin.publicId}/revoke`,
+        { targetDeviceId: basic.publicId, revokeDeviceTrust: true }
+      );
+      assert.equal(intruderRevoke.status, 403);
+
+      // 5. Invalid Signature Rejection & HTTP Replay Rejection
+      const badSigRes = await fetch(`${srv.baseUrl}/devices/${admin.publicId}/links`, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${admin.session.token}`,
+          'X-Nexlink-Timestamp': String(Date.now()),
+          'X-Nexlink-Nonce': admin.crypto.randomHex(16),
+          'X-Nexlink-Signature': Buffer.alloc(64).toString('base64'),
+        },
+      });
+      assert.equal(badSigRes.status, 401);
+
+      // HTTP Request Replay Attack: send identical signed request twice
+      const pathStr = `/devices/${admin.publicId}/links`;
+      const replayTs = Date.now();
+      const replayNonce = admin.crypto.randomHex(16);
+      const msg = `GET|/api/relay${pathStr}|${sha256('')}|${replayTs}|${replayNonce}`;
+      const sig = await admin.crypto.signPayload(msg);
+      const headers = {
+        Authorization: `Bearer ${admin.session.token}`,
+        'X-Nexlink-Timestamp': String(replayTs),
+        'X-Nexlink-Nonce': replayNonce,
+        'X-Nexlink-Signature': sig,
+      };
+      const firstReq = await fetch(`${srv.baseUrl}${pathStr}`, { headers });
+      assert.equal(firstReq.status, 200);
+      const secondReplayReq = await fetch(`${srv.baseUrl}${pathStr}`, { headers });
+      assert.equal(secondReplayReq.status, 409);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('6. WebSocket Identity Spoofing & 12. Revoked Device Session Rejection', async () => {
+    const srv = await createTestRelayServer();
+    try {
+      const admin = await registerAndAuthenticate(
+        srv.baseUrl,
+        'ws-admin',
+        'admin',
+        'WS Admin'
+      );
+      const peer = await registerAndAuthenticate(
+        srv.baseUrl,
+        'ws-peer',
+        'basic',
+        'WS Peer'
+      );
+
+      // 6a. Spoofing WS with legacy ?deviceId= query param without ticket -> closed 1008
+      const spoofCode = await new Promise<number>((resolve) => {
+        const ws = new WebSocket(`${srv.wsBaseUrl}?deviceId=${admin.publicId}`);
+        ws.on('close', (code) => resolve(code));
+      });
+      assert.equal(spoofCode, 1008);
+
+      // 6b. Obtain legitimate single-use ticket for peer
+      const ticketRes = await peer.signedFetch('POST', '/ws/ticket', {});
+      assert.equal(ticketRes.status, 200);
+      const { ticket } = (await ticketRes.json()) as { ticket: string };
+
+      // Connect peer WS cleanly
+      const peerWs = new WebSocket(
+        `${srv.wsBaseUrl}?ticket=${encodeURIComponent(ticket)}`
+      );
+      await new Promise<void>((resolve, reject) => {
+        peerWs.once('message', () => resolve());
+        peerWs.once('error', reject);
+      });
+
+      // Replaying the same single-use WS ticket fails with 1008
+      const replayWsCode = await new Promise<number>((resolve) => {
+        const ws2 = new WebSocket(
+          `${srv.wsBaseUrl}?ticket=${encodeURIComponent(ticket)}`
+        );
+        ws2.on('close', (code) => resolve(code));
+      });
+      assert.equal(replayWsCode, 1008);
+
+      // Pair admin <-> peer so admin can revoke trust
+      const pairReq = (await (
+        await admin.signedFetch('POST', '/pairing/request', {})
+      ).json()) as { pairingId: string; pairingCode: string };
+      await peer.signedFetch('POST', '/pairing/accept', {
+        pairingCode: pairReq.pairingCode,
+      });
+      await admin.signedFetch('POST', '/pairing/confirm', {
+        pairingId: pairReq.pairingId,
+        approve: true,
+      });
+
+      // 12. Revoked Device Session Rejection: Admin revokes trust on peer
+      const closePromise = new Promise<number>((resolve) => {
+        peerWs.once('close', (code) => resolve(code));
+      });
+      const revokeRes = await admin.signedFetch(
+        'POST',
+        `/devices/${admin.publicId}/revoke`,
+        { targetDeviceId: peer.publicId, revokeDeviceTrust: true }
+      );
+      assert.equal(revokeRes.status, 200);
+      assert.equal(await closePromise, 1008);
+
+      // Revoked peer's existing Bearer session is immediately rejected (401)
+      const afterRevokeFetch = await peer.signedFetch(
+        'GET',
+        `/devices/${peer.publicId}/links`
+      );
+      assert.equal(afterRevokeFetch.status, 401);
+
+      // Revoked peer cannot request a new auth challenge (403 DEVICE_REVOKED)
+      const newChal = await fetch(`${srv.baseUrl}/auth/challenge`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ publicId: peer.publicId }),
+      });
+      assert.equal(newChal.status, 403);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('7. Unauthorized Sync, 8. E2EE Integrity, 9. Tampered Ciphertext Rejection & 10. Duplicate Delivery Prevention', async () => {
+    const srv = await createTestRelayServer();
+    try {
+      const sender = await registerAndAuthenticate(
+        srv.baseUrl,
+        'e2ee-sender',
+        'admin',
+        'Sender'
+      );
+      const receiver = await registerAndAuthenticate(
+        srv.baseUrl,
+        'e2ee-receiver',
+        'basic',
+        'Receiver'
+      );
+      const stranger = await registerAndAuthenticate(
+        srv.baseUrl,
+        'e2ee-stranger',
+        'basic',
+        'Stranger'
+      );
+
+      // 7a. Unauthenticated sync rejected 401
+      const unauthSync = await fetch(`${srv.baseUrl}/sync`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          deviceId: sender.publicId,
+          targetDeviceId: receiver.publicId,
+          events: [],
+        }),
+      });
+      assert.equal(unauthSync.status, 401);
+
+      // 7b. Sync to unpaired device rejected 403 NOT_PAIRED_OR_REVOKED
+      const unpairedSync = await sender.signedFetch('POST', '/sync', {
+        deviceId: sender.publicId,
+        targetDeviceId: receiver.publicId,
+        events: [],
+      });
+      assert.equal(unpairedSync.status, 403);
+
+      // Pair sender and receiver
+      const pr = (await (
+        await sender.signedFetch('POST', '/pairing/request', {})
+      ).json()) as { pairingId: string; pairingCode: string };
+      await receiver.signedFetch('POST', '/pairing/accept', {
+        pairingCode: pr.pairingCode,
+      });
+      await sender.signedFetch('POST', '/pairing/confirm', {
+        pairingId: pr.pairingId,
+        approve: true,
+      });
+
+      // 7c. Plaintext event without valid E2eeEnvelope rejected 422 E2EE_ENVELOPE_REQUIRED
+      const plaintextReject = await sender.signedFetch('POST', '/sync', {
+        deviceId: sender.publicId,
+        targetDeviceId: receiver.publicId,
+        events: [
+          {
+            id: 1,
+            type: 'notification',
+            payload: '{"plaintext":"forbidden"}',
+            idempotencyKey: 'plain-1',
+            createdAt: Date.now(),
+          },
+        ],
+      });
+      assert.equal(plaintextReject.status, 422);
+
+      // 8. End-to-End Encryption Integrity: sender -> receiver
+      const plaintextMsg = JSON.stringify({
+        packageName: 'com.whatsapp',
+        title: 'Confidential',
+        text: 'Only receiver should decrypt this',
+        postedAt: 123456,
+      });
+
+      const envelope = await sender.crypto.encryptForPeer({
+        plaintext: plaintextMsg,
+        senderDeviceId: sender.publicId,
+        recipientDeviceId: receiver.publicId,
+        senderCryptoKeyId: sender.keys.cryptoKeyId,
+        recipientCryptoKeyId: receiver.keys.cryptoKeyId,
+        recipientEcdhPublicKeyJwk: receiver.keys.ecdhPublicKeyJwk!,
+        sessionId: sender.session.sessionId,
+        idempotencyKey: 'e2ee-idem-1',
+      });
+
+      const decryptedByReceiver = await receiver.crypto.decryptFromPeer({
+        envelope,
+        senderEcdsaPublicKeyJwk: sender.keys.publicKeyJwk!,
+        senderEcdhPublicKeyJwk: sender.keys.ecdhPublicKeyJwk!,
+        expectedRecipientDeviceId: receiver.publicId,
+        expectedRecipientCryptoKeyId: receiver.keys.cryptoKeyId,
+      });
+      assert.equal(decryptedByReceiver, plaintextMsg);
+
+      // Stranger cannot decrypt using their keys
+      await assert.rejects(
+        () =>
+          stranger.crypto.decryptFromPeer({
+            envelope,
+            senderEcdsaPublicKeyJwk: sender.keys.publicKeyJwk!,
+            senderEcdhPublicKeyJwk: sender.keys.ecdhPublicKeyJwk!,
+            expectedRecipientDeviceId: receiver.publicId,
+            expectedRecipientCryptoKeyId: receiver.keys.cryptoKeyId,
+          }),
+        (err: unknown) =>
+          err instanceof SecurityError && err.code === 'E2EE_DECRYPT_FAILED'
+      );
+
+      // 9. Tampered Ciphertext & Signature Rejection
+      const tamperedCipher = {
+        ...envelope,
+        ciphertext: `XXXX${envelope.ciphertext.slice(4)}`,
+      };
+      await assert.rejects(
+        () =>
+          receiver.crypto.decryptFromPeer({
+            envelope: tamperedCipher,
+            senderEcdsaPublicKeyJwk: sender.keys.publicKeyJwk!,
+            senderEcdhPublicKeyJwk: sender.keys.ecdhPublicKeyJwk!,
+            expectedRecipientDeviceId: receiver.publicId,
+            expectedRecipientCryptoKeyId: receiver.keys.cryptoKeyId,
+          }),
+        (err: unknown) =>
+          err instanceof SecurityError && err.code === 'E2EE_INVALID_SIGNATURE'
+      );
+
+      // 10. Duplicate Delivery Prevention at Relay SQLite boundary
+      const wireEvent = {
+        id: 101,
+        type: 'notification',
+        payload: '[E2EE_CIPHERTEXT]',
+        idempotencyKey: 'e2ee-idem-1',
+        createdAt: Date.now(),
+        e2eeEnvelope: envelope,
+      };
+      const sync1 = await sender.signedFetch('POST', '/sync', {
+        deviceId: sender.publicId,
+        targetDeviceId: receiver.publicId,
+        events: [wireEvent],
+      });
+      assert.equal(sync1.status, 200);
+      const ack1 = (await sync1.json()) as {
+        acceptedIds: number[];
+        duplicateIds: number[];
+      };
+      assert.deepEqual(ack1.acceptedIds, [101]);
+      assert.deepEqual(ack1.duplicateIds, []);
+
+      const syncDup = await sender.signedFetch('POST', '/sync', {
+        deviceId: sender.publicId,
+        targetDeviceId: receiver.publicId,
+        events: [wireEvent],
+      });
+      assert.equal(syncDup.status, 200);
+      const ackDup = (await syncDup.json()) as {
+        acceptedIds: number[];
+        duplicateIds: number[];
+      };
+      assert.deepEqual(ackDup.acceptedIds, []);
+      assert.deepEqual(ackDup.duplicateIds, [101]);
+    } finally {
+      await srv.close();
+    }
+  });
+});

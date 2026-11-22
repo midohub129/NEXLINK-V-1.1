@@ -29,9 +29,21 @@ function redactValue(value: unknown, depth = 0): unknown {
   return value;
 }
 
+let traceCounter = 0;
+
 export function createTraceId(prefix = 'op'): string {
-  const rand = Math.random().toString(36).slice(2, 8);
-  return `${prefix}-${Date.now().toString(36)}-${rand}`;
+  traceCounter = (traceCounter + 1) % 1_000_000;
+  let randHex = traceCounter.toString(36).padStart(4, '0');
+  if (
+    typeof globalThis.crypto !== 'undefined' &&
+    typeof globalThis.crypto.getRandomValues === 'function'
+  ) {
+    const bytes = globalThis.crypto.getRandomValues(new Uint8Array(4));
+    randHex = Array.from(bytes)
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+  return `${prefix}-${Date.now().toString(36)}-${randHex}`;
 }
 
 export class RotatingLogger implements ILogger {

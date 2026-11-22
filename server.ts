@@ -13,6 +13,27 @@ export async function startServer() {
   const relay = createRelayServer(db);
 
   app.use('/api/relay', relay.router);
+  app.use(
+    (
+      err: unknown,
+      _req: express.Request,
+      res: express.Response,
+      next: express.NextFunction
+    ) => {
+      if (res.headersSent) {
+        next(err);
+        return;
+      }
+      const status =
+        typeof (err as { status?: unknown })?.status === 'number'
+          ? (err as { status: number }).status
+          : 500;
+      res.status(status).json({
+        error: status === 400 ? 'طلب JSON غير صالح.' : 'حدث خطأ داخلي في الخادم.',
+        code: status === 400 ? 'MALFORMED_REQUEST' : 'INTERNAL_SERVER_ERROR',
+      });
+    }
+  );
 
   const isProd = process.env.NODE_ENV === 'production';
   if (!isProd) {

@@ -4,13 +4,24 @@ import { ErrorManager } from '../../src/application/errors/errorManager';
 import { HealthMonitor } from '../../src/application/health/healthMonitor';
 import { LifecycleManager } from '../../src/application/lifecycle/lifecycleManager';
 import { RotatingLogger } from '../../src/application/logging/loggerService';
-import { SettingsService, validateAppSettings } from '../../src/application/settings/settingsService';
+import {
+  SettingsService,
+  validateAppSettings,
+} from '../../src/application/settings/settingsService';
 import { SyncEngine } from '../../src/application/sync/syncEngine';
 import { DeviceManager } from '../../src/application/devices/deviceManager';
 import { SecurityManager } from '../../src/application/security/securityManager';
 import { TransportError, ValidationError } from '../../src/domain/errors/appError';
-import type { ILifecycleParticipant, ITransportClient } from '../../src/domain/interfaces/services';
-import type { ConnectionState, LinkedDevice, PairingRequest } from '../../src/domain/models/device';
+import type {
+  ILifecycleParticipant,
+  ITransportClient,
+} from '../../src/domain/interfaces/services';
+import type {
+  ConnectionState,
+  LinkedDevice,
+  PairingRequest,
+} from '../../src/domain/models/device';
+import type { RelayServerSession } from '../../src/domain/models/security';
 import { DEFAULT_APP_SETTINGS } from '../../src/domain/models/settings';
 import type { SyncDispatchAck, SyncEvent } from '../../src/domain/models/syncEvent';
 import {
@@ -26,6 +37,9 @@ class NoopTransport implements ITransportClient {
   getState(): ConnectionState {
     return this.state;
   }
+  getServerSession(): RelayServerSession | null {
+    return null;
+  }
   getLastSuccessfulConnectionAt(): number | null {
     return null;
   }
@@ -35,11 +49,20 @@ class NoopTransport implements ITransportClient {
   async disconnect(): Promise<void> {
     this.state = 'DISCONNECTED';
   }
+  async revokeServerSession(): Promise<void> {
+    this.state = 'DISCONNECTED';
+  }
   async createPairingRequest(): Promise<PairingRequest> {
     throw new Error('Not used');
   }
-  async acceptPairingRequest(): Promise<LinkedDevice> {
+  async acceptPairingRequest(): Promise<PairingRequest> {
     throw new Error('Not used');
+  }
+  async confirmPairingRequest(): Promise<LinkedDevice | null> {
+    return null;
+  }
+  async fetchPendingPairingApprovals(): Promise<PairingRequest[]> {
+    return [];
   }
   async fetchLinkedDevices(): Promise<LinkedDevice[]> {
     return [];
@@ -56,10 +79,20 @@ class NoopTransport implements ITransportClient {
   async fetchInboundEvents(): Promise<SyncEvent[]> {
     return [];
   }
+  async acknowledgeInboundDelivery(): Promise<void> {}
+  async fetchSyncDeliveryStatus(): Promise<number[]> {
+    return [];
+  }
   subscribe(): () => void {
     return () => {};
   }
   subscribeEvents(): () => void {
+    return () => {};
+  }
+  subscribeDeliveryAcks(): () => void {
+    return () => {};
+  }
+  subscribePairingUpdates(): () => void {
     return () => {};
   }
 }
@@ -76,7 +109,8 @@ describe('Settings, ErrorManager, HealthMonitor & LifecycleManager Tests', () =>
           ...DEFAULT_APP_SETTINGS,
           sessionTimeoutMinutes: 0,
         }),
-      (err: unknown) => err instanceof ValidationError && err.code === 'INVALID_SESSION_TIMEOUT'
+      (err: unknown) =>
+        err instanceof ValidationError && err.code === 'INVALID_SESSION_TIMEOUT'
     );
 
     assert.throws(
@@ -85,7 +119,8 @@ describe('Settings, ErrorManager, HealthMonitor & LifecycleManager Tests', () =>
           ...DEFAULT_APP_SETTINGS,
           relayEndpoint: 'ftp://invalid-endpoint',
         }),
-      (err: unknown) => err instanceof ValidationError && err.code === 'INVALID_RELAY_ENDPOINT'
+      (err: unknown) =>
+        err instanceof ValidationError && err.code === 'INVALID_RELAY_ENDPOINT'
     );
 
     const saved = await settings.update({

@@ -1,12 +1,14 @@
 import { SecurityError } from '../../domain/errors/appError';
 import type { ICryptoProvider } from '../../domain/interfaces/services';
-import type { EncryptedEnvelope } from '../../domain/models/security';
+import type { E2eeEnvelope, EncryptedEnvelope } from '../../domain/models/security';
 
 const KEYSTORE_DB_NAME = 'nexlink_keystore';
-const KEYSTORE_DB_VERSION = 1;
+const KEYSTORE_DB_VERSION = 2;
 const KEYSTORE_OBJECT_STORE = 'keys';
 const AES_KEY_RECORD_ID = 'master_aes_gcm_key';
 const DEVICE_ECDSA_RECORD_ID = 'device_ecdsa_p256_pair';
+const DEVICE_ECDH_RECORD_ID = 'device_ecdh_p256_pair';
+const HKDF_SALT = 'nexlink-e2ee-v1-salt';
 
 interface StoredKeyRecord {
   id: string;
@@ -41,8 +43,9 @@ function base64ToBytes(b64: string): Uint8Array {
   return new Uint8Array(Buffer.from(b64, 'base64'));
 }
 
-function bufferToHex(buf: ArrayBuffer): string {
-  return Array.from(new Uint8Array(buf))
+function bufferToHex(buf: ArrayBuffer | Uint8Array): string {
+  const view = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  return Array.from(view)
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('');
 }
@@ -55,11 +58,11 @@ function hasSubtleCrypto(): boolean {
 }
 
 /**
- * Isolated cryptographic provider backed by Web Crypto API + dedicated
+ * Cryptographic provider backed by Web Crypto API + dedicated
  * non-extractable IndexedDB keystore (`nexlink_keystore`).
- * - Payload confidentiality: AES-256-GCM
- * - Device cryptographic identity & signatures: ECDSA P-256
- * - Content hashing & fingerprints: SHA-256
+ * - Local rest encryption: AES-256-GCM
+ * - Device authentication identity: ECDSA P-256 (SHA-256)
+ * - End-to-End inter-device encryption: ECDH P-256 + HKDF-SHA-256 + AES-256-GCM + AAD + ECDSA P-256 signatures
  */
 export class WebCryptoProvider implements ICryptoProvider {
   private memoryAesKey: CryptoKey | null = null;
@@ -69,9 +72,29 @@ export class WebCryptoProvider implements ICryptoProvider {
     publicKeyJwk: JsonWebKey;
     cryptoKeyId: string;
   } | null = null;
+  private memoryEcdhPair: {
+    privateKey: CryptoKey;
+    publicKey: CryptoKey;
+    publicKeyJwk: JsonWebKey;
+  } | null = null;
 
   isSupported(): boolean {
     return hasSubtleCrypto();
+  }
+
+  randomHex(byteLength = 16): string {
+    if (
+      typeof globalThis.crypto === 'undefined' ||
+      typeof globalThis.crypto.getRandomValues !== 'function'
+    ) {
+      throw new SecurityError(
+        'CSPRNG_UNAVAILABLE',
+        'مولّد الأرقام العشوائية التشفيري غير متاح في هذا السياق.',
+        'crypto.getRandomValues is unavailable'
+      );
+    }
+    const bytes = globalThis.crypto.getRandomValues(new Uint8Array(byteLength));
+    return bufferToHex(bytes);
   }
 
   private openKeyStore(): Promise<IDBDatabase | null> {
@@ -138,7 +161,7 @@ export class WebCryptoProvider implements ICryptoProvider {
 
     const generated = await globalThis.crypto.subtle.generateKey(
       { name: 'AES-GCM', length: 256 },
-      false, // Non-extractable private symmetric key
+      false,
       ['encrypt', 'decrypt']
     );
 
@@ -149,6 +172,51 @@ export class WebCryptoProvider implements ICryptoProvider {
       createdAt: Date.now(),
     });
     return generated;
+  }
+
+  private async getOrCreateEcdhPair(): Promise<{
+    privateKey: CryptoKey;
+    publicKey: CryptoKey;
+    publicKeyJwk: JsonWebKey;
+  } | null> {
+    if (!hasSubtleCrypto()) return null;
+    if (this.memoryEcdhPair) return this.memoryEcdhPair;
+
+    const existing = await this.readKeyRecord(DEVICE_ECDH_RECORD_ID);
+    if (existing?.privateKey && existing.publicKey && existing.publicKeyJwk) {
+      this.memoryEcdhPair = {
+        privateKey: existing.privateKey,
+        publicKey: existing.publicKey,
+        publicKeyJwk: existing.publicKeyJwk,
+      };
+      return this.memoryEcdhPair;
+    }
+
+    const pair = await globalThis.crypto.subtle.generateKey(
+      { name: 'ECDH', namedCurve: 'P-256' },
+      false,
+      ['deriveBits']
+    );
+    const publicKeyJwk = await globalThis.crypto.subtle.exportKey(
+      'jwk',
+      pair.publicKey
+    );
+
+    this.memoryEcdhPair = {
+      privateKey: pair.privateKey,
+      publicKey: pair.publicKey,
+      publicKeyJwk,
+    };
+
+    await this.writeKeyRecord({
+      id: DEVICE_ECDH_RECORD_ID,
+      privateKey: pair.privateKey,
+      publicKey: pair.publicKey,
+      publicKeyJwk,
+      createdAt: Date.now(),
+    });
+
+    return this.memoryEcdhPair;
   }
 
   async sha256Hex(value: string): Promise<string> {
@@ -208,18 +276,23 @@ export class WebCryptoProvider implements ICryptoProvider {
   async getOrCreateDeviceKeyPair(): Promise<{
     cryptoKeyId: string;
     publicKeyJwk: JsonWebKey | null;
+    ecdhPublicKeyJwk: JsonWebKey | null;
   }> {
     if (!hasSubtleCrypto()) {
       return {
         cryptoKeyId: 'unsupported-webcrypto-context',
         publicKeyJwk: null,
+        ecdhPublicKeyJwk: null,
       };
     }
+
+    const ecdhPair = await this.getOrCreateEcdhPair();
 
     if (this.memoryEcdsaPair) {
       return {
         cryptoKeyId: this.memoryEcdsaPair.cryptoKeyId,
         publicKeyJwk: this.memoryEcdsaPair.publicKeyJwk,
+        ecdhPublicKeyJwk: ecdhPair?.publicKeyJwk ?? null,
       };
     }
 
@@ -239,12 +312,13 @@ export class WebCryptoProvider implements ICryptoProvider {
       return {
         cryptoKeyId: existing.cryptoKeyId,
         publicKeyJwk: existing.publicKeyJwk,
+        ecdhPublicKeyJwk: ecdhPair?.publicKeyJwk ?? null,
       };
     }
 
     const pair = await globalThis.crypto.subtle.generateKey(
       { name: 'ECDSA', namedCurve: 'P-256' },
-      false, // Non-extractable private signing key
+      false,
       ['sign', 'verify']
     );
 
@@ -273,7 +347,11 @@ export class WebCryptoProvider implements ICryptoProvider {
       createdAt: Date.now(),
     });
 
-    return { cryptoKeyId, publicKeyJwk };
+    return {
+      cryptoKeyId,
+      publicKeyJwk,
+      ecdhPublicKeyJwk: ecdhPair?.publicKeyJwk ?? null,
+    };
   }
 
   async signPayload(payload: string): Promise<string | null> {
@@ -292,6 +370,276 @@ export class WebCryptoProvider implements ICryptoProvider {
     return bytesToBase64(new Uint8Array(sig));
   }
 
+  async verifySignatureWithJwk(
+    publicKeyJwk: JsonWebKey,
+    expectedCryptoKeyId: string,
+    payload: string,
+    signatureBase64: string
+  ): Promise<boolean> {
+    if (!hasSubtleCrypto()) return false;
+    try {
+      const fingerprint = await this.sha256Hex(
+        `${publicKeyJwk.x ?? ''}:${publicKeyJwk.y ?? ''}`
+      );
+      if (`ecdsa-${fingerprint.slice(0, 24)}` !== expectedCryptoKeyId) {
+        return false;
+      }
+      const key = await globalThis.crypto.subtle.importKey(
+        'jwk',
+        publicKeyJwk,
+        { name: 'ECDSA', namedCurve: 'P-256' },
+        false,
+        ['verify']
+      );
+      return await globalThis.crypto.subtle.verify(
+        { name: 'ECDSA', hash: 'SHA-256' },
+        key,
+        new Uint8Array(base64ToBytes(signatureBase64)),
+        new TextEncoder().encode(payload)
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private async deriveE2eeAesKey(params: {
+    peerEcdhPublicKeyJwk: JsonWebKey;
+    senderDeviceId: string;
+    recipientDeviceId: string;
+    senderCryptoKeyId: string;
+    recipientCryptoKeyId: string;
+    sessionId: string;
+    messageNonce: string;
+    usage: 'encrypt' | 'decrypt';
+  }): Promise<CryptoKey> {
+    const ecdhPair = await this.getOrCreateEcdhPair();
+    if (!ecdhPair) {
+      throw new SecurityError(
+        'E2EE_UNAVAILABLE',
+        'واجهة تبادل المفاتيح ECDH غير متاحة.',
+        'ECDH pair missing'
+      );
+    }
+
+    const peerPublicKey = await globalThis.crypto.subtle.importKey(
+      'jwk',
+      params.peerEcdhPublicKeyJwk,
+      { name: 'ECDH', namedCurve: 'P-256' },
+      false,
+      []
+    );
+
+    const sharedBits = await globalThis.crypto.subtle.deriveBits(
+      { name: 'ECDH', public: peerPublicKey },
+      ecdhPair.privateKey,
+      256
+    );
+
+    const hkdfKey = await globalThis.crypto.subtle.importKey(
+      'raw',
+      sharedBits,
+      'HKDF',
+      false,
+      ['deriveKey']
+    );
+
+    const encoder = new TextEncoder();
+    const info = encoder.encode(
+      `nexlink-e2ee-v1|${params.senderDeviceId}|${params.recipientDeviceId}|${params.senderCryptoKeyId}|${params.recipientCryptoKeyId}|${params.sessionId}|${params.messageNonce}`
+    );
+
+    return globalThis.crypto.subtle.deriveKey(
+      {
+        name: 'HKDF',
+        hash: 'SHA-256',
+        salt: encoder.encode(HKDF_SALT),
+        info,
+      },
+      hkdfKey,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      [params.usage]
+    );
+  }
+
+  async encryptForPeer(params: {
+    plaintext: string;
+    senderDeviceId: string;
+    recipientDeviceId: string;
+    senderCryptoKeyId: string;
+    recipientCryptoKeyId: string;
+    recipientEcdhPublicKeyJwk: JsonWebKey;
+    sessionId: string;
+    idempotencyKey: string;
+  }): Promise<E2eeEnvelope> {
+    if (!hasSubtleCrypto()) {
+      throw new SecurityError(
+        'E2EE_UNAVAILABLE',
+        'التشفير الطرفي غير متوفر بدون Web Crypto API.',
+        'Web Crypto unavailable for E2EE encryption'
+      );
+    }
+
+    const messageNonce = this.randomHex(16);
+    const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
+    const aesKey = await this.deriveE2eeAesKey({
+      peerEcdhPublicKeyJwk: params.recipientEcdhPublicKeyJwk,
+      senderDeviceId: params.senderDeviceId,
+      recipientDeviceId: params.recipientDeviceId,
+      senderCryptoKeyId: params.senderCryptoKeyId,
+      recipientCryptoKeyId: params.recipientCryptoKeyId,
+      sessionId: params.sessionId,
+      messageNonce,
+      usage: 'encrypt',
+    });
+
+    const aad = JSON.stringify({
+      v: 1,
+      senderDeviceId: params.senderDeviceId,
+      recipientDeviceId: params.recipientDeviceId,
+      senderCryptoKeyId: params.senderCryptoKeyId,
+      recipientCryptoKeyId: params.recipientCryptoKeyId,
+      sessionId: params.sessionId,
+      messageNonce,
+      idempotencyKey: params.idempotencyKey,
+    });
+
+    const encoder = new TextEncoder();
+    const cipherBuf = await globalThis.crypto.subtle.encrypt(
+      {
+        name: 'AES-GCM',
+        iv,
+        additionalData: encoder.encode(aad),
+      },
+      aesKey,
+      encoder.encode(params.plaintext)
+    );
+
+    const ivB64 = bytesToBase64(iv);
+    const ciphertextB64 = bytesToBase64(new Uint8Array(cipherBuf));
+    const sigTarget = `E2EE|${await this.sha256Hex(aad)}|${await this.sha256Hex(`${ivB64}:${ciphertextB64}`)}`;
+    const signature = await this.signPayload(sigTarget);
+    if (!signature) {
+      throw new SecurityError(
+        'E2EE_SIGNING_FAILED',
+        'فشل توقيع حزمة التشفير الطرفي.',
+        'ECDSA signature returned null'
+      );
+    }
+
+    return {
+      version: 1,
+      algorithm: 'ECDH-P256+HKDF-SHA256+AES-256-GCM',
+      senderDeviceId: params.senderDeviceId,
+      recipientDeviceId: params.recipientDeviceId,
+      senderCryptoKeyId: params.senderCryptoKeyId,
+      recipientCryptoKeyId: params.recipientCryptoKeyId,
+      sessionId: params.sessionId,
+      messageNonce,
+      iv: ivB64,
+      aad,
+      ciphertext: ciphertextB64,
+      signature,
+    };
+  }
+
+  async decryptFromPeer(params: {
+    envelope: E2eeEnvelope;
+    senderEcdsaPublicKeyJwk: JsonWebKey;
+    senderEcdhPublicKeyJwk: JsonWebKey;
+    expectedRecipientDeviceId: string;
+    expectedRecipientCryptoKeyId: string;
+  }): Promise<string> {
+    const { envelope } = params;
+    if (
+      !envelope ||
+      envelope.version !== 1 ||
+      envelope.algorithm !== 'ECDH-P256+HKDF-SHA256+AES-256-GCM' ||
+      envelope.recipientDeviceId !== params.expectedRecipientDeviceId ||
+      envelope.recipientCryptoKeyId !== params.expectedRecipientCryptoKeyId
+    ) {
+      throw new SecurityError(
+        'E2EE_BINDING_MISMATCH',
+        'فشل التحقق من هوية المرسل أو المستلم لحزمة E2EE.',
+        'E2EE envelope recipient binding mismatch'
+      );
+    }
+
+    let parsedAad: Record<string, unknown>;
+    try {
+      parsedAad = JSON.parse(envelope.aad) as Record<string, unknown>;
+    } catch {
+      throw new SecurityError(
+        'E2EE_INVALID_AAD',
+        'بيانات السياق المرتبطة (AAD) تالفة.',
+        'Invalid E2EE AAD JSON'
+      );
+    }
+
+    if (
+      parsedAad.v !== 1 ||
+      parsedAad.senderDeviceId !== envelope.senderDeviceId ||
+      parsedAad.recipientDeviceId !== envelope.recipientDeviceId ||
+      parsedAad.senderCryptoKeyId !== envelope.senderCryptoKeyId ||
+      parsedAad.recipientCryptoKeyId !== envelope.recipientCryptoKeyId ||
+      parsedAad.sessionId !== envelope.sessionId ||
+      parsedAad.messageNonce !== envelope.messageNonce
+    ) {
+      throw new SecurityError(
+        'E2EE_AAD_TAMPERED',
+        'تم رصد عدم تطابق أو تلاعب في بيانات السياق AAD.',
+        'E2EE AAD metadata mismatch'
+      );
+    }
+
+    const sigTarget = `E2EE|${await this.sha256Hex(envelope.aad)}|${await this.sha256Hex(`${envelope.iv}:${envelope.ciphertext}`)}`;
+    const sigValid = await this.verifySignatureWithJwk(
+      params.senderEcdsaPublicKeyJwk,
+      envelope.senderCryptoKeyId,
+      sigTarget,
+      envelope.signature
+    );
+    if (!sigValid) {
+      throw new SecurityError(
+        'E2EE_INVALID_SIGNATURE',
+        'فشل التحقق من التوقيع الرقمي لرسالة E2EE.',
+        'E2EE envelope ECDSA signature verification failed'
+      );
+    }
+
+    try {
+      const aesKey = await this.deriveE2eeAesKey({
+        peerEcdhPublicKeyJwk: params.senderEcdhPublicKeyJwk,
+        senderDeviceId: envelope.senderDeviceId,
+        recipientDeviceId: envelope.recipientDeviceId,
+        senderCryptoKeyId: envelope.senderCryptoKeyId,
+        recipientCryptoKeyId: envelope.recipientCryptoKeyId,
+        sessionId: envelope.sessionId,
+        messageNonce: envelope.messageNonce,
+        usage: 'decrypt',
+      });
+
+      const plainBuf = await globalThis.crypto.subtle.decrypt(
+        {
+          name: 'AES-GCM',
+          iv: new Uint8Array(base64ToBytes(envelope.iv)),
+          additionalData: new TextEncoder().encode(envelope.aad),
+        },
+        aesKey,
+        new Uint8Array(base64ToBytes(envelope.ciphertext))
+      );
+
+      return new TextDecoder().decode(plainBuf);
+    } catch (err) {
+      throw new SecurityError(
+        'E2EE_DECRYPT_FAILED',
+        'فشل فك تشفير الرسالة بسبب تلاعب بالمحتوى أو مفتاح غير متطابق.',
+        err instanceof Error ? err.message : 'AES-GCM authentication failed',
+        err
+      );
+    }
+  }
+
   async verifySelfIntegrity(): Promise<{ ok: boolean; algorithm: string }> {
     if (!hasSubtleCrypto()) {
       return {
@@ -300,7 +648,7 @@ export class WebCryptoProvider implements ICryptoProvider {
       };
     }
 
-    const probe = `nexlink-integrity-${Date.now()}`;
+    const probe = `nexlink-integrity-${Date.now()}-${this.randomHex(8)}`;
     const envelope = await this.encrypt(probe);
     if (!envelope) {
       return { ok: false, algorithm: 'تعذّر إنشاء مفتاح AES-256-GCM' };
@@ -310,11 +658,12 @@ export class WebCryptoProvider implements ICryptoProvider {
       return { ok: false, algorithm: 'فشل التحقق المتطابق لـ AES-256-GCM' };
     }
 
+    const keys = await this.getOrCreateDeviceKeyPair();
     const signature = await this.signPayload(probe);
-    if (!signature || !this.memoryEcdsaPair) {
+    if (!signature || !this.memoryEcdsaPair || !keys.ecdhPublicKeyJwk) {
       return {
         ok: false,
-        algorithm: 'فشل فحص توقيع الهوية التشفيرية ECDSA P-256',
+        algorithm: 'فشل فحص هوية ECDSA P-256 أو ECDH P-256',
       };
     }
 
@@ -328,7 +677,7 @@ export class WebCryptoProvider implements ICryptoProvider {
     return {
       ok: verified,
       algorithm: verified
-        ? 'AES-256-GCM + ECDSA P-256 (IndexedDB Non-Extractable KeyStore)'
+        ? 'AES-256-GCM + ECDSA P-256 + ECDH P-256 (IndexedDB Non-Extractable KeyStore)'
         : 'فشل التحقق من توقيع ECDSA P-256',
     };
   }

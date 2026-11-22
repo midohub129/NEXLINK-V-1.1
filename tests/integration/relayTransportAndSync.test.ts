@@ -33,19 +33,17 @@ async function buildDeviceStack(baseUrl: string, role: 'admin' | 'basic') {
     notificationAccessGranted: true,
     selectedNotificationApps: ['com.whatsapp'],
     relayEndpoint: baseUrl,
+    syncDeliveryPolicy: 'PEER_CONFIRMED',
   });
 
-  const security = new SecurityManager(
-    crypto,
-    new InMemoryAuditRepository(),
-    logger
-  );
+  const security = new SecurityManager(crypto, new InMemoryAuditRepository(), logger);
   await security.initialize();
 
   const transport = new RelayTransportClient({
     baseUrl,
     requestTimeoutMs: 4000,
     logger,
+    crypto,
     webSocketFactory: (url) => new WebSocket(url) as unknown as globalThis.WebSocket,
   });
 
@@ -75,8 +73,8 @@ async function buildDeviceStack(baseUrl: string, role: 'admin' | 'basic') {
   return { devices, syncEngine, transport, security, identity };
 }
 
-describe('End-to-End Relay Transport, Pairing & Sync Integration Tests', () => {
-  it('pairs two real DeviceManagers over HTTP+WS relay, syncs idempotent batches, and pushes inbound events', async () => {
+describe('End-to-End Authenticated Relay Transport, Mutual Pairing, E2EE & Peer ACK Tests', () => {
+  it('completes challenge-response auth, two-phase mutual pairing, zero-plaintext E2EE WS sync, peer ACK, and trust revocation', async () => {
     const dir = mkdtempSync(path.join(tmpdir(), 'nexlink-e2e-'));
     const db = new SqliteRelayDatabase(path.join(dir, 'relay.sqlite'));
     const relay = createRelayServer(db);
@@ -103,48 +101,74 @@ describe('End-to-End Relay Transport, Pairing & Sync Integration Tests', () => {
 
       assert.equal(deviceA.transport.getState(), 'CONNECTED');
       assert.equal(deviceB.transport.getState(), 'CONNECTED');
+      assert.ok(deviceA.transport.getServerSession()?.token);
+      assert.ok(deviceB.transport.getServerSession()?.token);
 
-      // 1. Device A creates pairing code, Device B accepts it
+      // 1. Two-phase mutual pairing: A creates code -> B enters code -> A verifies B fingerprint & approves
       const pairingReq = await deviceA.devices.createPairingRequest();
       assert.equal(pairingReq.pairingCode.length, 6);
 
-      const pairedFromB = await deviceB.devices.acceptPairingCode(
+      const pendingFromB = await deviceB.devices.acceptPairingCode(
         pairingReq.pairingCode,
         'basic',
         'Basic Tablet'
       );
-      assert.equal(pairedFromB.publicId, deviceA.identity.publicId);
-      assert.equal(pairedFromB.verifiedByRelay, true);
+      assert.equal(pendingFromB.status, 'AWAITING_REQUESTER_CONFIRMATION');
 
-      // Refresh Device A's authoritative links from relay
-      const linksOnA = await deviceA.devices.refreshLinkedDevicesFromRelay();
-      assert.equal(linksOnA.length, 1);
-      assert.equal(linksOnA[0].publicId, deviceB.identity.publicId);
-      assert.equal(linksOnA[0].pairingState, 'PAIRED');
+      // Before A confirms, zero devices are paired
+      assert.equal((await deviceA.devices.refreshLinkedDevicesFromRelay()).length, 0);
 
-      // 2. Device A enqueues notification and runs SyncEngine cycle
+      // Device A explicitly confirms peer cryptoKeyId fingerprint
+      const confirmedPeer = await deviceA.devices.confirmPairingApproval(
+        pendingFromB.pairingId,
+        true,
+        deviceB.identity.cryptoKeyId
+      );
+      assert.ok(confirmedPeer);
+      assert.equal(confirmedPeer.pairingState, 'PAIRED');
+
+      // Wait briefly for WS device:paired notification & refresh on B
+      await new Promise((r) => setTimeout(r, 80));
+      const linksOnB = await deviceB.devices.refreshLinkedDevicesFromRelay();
+      assert.equal(linksOnB.length, 1);
+      assert.equal(linksOnB[0].publicId, deviceA.identity.publicId);
+
+      // 2. Device A enqueues notification and runs E2EE SyncEngine cycle
+      const secretText = 'Top Secret E2EE Payload Only Peer Reads';
       const enqueued = await deviceA.syncEngine.enqueueNotification({
         packageName: 'com.whatsapp',
-        title: 'Live Relay Message',
-        text: 'Delivered through Express + SQLite + WebSocket',
+        title: 'Live E2EE Relay Message',
+        text: secretText,
         notificationKey: 'live-k1',
       });
       assert.equal(enqueued.status, 'SAVED');
 
       const syncSummary = await deviceA.syncEngine.runSyncCycle();
-      assert.equal(syncSummary.synced, 1);
-      assert.equal(syncSummary.failed, 0);
-      assert.equal(deviceA.syncEngine.getEvents()[0].status, 'SYNCED');
+      assert.equal(syncSummary.attempted, 1);
 
-      // Wait briefly for WebSocket delivery onto Device B's SyncEngine
+      // Verify zero plaintext exists in SQLite relay_events!
+      const rawDbRow = db.db
+        .prepare('SELECT payload FROM relay_events LIMIT 1')
+        .get() as { payload: string };
+      assert.equal(rawDbRow.payload.includes(secretText), false);
+      assert.equal(rawDbRow.payload.includes('Live E2EE Relay Message'), false);
+
+      // Wait briefly for WebSocket delivery onto B -> E2EE decrypt -> ACK back to A
       await new Promise((r) => setTimeout(r, 150));
+
       const inboundOnB = deviceB.syncEngine.getEvents();
       assert.equal(inboundOnB.length, 1);
       assert.equal(inboundOnB[0].status, 'SYNCED');
-      assert.ok(inboundOnB[0].payload.includes('Live Relay Message'));
+      assert.equal(inboundOnB[0].e2eeProtected, true);
+      assert.ok(inboundOnB[0].payload.includes(secretText));
 
-      // 3. Revocation on Device A marks link REVOKED
-      await deviceA.devices.revokeLinkedDevice(deviceB.identity.publicId);
+      // Device A received peer confirmation ACK and transitioned from IN_PROGRESS -> SYNCED
+      const onA = deviceA.syncEngine.getEvents()[0];
+      assert.equal(onA.status, 'SYNCED');
+      assert.ok(onA.deliveredAt !== null);
+
+      // 3. Trust revocation by Device A terminates B's access
+      await deviceA.devices.revokeLinkedDevice(deviceB.identity.publicId, true);
       const afterRevoke = deviceA.devices.getLinkedDevices()[0];
       assert.equal(afterRevoke.pairingState, 'REVOKED');
       assert.equal(afterRevoke.verifiedByRelay, false);
@@ -162,6 +186,8 @@ describe('End-to-End Relay Transport, Pairing & Sync Integration Tests', () => {
 
   it('enforces request timeouts and throws retryable TransportError', async () => {
     const logger = new RotatingLogger();
+    const crypto = new NodeTestCryptoProvider();
+    const keys = await crypto.getOrCreateDeviceKeyPair();
     const slowFetch: typeof fetch = (_input, init) =>
       new Promise((_resolve, reject) => {
         init?.signal?.addEventListener('abort', () => {
@@ -175,6 +201,7 @@ describe('End-to-End Relay Transport, Pairing & Sync Integration Tests', () => {
       baseUrl: 'http://127.0.0.1:9999/api/relay',
       requestTimeoutMs: 40,
       logger,
+      crypto,
       fetchImpl: slowFetch,
     });
 
@@ -182,8 +209,9 @@ describe('End-to-End Relay Transport, Pairing & Sync Integration Tests', () => {
       () =>
         client.connect({
           publicId: 'dev-timeout',
-          cryptoKeyId: 'ecdsa-timeout',
-          publicKeyJwk: null,
+          cryptoKeyId: keys.cryptoKeyId,
+          publicKeyJwk: keys.publicKeyJwk,
+          ecdhPublicKeyJwk: keys.ecdhPublicKeyJwk,
           role: 'admin',
           label: 'Timeout Probe',
         }),

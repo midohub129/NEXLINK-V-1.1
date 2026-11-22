@@ -8,7 +8,7 @@ import type {
   PairingRequest,
 } from './domain/models/device';
 import type { SystemHealthSnapshot } from './domain/models/health';
-import type { SecurityAuditEntry } from './domain/models/security';
+import type { RelayServerSession, SecurityAuditEntry } from './domain/models/security';
 import type { AppSettings } from './domain/models/settings';
 import type { SyncEvent, SyncRunSummary } from './domain/models/syncEvent';
 import { ActionModal } from './presentation/components/ActionModal';
@@ -36,6 +36,12 @@ export function App() {
     useState<PairingRequest | null>(() =>
       container.deviceManager.getActivePairingRequest()
     );
+  const [pendingPairingApprovals, setPendingPairingApprovals] = useState<
+    PairingRequest[]
+  >(() => container.deviceManager.getPendingPairingApprovals());
+  const [serverSession, setServerSession] = useState<RelayServerSession | null>(() =>
+    container.deviceManager.getServerSession()
+  );
   const [connectionState, setConnectionState] = useState<ConnectionState>(() =>
     container.deviceManager.getConnectionState()
   );
@@ -74,6 +80,8 @@ export function App() {
       setIdentity(container.deviceManager.getIdentity());
       setLinkedDevices(container.deviceManager.getLinkedDevices());
       setActivePairingRequest(container.deviceManager.getActivePairingRequest());
+      setPendingPairingApprovals(container.deviceManager.getPendingPairingApprovals());
+      setServerSession(container.deviceManager.getServerSession());
       setConnectionState(container.deviceManager.getConnectionState());
       setEvents(container.syncEngine.getEvents());
       setIsSyncRunning(container.syncEngine.isSyncRunning());
@@ -242,8 +250,10 @@ export function App() {
           connectionState={connectionState}
           linkedDevices={linkedDevices}
           activePairingRequest={activePairingRequest}
+          pendingPairingApprovals={pendingPairingApprovals}
           sessionValid={sessionValid}
           remainingSessionSeconds={remainingSessionSeconds}
+          serverSession={serverSession}
           cryptoSupported={container.crypto.isSupported()}
           health={health}
           auditEntries={auditEntries}
@@ -281,11 +291,19 @@ export function App() {
           onAcceptPairingCode={(code, label) =>
             container.deviceManager.acceptPairingCode(code, role, label)
           }
+          onConfirmPairingApproval={(pairingId, approve, expectedCryptoKeyId) =>
+            container.deviceManager.confirmPairingApproval(
+              pairingId,
+              approve,
+              expectedCryptoKeyId
+            )
+          }
           onRefreshLinkedDevices={async () => {
             await container.deviceManager.refreshLinkedDevicesFromRelay();
+            await container.deviceManager.refreshPendingPairingApprovals();
           }}
-          onRevokeLinkedDevice={(publicId) =>
-            container.deviceManager.revokeLinkedDevice(publicId)
+          onRevokeLinkedDevice={(publicId, revokeTrust) =>
+            container.deviceManager.revokeLinkedDevice(publicId, revokeTrust)
           }
           onRemoveLinkedDevice={(publicId) =>
             container.deviceManager.removeLinkedDevice(publicId)

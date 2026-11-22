@@ -87,14 +87,18 @@ export class SecurityManager {
   ): SessionState {
     const now = Date.now();
     this.session = {
-      sessionId: `sess-${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      sessionId: `sess-${this.crypto.randomHex(16)}`,
       authenticated: true,
+      scope: 'LOCAL_UI',
       issuedAt: now,
       expiresAt: now + timeoutMinutes * 60 * 1000,
       devicePublicId,
       cryptoKeyId,
     };
-    this.logger.info('SECURITY', 'تم إصدار جلسة مصادقة نشطة');
+    this.logger.info(
+      'SECURITY',
+      'تم إصدار جلسة واجهة محلية منفصلة بالمولد العشوائي التشفيري'
+    );
     this.notify();
     return this.session;
   }

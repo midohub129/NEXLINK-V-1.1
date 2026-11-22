@@ -36,6 +36,11 @@ interface StoredSyncEventRecord {
   notificationKey?: string;
   payloadHash?: string;
   encrypted: boolean;
+  e2eeProtected?: boolean;
+  targetDeviceId?: string | null;
+  sourceDeviceId?: string | null;
+  relayAcceptedAt?: number | null;
+  deliveredAt?: number | null;
   lastError?: string | null;
   syncedAt?: number | null;
 }
@@ -99,6 +104,11 @@ export class IndexedDbSyncEventRepository implements ISyncEventRepository {
       notificationKey: record.notificationKey,
       payloadHash: record.payloadHash,
       encrypted: record.encrypted,
+      e2eeProtected: record.e2eeProtected ?? false,
+      targetDeviceId: record.targetDeviceId ?? null,
+      sourceDeviceId: record.sourceDeviceId ?? null,
+      relayAcceptedAt: record.relayAcceptedAt ?? null,
+      deliveredAt: record.deliveredAt ?? null,
       lastError: record.lastError ?? null,
       syncedAt: record.syncedAt ?? null,
     };
@@ -121,6 +131,11 @@ export class IndexedDbSyncEventRepository implements ISyncEventRepository {
       notificationKey: input.notificationKey,
       payloadHash: input.payloadHash,
       encrypted: Boolean(envelope),
+      e2eeProtected: input.e2eeProtected ?? false,
+      targetDeviceId: input.targetDeviceId ?? null,
+      sourceDeviceId: input.sourceDeviceId ?? null,
+      relayAcceptedAt: null,
+      deliveredAt: null,
       lastError: null,
       syncedAt: null,
     };
@@ -188,7 +203,15 @@ export class IndexedDbSyncEventRepository implements ISyncEventRepository {
     patch: Partial<
       Pick<
         SyncEvent,
-        'status' | 'retryCount' | 'nextRetryAt' | 'lastError' | 'syncedAt'
+        | 'status'
+        | 'retryCount'
+        | 'nextRetryAt'
+        | 'lastError'
+        | 'syncedAt'
+        | 'relayAcceptedAt'
+        | 'deliveredAt'
+        | 'targetDeviceId'
+        | 'e2eeProtected'
       >
     >
   ): Promise<SyncEvent | null> {
@@ -514,6 +537,11 @@ export class IndexedDbBackupProvider implements IBackupProvider {
         notificationKey: evt.notificationKey,
         payloadHash: evt.payloadHash,
         encrypted: Boolean(envelope),
+        e2eeProtected: evt.e2eeProtected ?? false,
+        targetDeviceId: evt.targetDeviceId ?? null,
+        sourceDeviceId: evt.sourceDeviceId ?? null,
+        relayAcceptedAt: evt.relayAcceptedAt ?? null,
+        deliveredAt: evt.deliveredAt ?? null,
         lastError: evt.lastError ?? null,
         syncedAt: evt.syncedAt ?? null,
       });
@@ -601,6 +629,11 @@ export class InMemorySyncEventRepository implements ISyncEventRepository {
       notificationKey: input.notificationKey,
       payloadHash: input.payloadHash,
       encrypted: false,
+      e2eeProtected: input.e2eeProtected ?? false,
+      targetDeviceId: input.targetDeviceId ?? null,
+      sourceDeviceId: input.sourceDeviceId ?? null,
+      relayAcceptedAt: null,
+      deliveredAt: null,
       lastError: null,
       syncedAt: null,
     };
@@ -657,7 +690,15 @@ export class InMemorySyncEventRepository implements ISyncEventRepository {
     patch: Partial<
       Pick<
         SyncEvent,
-        'status' | 'retryCount' | 'nextRetryAt' | 'lastError' | 'syncedAt'
+        | 'status'
+        | 'retryCount'
+        | 'nextRetryAt'
+        | 'lastError'
+        | 'syncedAt'
+        | 'relayAcceptedAt'
+        | 'deliveredAt'
+        | 'targetDeviceId'
+        | 'e2eeProtected'
       >
     >
   ): Promise<SyncEvent | null> {

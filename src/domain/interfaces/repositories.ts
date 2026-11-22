@@ -9,6 +9,9 @@ export interface CreateSyncEventInput {
   idempotencyKey: string;
   notificationKey?: string;
   payloadHash?: string;
+  targetDeviceId?: string | null;
+  sourceDeviceId?: string | null;
+  e2eeProtected?: boolean;
   createdAt?: number;
 }
 
@@ -31,7 +34,15 @@ export interface ISyncEventRepository {
     patch: Partial<
       Pick<
         SyncEvent,
-        'status' | 'retryCount' | 'nextRetryAt' | 'lastError' | 'syncedAt'
+        | 'status'
+        | 'retryCount'
+        | 'nextRetryAt'
+        | 'lastError'
+        | 'syncedAt'
+        | 'relayAcceptedAt'
+        | 'deliveredAt'
+        | 'targetDeviceId'
+        | 'e2eeProtected'
       >
     >
   ): Promise<SyncEvent | null>;

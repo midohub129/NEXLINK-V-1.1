@@ -61,6 +61,13 @@ export function validateAppSettings(candidate: AppSettings): AppSettings {
     );
   }
 
+  const syncDeliveryPolicy =
+    candidate.syncDeliveryPolicy === 'RELAY_QUEUED' ? 'RELAY_QUEUED' : 'PEER_CONFIRMED';
+  const targetDeviceId =
+    typeof candidate.targetDeviceId === 'string' && candidate.targetDeviceId.trim()
+      ? candidate.targetDeviceId.trim()
+      : null;
+
   const uniqueApps = Array.from(
     new Set(
       candidate.selectedNotificationApps
@@ -72,6 +79,8 @@ export function validateAppSettings(candidate: AppSettings): AppSettings {
   return {
     ...candidate,
     relayEndpoint: trimmedEndpoint,
+    syncDeliveryPolicy,
+    targetDeviceId,
     selectedNotificationApps: uniqueApps,
   };
 }

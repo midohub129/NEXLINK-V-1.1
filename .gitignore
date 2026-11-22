@@ -10,3 +10,13 @@ google-services.json
 *.bak
 *.save
 /backups/
+
+# Operational Web/Relay runtime & SQLite WAL/SHM artifacts
+.data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db-wal
+*.db-shm
+node_modules/
+dist/
