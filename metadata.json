@@ -1,0 +1,5 @@
+{
+  "name": "NEXLINK",
+  "description": "تطبيق NEXLINK لربط الأجهزة وإدارة خدمة الاتصال ومشاركة الإشعارات والصلاحيات.",
+  "requestFramePermissions": []
+}

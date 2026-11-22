@@ -1,0 +1,12 @@
+.gradle/
+.kotlin/
+build/
+**/build/
+local.properties
+*.jks
+*.keystore
+*.env
+google-services.json
+*.bak
+*.save
+/backups/

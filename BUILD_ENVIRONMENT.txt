@@ -1,0 +1,72 @@
+========================================
+ViewCaptureApp - Successful Build Environment
+Date: 2026-10-30
+Architecture: aarch64
+========================================
+
+[System]
+OS: Android / Termux
+Architecture: aarch64
+
+[Java]
+OpenJDK: 21.0.12
+JAVA_HOME: $PREFIX/lib/jvm/java-21-openjdk
+
+[Gradle]
+Gradle: 9.8.2
+
+[Android Gradle Plugin]
+AGP: 8.9.2
+
+[Kotlin]
+Kotlin Android Plugin: 2.1.20
+
+[Android SDK]
+Android SDK Platform: 35
+Build Tools: 35.0.0
+Additional Build Tools: 37.0.0
+Command-line Tools: 19.0
+Platform Tools: Installed
+
+[Android Build Configuration]
+compileSdk: 35
+targetSdk: 35
+minSdk: 23
+versionCode: 1
+versionName: 1.0
+
+[Java Compatibility]
+sourceCompatibility: 17
+targetCompatibility: 17
+Kotlin JVM Target: 17
+
+[AAPT2]
+Version: 2.20-android-16.0.0_r4
+Path: $PREFIX/bin/aapt2
+
+[Build Configuration]
+org.gradle.jvmargs=-Xmx1536m
+org.gradle.parallel=false
+
+[Required Environment]
+LD_LIBRARY_PATH=$PREFIX/lib
+
+[Successful Build Command]
+gradle assembleDebug
+
+[Build Result]
+BUILD SUCCESSFUL
+
+[APK Location]
+app/build/outputs/apk/debug/app-debug.apk
+
+[APK Size]
+814 KB
+
+[Signature]
+V1: Verified
+V2: Verified
+
+========================================
+END OF RECORD
+========================================
