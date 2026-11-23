@@ -36,7 +36,12 @@ interface StoredSyncEventRecord {
   notificationKey?: string;
   payloadHash?: string;
   encrypted: boolean;
+  localEncrypted?: boolean;
   e2eeProtected?: boolean;
+  e2eeVerified?: boolean;
+  e2eeNonce?: string | null;
+  relayEventId?: number | null;
+  inboundAckConfirmed?: boolean;
   targetDeviceId?: string | null;
   sourceDeviceId?: string | null;
   relayAcceptedAt?: number | null;
@@ -104,7 +109,12 @@ export class IndexedDbSyncEventRepository implements ISyncEventRepository {
       notificationKey: record.notificationKey,
       payloadHash: record.payloadHash,
       encrypted: record.encrypted,
+      localEncrypted: record.localEncrypted ?? record.encrypted,
       e2eeProtected: record.e2eeProtected ?? false,
+      e2eeVerified: record.e2eeVerified ?? false,
+      e2eeNonce: record.e2eeNonce ?? null,
+      relayEventId: record.relayEventId ?? null,
+      inboundAckConfirmed: record.inboundAckConfirmed ?? false,
       targetDeviceId: record.targetDeviceId ?? null,
       sourceDeviceId: record.sourceDeviceId ?? null,
       relayAcceptedAt: record.relayAcceptedAt ?? null,
@@ -131,7 +141,12 @@ export class IndexedDbSyncEventRepository implements ISyncEventRepository {
       notificationKey: input.notificationKey,
       payloadHash: input.payloadHash,
       encrypted: Boolean(envelope),
+      localEncrypted: Boolean(envelope),
       e2eeProtected: input.e2eeProtected ?? false,
+      e2eeVerified: input.e2eeVerified ?? false,
+      e2eeNonce: input.e2eeNonce ?? null,
+      relayEventId: input.relayEventId ?? null,
+      inboundAckConfirmed: input.inboundAckConfirmed ?? false,
       targetDeviceId: input.targetDeviceId ?? null,
       sourceDeviceId: input.sourceDeviceId ?? null,
       relayAcceptedAt: null,
@@ -244,6 +259,8 @@ export class IndexedDbSyncEventRepository implements ISyncEventRepository {
         | 'deliveredAt'
         | 'targetDeviceId'
         | 'e2eeProtected'
+        | 'e2eeVerified'
+        | 'inboundAckConfirmed'
       >
     >
   ): Promise<SyncEvent | null> {
@@ -569,7 +586,12 @@ export class IndexedDbBackupProvider implements IBackupProvider {
         notificationKey: evt.notificationKey,
         payloadHash: evt.payloadHash,
         encrypted: Boolean(envelope),
+        localEncrypted: Boolean(envelope),
         e2eeProtected: evt.e2eeProtected ?? false,
+        e2eeVerified: evt.e2eeVerified ?? false,
+        e2eeNonce: evt.e2eeNonce ?? null,
+        relayEventId: evt.relayEventId ?? null,
+        inboundAckConfirmed: evt.inboundAckConfirmed ?? false,
         targetDeviceId: evt.targetDeviceId ?? null,
         sourceDeviceId: evt.sourceDeviceId ?? null,
         relayAcceptedAt: evt.relayAcceptedAt ?? null,
@@ -661,7 +683,12 @@ export class InMemorySyncEventRepository implements ISyncEventRepository {
       notificationKey: input.notificationKey,
       payloadHash: input.payloadHash,
       encrypted: false,
+      localEncrypted: false,
       e2eeProtected: input.e2eeProtected ?? false,
+      e2eeVerified: input.e2eeVerified ?? false,
+      e2eeNonce: input.e2eeNonce ?? null,
+      relayEventId: input.relayEventId ?? null,
+      inboundAckConfirmed: input.inboundAckConfirmed ?? false,
       targetDeviceId: input.targetDeviceId ?? null,
       sourceDeviceId: input.sourceDeviceId ?? null,
       relayAcceptedAt: null,
@@ -736,6 +763,8 @@ export class InMemorySyncEventRepository implements ISyncEventRepository {
         | 'deliveredAt'
         | 'targetDeviceId'
         | 'e2eeProtected'
+        | 'e2eeVerified'
+        | 'inboundAckConfirmed'
       >
     >
   ): Promise<SyncEvent | null> {

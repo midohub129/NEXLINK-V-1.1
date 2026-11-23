@@ -12,6 +12,10 @@ export interface CreateSyncEventInput {
   targetDeviceId?: string | null;
   sourceDeviceId?: string | null;
   e2eeProtected?: boolean;
+  e2eeVerified?: boolean;
+  e2eeNonce?: string | null;
+  relayEventId?: number | null;
+  inboundAckConfirmed?: boolean;
   createdAt?: number;
 }
 
@@ -44,6 +48,8 @@ export interface ISyncEventRepository {
         | 'deliveredAt'
         | 'targetDeviceId'
         | 'e2eeProtected'
+        | 'e2eeVerified'
+        | 'inboundAckConfirmed'
       >
     >
   ): Promise<SyncEvent | null>;

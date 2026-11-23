@@ -87,6 +87,7 @@ export interface ICryptoProvider {
     senderEcdhPublicKeyJwk: JsonWebKey;
     expectedRecipientDeviceId: string;
     expectedRecipientCryptoKeyId: string;
+    expectedIdempotencyKey?: string;
   }): Promise<string>;
   verifySelfIntegrity(): Promise<{ ok: boolean; algorithm: string }>;
 }

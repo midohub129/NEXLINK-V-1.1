@@ -215,12 +215,17 @@ export class NodeTestCryptoProvider implements ICryptoProvider {
     senderEcdhPublicKeyJwk: JsonWebKey;
     expectedRecipientDeviceId: string;
     expectedRecipientCryptoKeyId: string;
+    expectedIdempotencyKey?: string;
   }): Promise<string> {
     const { envelope } = params;
     if (
       !envelope ||
       envelope.version !== 1 ||
       envelope.algorithm !== 'ECDH-P256+HKDF-SHA256+AES-256-GCM' ||
+      !envelope.senderDeviceId ||
+      !envelope.senderCryptoKeyId ||
+      !envelope.sessionId ||
+      !envelope.messageNonce ||
       envelope.recipientDeviceId !== params.expectedRecipientDeviceId ||
       envelope.recipientCryptoKeyId !== params.expectedRecipientCryptoKeyId
     ) {
@@ -231,7 +236,17 @@ export class NodeTestCryptoProvider implements ICryptoProvider {
       );
     }
 
-    const parsedAad = JSON.parse(envelope.aad) as Record<string, unknown>;
+    let parsedAad: Record<string, unknown>;
+    try {
+      parsedAad = JSON.parse(envelope.aad) as Record<string, unknown>;
+    } catch {
+      throw new SecurityError(
+        'E2EE_INVALID_AAD',
+        'بيانات السياق المرتبطة (AAD) تالفة.',
+        'Invalid E2EE AAD JSON'
+      );
+    }
+
     if (
       parsedAad.v !== 1 ||
       parsedAad.senderDeviceId !== envelope.senderDeviceId ||
@@ -239,7 +254,11 @@ export class NodeTestCryptoProvider implements ICryptoProvider {
       parsedAad.senderCryptoKeyId !== envelope.senderCryptoKeyId ||
       parsedAad.recipientCryptoKeyId !== envelope.recipientCryptoKeyId ||
       parsedAad.sessionId !== envelope.sessionId ||
-      parsedAad.messageNonce !== envelope.messageNonce
+      parsedAad.messageNonce !== envelope.messageNonce ||
+      typeof parsedAad.idempotencyKey !== 'string' ||
+      parsedAad.idempotencyKey.length === 0 ||
+      (params.expectedIdempotencyKey !== undefined &&
+        parsedAad.idempotencyKey !== params.expectedIdempotencyKey)
     ) {
       throw new SecurityError(
         'E2EE_AAD_TAMPERED',

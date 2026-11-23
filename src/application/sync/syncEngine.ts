@@ -103,6 +103,12 @@ export class SyncEngine implements ILifecycleParticipant {
     }
 
     this.eventsCache = await this.repo.getAll();
+    this.seenE2eeNonces.clear();
+    for (const evt of this.eventsCache) {
+      if (evt.e2eeNonce) {
+        this.seenE2eeNonces.add(evt.e2eeNonce);
+      }
+    }
     this.lastTransportState = this.transport.getState();
 
     if (!this.unsubInbound) {
@@ -363,6 +369,32 @@ export class SyncEngine implements ILifecycleParticipant {
     }
 
     if (this.seenE2eeNonces.has(envelope.messageNonce)) {
+      const existingUnacked = await this.repo.findByIdempotencyKey(
+        remoteEvent.idempotencyKey
+      );
+      if (
+        existingUnacked &&
+        existingUnacked.e2eeNonce === envelope.messageNonce &&
+        existingUnacked.relayEventId === remoteEvent.id &&
+        existingUnacked.inboundAckConfirmed === false
+      ) {
+        if (this.transport.getState() === 'CONNECTED') {
+          try {
+            await this.transport.acknowledgeInboundDelivery(identity.publicId, [
+              remoteEvent.id,
+            ]);
+            await this.repo.updateEvent(existingUnacked.id, {
+              inboundAckConfirmed: true,
+            });
+            this.eventsCache = await this.repo.getAll();
+            this.notify();
+          } catch {
+            // keep inboundAckConfirmed=false for next reconnect retry
+          }
+        }
+        return true;
+      }
+
       await this.security.recordAudit({
         action: 'REPLAY_BLOCKED',
         actorRole: role,
@@ -408,16 +440,8 @@ export class SyncEngine implements ILifecycleParticipant {
         senderEcdhPublicKeyJwk: senderPeer.ecdhPublicKeyJwk,
         expectedRecipientDeviceId: identity.publicId,
         expectedRecipientCryptoKeyId: identity.cryptoKeyId,
+        expectedIdempotencyKey: remoteEvent.idempotencyKey,
       });
-
-      const parsedAad = JSON.parse(envelope.aad) as { idempotencyKey?: unknown };
-      if (parsedAad.idempotencyKey !== remoteEvent.idempotencyKey) {
-        throw new SecurityError(
-          'E2EE_AAD_TAMPERED',
-          'عدم تطابق مفتاح عدم التكرار بين الحدث ومغلف E2EE.',
-          'AAD idempotencyKey mismatch'
-        );
-      }
     } catch (err) {
       const msg =
         err instanceof SecurityError ? err.message : 'فشل التحقق وفك التشفير E2EE';
@@ -430,8 +454,6 @@ export class SyncEngine implements ILifecycleParticipant {
       });
       return false;
     }
-
-    this.seenE2eeNonces.add(envelope.messageNonce);
 
     const existingByKey = await this.repo.findByIdempotencyKey(
       remoteEvent.idempotencyKey
@@ -447,38 +469,87 @@ export class SyncEngine implements ILifecycleParticipant {
       ));
 
     if (existing) {
+      this.seenE2eeNonces.add(envelope.messageNonce);
       if (this.transport.getState() === 'CONNECTED') {
-        await this.transport
-          .acknowledgeInboundDelivery(identity.publicId, [remoteEvent.id])
-          .catch(() => {});
+        try {
+          await this.transport.acknowledgeInboundDelivery(identity.publicId, [
+            remoteEvent.id,
+          ]);
+          await this.repo.updateEvent(existing.id, { inboundAckConfirmed: true });
+        } catch {
+          // defer ACK retry until next pull
+        }
       }
       return true;
     }
 
-    const inserted = await this.repo.insert({
-      type: remoteEvent.type,
-      payload: decryptedPlaintext,
-      idempotencyKey: remoteEvent.idempotencyKey,
-      notificationKey: remoteEvent.notificationKey,
-      payloadHash: remoteEvent.payloadHash,
-      sourceDeviceId: senderPeer.publicId,
-      targetDeviceId: identity.publicId,
-      e2eeProtected: true,
-      createdAt: remoteEvent.createdAt,
-    });
+    let insertedId: number | null = null;
+    try {
+      const inserted = await this.repo.insert({
+        type: remoteEvent.type,
+        payload: decryptedPlaintext,
+        idempotencyKey: remoteEvent.idempotencyKey,
+        notificationKey: remoteEvent.notificationKey,
+        payloadHash: remoteEvent.payloadHash,
+        sourceDeviceId: senderPeer.publicId,
+        targetDeviceId: identity.publicId,
+        e2eeProtected: true,
+        e2eeVerified: true,
+        e2eeNonce: envelope.messageNonce,
+        relayEventId: remoteEvent.id,
+        inboundAckConfirmed: false,
+        createdAt: remoteEvent.createdAt,
+      });
+      insertedId = inserted.id;
 
-    const now = Date.now();
-    await this.repo.updateEvent(inserted.id, {
-      status: 'SYNCED',
-      syncedAt: now,
-      deliveredAt: now,
-      e2eeProtected: true,
-    });
+      const now = Date.now();
+      const updated = await this.repo.updateEvent(inserted.id, {
+        status: 'SYNCED',
+        syncedAt: now,
+        deliveredAt: now,
+        e2eeProtected: true,
+        e2eeVerified: true,
+        inboundAckConfirmed: false,
+      });
+      if (!updated) {
+        throw new Error('Failed to finalize persisted inbound event status');
+      }
+    } catch (storageErr) {
+      if (insertedId !== null) {
+        await this.repo.delete(insertedId).catch(() => false);
+      }
+      await this.security.recordAudit({
+        action: 'E2EE_DECRYPT_FAILED',
+        actorRole: role,
+        deviceId: identity.publicId,
+        outcome: 'DENIED',
+        details: `تعذّر حفظ الحدث المفكوك محلياً — لن يتم إرسال ACK للخادم (${storageErr instanceof Error ? storageErr.message : 'storage error'})`,
+      });
+      return false;
+    }
+
+    this.seenE2eeNonces.add(envelope.messageNonce);
+    this.eventsCache = await this.repo.getAll();
+    this.notify();
 
     if (this.transport.getState() === 'CONNECTED') {
-      await this.transport
-        .acknowledgeInboundDelivery(identity.publicId, [remoteEvent.id])
-        .catch(() => {});
+      try {
+        await this.transport.acknowledgeInboundDelivery(identity.publicId, [
+          remoteEvent.id,
+        ]);
+        await this.repo.updateEvent(insertedId, { inboundAckConfirmed: true });
+        this.eventsCache = await this.repo.getAll();
+        this.notify();
+      } catch (ackErr) {
+        this.logger.warn(
+          'SYNC',
+          'تم حفظ الحدث محلياً لكن تعذّر إرسال تأكيد ACK للخادم وسيُعاد لاحقاً',
+          {
+            relayEventId: remoteEvent.id,
+            reason: ackErr instanceof Error ? ackErr.message : 'ack error',
+          }
+        );
+      }
     }
 
     await this.security.recordAudit({
@@ -489,8 +560,6 @@ export class SyncEngine implements ILifecycleParticipant {
       details: `تم فك تشفير حدث وارد وتوثيق مصدره E2EE من ${senderPeer.publicId}`,
     });
 
-    this.eventsCache = await this.repo.getAll();
-    this.notify();
     return true;
   }
 
@@ -666,6 +735,7 @@ export class SyncEngine implements ILifecycleParticipant {
             payload: '[E2EE_CIPHERTEXT]',
             sourceDeviceId: identity.publicId,
             targetDeviceId: activePeer.publicId,
+            encrypted: true,
             e2eeProtected: true,
             e2eeEnvelope,
           });

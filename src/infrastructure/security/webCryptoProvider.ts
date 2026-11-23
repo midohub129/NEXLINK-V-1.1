@@ -549,12 +549,17 @@ export class WebCryptoProvider implements ICryptoProvider {
     senderEcdhPublicKeyJwk: JsonWebKey;
     expectedRecipientDeviceId: string;
     expectedRecipientCryptoKeyId: string;
+    expectedIdempotencyKey?: string;
   }): Promise<string> {
     const { envelope } = params;
     if (
       !envelope ||
       envelope.version !== 1 ||
       envelope.algorithm !== 'ECDH-P256+HKDF-SHA256+AES-256-GCM' ||
+      !envelope.senderDeviceId ||
+      !envelope.senderCryptoKeyId ||
+      !envelope.sessionId ||
+      !envelope.messageNonce ||
       envelope.recipientDeviceId !== params.expectedRecipientDeviceId ||
       envelope.recipientCryptoKeyId !== params.expectedRecipientCryptoKeyId
     ) {
@@ -583,7 +588,11 @@ export class WebCryptoProvider implements ICryptoProvider {
       parsedAad.senderCryptoKeyId !== envelope.senderCryptoKeyId ||
       parsedAad.recipientCryptoKeyId !== envelope.recipientCryptoKeyId ||
       parsedAad.sessionId !== envelope.sessionId ||
-      parsedAad.messageNonce !== envelope.messageNonce
+      parsedAad.messageNonce !== envelope.messageNonce ||
+      typeof parsedAad.idempotencyKey !== 'string' ||
+      parsedAad.idempotencyKey.length === 0 ||
+      (params.expectedIdempotencyKey !== undefined &&
+        parsedAad.idempotencyKey !== params.expectedIdempotencyKey)
     ) {
       throw new SecurityError(
         'E2EE_AAD_TAMPERED',

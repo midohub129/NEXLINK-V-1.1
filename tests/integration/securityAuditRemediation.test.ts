@@ -634,6 +634,160 @@ describe('P0/P1 Negative Security, E2EE & Reliability Audit Suite', () => {
       assert.equal(badKeyIdSync.status, 422);
       const badKeyJson = (await badKeyIdSync.json()) as { code: string };
       assert.equal(badKeyJson.code, 'E2EE_KEY_ID_MISMATCH');
+
+      // 13. Relay rejects forged ECDSA signature inside E2EE envelope (422 E2EE_ENVELOPE_SIGNATURE_INVALID)
+      const forgedTargetEnv = await sender.crypto.encryptForPeer({
+        plaintext: plaintextMsg,
+        senderDeviceId: sender.publicId,
+        recipientDeviceId: receiver.publicId,
+        senderCryptoKeyId: sender.keys.cryptoKeyId,
+        recipientCryptoKeyId: receiver.keys.cryptoKeyId,
+        recipientEcdhPublicKeyJwk: receiver.keys.ecdhPublicKeyJwk!,
+        sessionId: sender.session.sessionId,
+        idempotencyKey: 'e2ee-idem-forged-sig',
+      });
+      const forgedRelayEnv = {
+        ...forgedTargetEnv,
+        signature: Buffer.alloc(64, 5).toString('base64'),
+      };
+      const forgedRelaySync = await sender.signedFetch('POST', '/sync', {
+        deviceId: sender.publicId,
+        targetDeviceId: receiver.publicId,
+        events: [
+          {
+            ...wireEvent,
+            id: 103,
+            idempotencyKey: 'e2ee-idem-forged-sig',
+            e2eeEnvelope: forgedRelayEnv,
+          },
+        ],
+      });
+      assert.equal(forgedRelaySync.status, 422);
+      const forgedRelayJson = (await forgedRelaySync.json()) as { code: string };
+      assert.equal(forgedRelayJson.code, 'E2EE_ENVELOPE_SIGNATURE_INVALID');
+
+      // 14. Relay rejects AAD metadata tampering inside E2EE envelope (422 E2EE_AAD_INVALID)
+      const tamperedRelaySync = await sender.signedFetch('POST', '/sync', {
+        deviceId: sender.publicId,
+        targetDeviceId: receiver.publicId,
+        events: [
+          {
+            ...wireEvent,
+            id: 104,
+            idempotencyKey: 'e2ee-idem-aad-mismatch',
+            e2eeEnvelope: envelope,
+          },
+        ],
+      });
+      assert.equal(tamperedRelaySync.status, 422);
+      const tamperedRelayJson = (await tamperedRelaySync.json()) as { code: string };
+      assert.equal(tamperedRelayJson.code, 'E2EE_AAD_INVALID');
+
+      // 15. Relay rejects reused messageNonce on a different idempotencyKey (409 E2EE_NONCE_REUSED)
+      const forgedNonceReusedAad = JSON.stringify({
+        v: 1,
+        senderDeviceId: sender.publicId,
+        recipientDeviceId: receiver.publicId,
+        senderCryptoKeyId: sender.keys.cryptoKeyId,
+        recipientCryptoKeyId: receiver.keys.cryptoKeyId,
+        sessionId: sender.session.sessionId,
+        messageNonce: envelope.messageNonce,
+        idempotencyKey: 'e2ee-idem-nonce-reused',
+      });
+      const nonceReuseSig = await sender.crypto.signPayload(
+        `E2EE|${sha256(forgedNonceReusedAad)}|${sha256(`${envelope.iv}:${envelope.ciphertext}`)}`
+      );
+      const nonceReuseRes = await sender.signedFetch('POST', '/sync', {
+        deviceId: sender.publicId,
+        targetDeviceId: receiver.publicId,
+        events: [
+          {
+            ...wireEvent,
+            id: 105,
+            idempotencyKey: 'e2ee-idem-nonce-reused',
+            e2eeEnvelope: {
+              ...envelope,
+              aad: forgedNonceReusedAad,
+              signature: nonceReuseSig,
+            },
+          },
+        ],
+      });
+      assert.equal(nonceReuseRes.status, 409);
+      const nonceReuseJson = (await nonceReuseRes.json()) as { code: string };
+      assert.equal(nonceReuseJson.code, 'E2EE_NONCE_REUSED');
+
+      // 16. Verify receiver's /inbox returns truthful encryption flags and non-SYNCED pre-ACK status
+      const receiverInboxRes = await receiver.signedFetch(
+        'GET',
+        `/sync/${receiver.publicId}/inbox`
+      );
+      assert.equal(receiverInboxRes.status, 200);
+      const inboxBody = (await receiverInboxRes.json()) as {
+        events: Array<Record<string, unknown>>;
+      };
+      assert.equal(inboxBody.events.length, 1);
+      assert.equal(inboxBody.events[0].encrypted, true);
+      assert.equal(inboxBody.events[0].localEncrypted, false);
+      assert.equal(inboxBody.events[0].e2eeProtected, false);
+      assert.equal(inboxBody.events[0].e2eeVerified, false);
+      assert.equal(inboxBody.events[0].relaySignatureVerified, true);
+      assert.equal(inboxBody.events[0].status, 'IN_PROGRESS');
+      assert.equal(inboxBody.events[0].relayDeliveryState, 'QUEUED_AT_RELAY');
+
+      // 17. Verify WebSocket sync:event push emits identical honest encryption & IN_PROGRESS status flags
+      const wsTicketRes = await receiver.signedFetch('POST', '/ws/ticket', {});
+      assert.equal(wsTicketRes.status, 200);
+      const { ticket: rxTicket } = (await wsTicketRes.json()) as { ticket: string };
+      const rxWs = new WebSocket(`${srv.wsBaseUrl}?ticket=${encodeURIComponent(rxTicket)}`);
+      const wsSyncFramePromise = new Promise<Record<string, unknown>>((resolve, reject) => {
+        rxWs.on('message', (raw) => {
+          const msg = JSON.parse(raw.toString('utf8')) as {
+            type?: string;
+            event?: Record<string, unknown>;
+          };
+          if (msg.type === 'sync:event' && msg.event) {
+            resolve(msg.event);
+          }
+        });
+        rxWs.on('error', reject);
+      });
+
+      const wsEnv = await sender.crypto.encryptForPeer({
+        plaintext: plaintextMsg,
+        senderDeviceId: sender.publicId,
+        recipientDeviceId: receiver.publicId,
+        senderCryptoKeyId: sender.keys.cryptoKeyId,
+        recipientCryptoKeyId: receiver.keys.cryptoKeyId,
+        recipientEcdhPublicKeyJwk: receiver.keys.ecdhPublicKeyJwk!,
+        sessionId: sender.session.sessionId,
+        idempotencyKey: 'e2ee-idem-ws-check',
+      });
+      const wsSendRes = await sender.signedFetch('POST', '/sync', {
+        deviceId: sender.publicId,
+        targetDeviceId: receiver.publicId,
+        events: [
+          {
+            id: 106,
+            type: 'notification',
+            payload: '[E2EE_CIPHERTEXT]',
+            idempotencyKey: 'e2ee-idem-ws-check',
+            createdAt: Date.now(),
+            e2eeEnvelope: wsEnv,
+          },
+        ],
+      });
+      assert.equal(wsSendRes.status, 200);
+
+      const wsEvent = await wsSyncFramePromise;
+      assert.equal(wsEvent.encrypted, true);
+      assert.equal(wsEvent.localEncrypted, false);
+      assert.equal(wsEvent.e2eeProtected, false);
+      assert.equal(wsEvent.e2eeVerified, false);
+      assert.equal(wsEvent.relaySignatureVerified, true);
+      assert.equal(wsEvent.status, 'IN_PROGRESS');
+      assert.equal(wsEvent.relayDeliveryState, 'QUEUED_AT_RELAY');
+      rxWs.close();
     } finally {
       await srv.close();
     }

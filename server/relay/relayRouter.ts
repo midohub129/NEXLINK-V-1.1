@@ -959,8 +959,12 @@ export function createRelayServer(db: SqliteRelayDatabase): RelayServerHandle {
     }
 
     const cleanTarget = targetDeviceId.trim();
+    const senderDevice = db.getDevice(auth.publicId);
     const targetDevice = db.getDevice(cleanTarget);
     if (
+      !senderDevice ||
+      !senderDevice.publicKeyJwk ||
+      senderDevice.status !== 'ACTIVE' ||
       !targetDevice ||
       targetDevice.status !== 'ACTIVE' ||
       !db.isLinkPaired(auth.publicId, cleanTarget)
@@ -971,6 +975,9 @@ export function createRelayServer(db: SqliteRelayDatabase): RelayServerHandle {
       });
       return;
     }
+
+    const senderPublicKeyJwk = JSON.parse(senderDevice.publicKeyJwk) as JsonWebKey;
+    const seenBatchNonces = new Map<string, string>();
 
     const normalizedEvents: Array<{
       id: number;
@@ -1014,6 +1021,65 @@ export function createRelayServer(db: SqliteRelayDatabase): RelayServerHandle {
         return;
       }
 
+      let parsedAad: Record<string, unknown>;
+      try {
+        parsedAad = JSON.parse(String(env.aad)) as Record<string, unknown>;
+      } catch {
+        res.status(422).json({
+          error: 'بيانات السياق AAD في مغلف E2EE غير صالحة.',
+          code: 'E2EE_AAD_INVALID',
+        });
+        return;
+      }
+
+      if (
+        parsedAad.v !== 1 ||
+        parsedAad.senderDeviceId !== auth.publicId ||
+        parsedAad.recipientDeviceId !== cleanTarget ||
+        parsedAad.senderCryptoKeyId !== auth.cryptoKeyId ||
+        parsedAad.recipientCryptoKeyId !== targetDevice.cryptoKeyId ||
+        parsedAad.sessionId !== env.sessionId ||
+        parsedAad.messageNonce !== env.messageNonce ||
+        parsedAad.idempotencyKey !== evt.idempotencyKey
+      ) {
+        res.status(422).json({
+          error:
+            'عدم تطابق بيانات السياق AAD مع هوية المرسل أو المستلم أو مفتاح الحدث.',
+          code: 'E2EE_AAD_INVALID',
+        });
+        return;
+      }
+
+      const sigTarget = `E2EE|${sha256Hex(String(env.aad))}|${sha256Hex(`${String(env.iv)}:${String(env.ciphertext)}`)}`;
+      if (
+        !verifyEcdsaSignature(
+          senderPublicKeyJwk,
+          auth.cryptoKeyId,
+          sigTarget,
+          String(env.signature)
+        )
+      ) {
+        res.status(422).json({
+          error: 'فشل التحقق من التوقيع الرقمي لمغلف E2EE.',
+          code: 'E2EE_ENVELOPE_SIGNATURE_INVALID',
+        });
+        return;
+      }
+
+      const messageNonce = String(env.messageNonce);
+      const batchPrevKey = seenBatchNonces.get(messageNonce);
+      if (
+        (batchPrevKey !== undefined && batchPrevKey !== evt.idempotencyKey) ||
+        db.hasUsedMessageNonce(auth.publicId, messageNonce, evt.idempotencyKey)
+      ) {
+        res.status(409).json({
+          error: 'تم رفض الحدث بسبب إعادة استخدام messageNonce لحدث مختلف.',
+          code: 'E2EE_NONCE_REUSED',
+        });
+        return;
+      }
+      seenBatchNonces.set(messageNonce, evt.idempotencyKey);
+
       normalizedEvents.push({
         id: evt.id,
         idempotencyKey: evt.idempotencyKey,
@@ -1022,7 +1088,7 @@ export function createRelayServer(db: SqliteRelayDatabase): RelayServerHandle {
         payload: JSON.stringify(env),
         senderCryptoKeyId: String(env.senderCryptoKeyId),
         recipientCryptoKeyId: String(env.recipientCryptoKeyId),
-        messageNonce: String(env.messageNonce),
+        messageNonce,
         notificationKey:
           typeof evt.notificationKey === 'string' ? evt.notificationKey : undefined,
         payloadHash: typeof evt.payloadHash === 'string' ? evt.payloadHash : undefined,
@@ -1045,14 +1111,20 @@ export function createRelayServer(db: SqliteRelayDatabase): RelayServerHandle {
           sourceDeviceId: row.sourceDeviceId,
           targetDeviceId: row.targetDeviceId,
           createdAt: row.createdAt,
-          status: 'SYNCED',
+          status: 'IN_PROGRESS',
           retryCount: 0,
           nextRetryAt: null,
           idempotencyKey: row.idempotencyKey,
           notificationKey: row.notificationKey ?? undefined,
           payloadHash: row.payloadHash ?? undefined,
-          encrypted: false,
-          e2eeProtected: true,
+          encrypted: true,
+          localEncrypted: false,
+          e2eeProtected: false,
+          e2eeVerified: false,
+          relaySignatureVerified: true,
+          relayDeliveryState: 'QUEUED_AT_RELAY',
+          relayAcceptedAt: row.receivedAt,
+          deliveredAt: null,
         },
       });
     }
@@ -1087,14 +1159,20 @@ export function createRelayServer(db: SqliteRelayDatabase): RelayServerHandle {
         sourceDeviceId: r.sourceDeviceId,
         targetDeviceId: auth.publicId,
         createdAt: r.createdAt,
-        status: 'SYNCED',
+        status: r.deliveredAt != null ? 'SYNCED' : 'IN_PROGRESS',
         retryCount: 0,
         nextRetryAt: null,
         idempotencyKey: r.idempotencyKey,
         notificationKey: r.notificationKey ?? undefined,
         payloadHash: r.payloadHash ?? undefined,
-        encrypted: false,
-        e2eeProtected: true,
+        encrypted: true,
+        localEncrypted: false,
+        e2eeProtected: false,
+        e2eeVerified: false,
+        relaySignatureVerified: true,
+        relayDeliveryState: r.deliveredAt != null ? 'DELIVERED' : 'QUEUED_AT_RELAY',
+        relayAcceptedAt: r.receivedAt,
+        deliveredAt: r.deliveredAt ?? null,
       }));
       res.json({ events: rows });
     }

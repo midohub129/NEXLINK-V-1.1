@@ -70,3 +70,10 @@ V2: Verified
 ========================================
 END OF RECORD
 ========================================
+
+[Cross-Environment Build & CI Notes (Linux / GitHub Actions vs Termux)]
+- Gradle Wrapper: ./gradlew (Gradle 8.11.1, SHA-256 verified) compatible with AGP 8.9.2, Kotlin 2.1.20, KSP 2.1.20-1.0.32, Room 2.7.2, JDK 17.
+- Shared gradle.properties no longer hardcodes android.aapt2FromMavenOverride=/data/data/com.termux/files/usr/bin/aapt2.
+- On Linux / CI: run ./gradlew :app:assembleDebug and ./gradlew :app:testDebugUnitTest directly (uses Maven AAPT2 automatically).
+- On Termux (aarch64): keep tools/aapt2-termux or pass -Pandroid.aapt2FromMavenOverride=/data/data/com.termux/files/usr/bin/aapt2 (or store it in ~/.gradle/gradle.properties).
+

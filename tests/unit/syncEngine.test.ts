@@ -391,12 +391,16 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
       sourceDeviceId: peerDevice.publicId,
       targetDeviceId: myId.publicId,
       createdAt: 1000,
-      status: 'SYNCED',
+      status: 'IN_PROGRESS',
       retryCount: 0,
       nextRetryAt: null,
       idempotencyKey: 'idem-tamper-1',
-      encrypted: false,
-      e2eeProtected: true,
+      encrypted: true,
+      localEncrypted: false,
+      e2eeProtected: false,
+      e2eeVerified: false,
+      relaySignatureVerified: true,
+      relayDeliveryState: 'QUEUED_AT_RELAY',
     });
     assert.equal(acceptedTampered, false);
     assert.equal(transport.ackedRelayEventIds.length, 0);
@@ -415,12 +419,14 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
       sourceDeviceId: peerDevice.publicId,
       targetDeviceId: myId.publicId,
       createdAt: 1000,
-      status: 'SYNCED',
+      status: 'IN_PROGRESS',
       retryCount: 0,
       nextRetryAt: null,
       idempotencyKey: 'idem-wrong-wrapper',
-      encrypted: false,
-      e2eeProtected: true,
+      encrypted: true,
+      localEncrypted: false,
+      e2eeProtected: false,
+      e2eeVerified: false,
     });
     assert.equal(mismatchIdem, false);
     assert.equal(transport.ackedRelayEventIds.length, 0);
@@ -434,12 +440,14 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
       sourceDeviceId: peerDevice.publicId,
       targetDeviceId: myId.publicId,
       createdAt: 1000,
-      status: 'SYNCED',
+      status: 'IN_PROGRESS',
       retryCount: 0,
       nextRetryAt: null,
       idempotencyKey: 'idem-tamper-1',
-      encrypted: false,
-      e2eeProtected: true,
+      encrypted: true,
+      localEncrypted: false,
+      e2eeProtected: false,
+      e2eeVerified: false,
     });
     assert.equal(acceptedValid, true);
     assert.deepEqual(transport.ackedRelayEventIds, [902]);
@@ -452,12 +460,14 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
       sourceDeviceId: peerDevice.publicId,
       targetDeviceId: myId.publicId,
       createdAt: 1000,
-      status: 'SYNCED',
+      status: 'IN_PROGRESS',
       retryCount: 0,
       nextRetryAt: null,
       idempotencyKey: 'idem-tamper-1',
-      encrypted: false,
-      e2eeProtected: true,
+      encrypted: true,
+      localEncrypted: false,
+      e2eeProtected: false,
+      e2eeVerified: false,
     });
     assert.equal(replayBlocked, false);
     assert.ok(security.getAuditLog().some((a) => a.action === 'REPLAY_BLOCKED'));
@@ -577,12 +587,14 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
         sourceDeviceId: peerDevice.publicId,
         targetDeviceId: myId.publicId,
         createdAt: oldTs,
-        status: 'SYNCED',
+        status: 'IN_PROGRESS',
         retryCount: 0,
         nextRetryAt: null,
         idempotencyKey: 'idem-reconnect-old',
-        encrypted: false,
-        e2eeProtected: true,
+        encrypted: true,
+        localEncrypted: false,
+        e2eeProtected: false,
+        e2eeVerified: false,
       },
     ];
 
@@ -591,9 +603,11 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
     await new Promise((r) => setTimeout(r, 40));
 
     assert.equal(syncEngine.getEvents().length, 1);
+    assert.equal(syncEngine.getEvents()[0].e2eeVerified, true);
+    assert.equal(syncEngine.getEvents()[0].e2eeProtected, true);
     assert.deepEqual(transport.ackedRelayEventIds, [777]);
 
-    // Simulate app restart (fresh seenE2eeNonces) receiving a redelivered copy of the same old idempotencyKey
+    // Simulate app restart receiving a replay of the OLD messageNonce -> BLOCKED persistently!
     await syncEngine.stop();
     const restartedEngine = new SyncEngine({
       repo: syncRepo,
@@ -606,6 +620,27 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
     });
     await restartedEngine.start();
 
+    const persistentReplayBlocked = await restartedEngine.ingestInboundEvent({
+      id: 779,
+      type: 'notification',
+      payload: '[E2EE_CIPHERTEXT]',
+      e2eeEnvelope: envelope1,
+      sourceDeviceId: peerDevice.publicId,
+      targetDeviceId: myId.publicId,
+      createdAt: oldTs,
+      status: 'IN_PROGRESS',
+      retryCount: 0,
+      nextRetryAt: null,
+      idempotencyKey: 'idem-reconnect-old',
+      encrypted: true,
+      localEncrypted: false,
+      e2eeProtected: false,
+      e2eeVerified: false,
+    });
+    assert.equal(persistentReplayBlocked, false);
+    assert.equal(transport.ackedRelayEventIds.includes(779), false);
+
+    // Re-delivery with a FRESH nonce & matching idempotencyKey deduplicates and ACKs cleanly
     const freshNonceCopy = await peerCrypto.encryptForPeer({
       plaintext: JSON.stringify({
         packageName: 'com.whatsapp',
@@ -630,18 +665,216 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
       sourceDeviceId: peerDevice.publicId,
       targetDeviceId: myId.publicId,
       createdAt: oldTs,
-      status: 'SYNCED',
+      status: 'IN_PROGRESS',
       retryCount: 0,
       nextRetryAt: null,
       idempotencyKey: 'idem-reconnect-old',
-      encrypted: false,
-      e2eeProtected: true,
+      encrypted: true,
+      localEncrypted: false,
+      e2eeProtected: false,
+      e2eeVerified: false,
     });
     assert.equal(deduped, true);
     // Stored count stays 1 (no duplicate row) and relay event #778 gets ACKed cleanly
     assert.equal(restartedEngine.getEvents().length, 1);
     assert.ok(transport.ackedRelayEventIds.includes(778));
     await restartedEngine.stop();
+  });
+
+  it('never sends /sync/ack when local storage fails, and rejects forged signatures or wrong ECDH keys without ACK', async () => {
+    const {
+      syncEngine,
+      syncRepo,
+      transport,
+      devices,
+      peerCrypto,
+      peerDevice,
+    } = await setupSyncHarness();
+    await transport.connect();
+    const myId = devices.getIdentity()!;
+
+    const env = await peerCrypto.encryptForPeer({
+      plaintext: JSON.stringify({
+        packageName: 'com.whatsapp',
+        title: 'Storage & Crypto Guard',
+        text: 'Must survive negative checks',
+        postedAt: 2222,
+      }),
+      senderDeviceId: peerDevice.publicId,
+      recipientDeviceId: myId.publicId,
+      senderCryptoKeyId: peerDevice.cryptoKeyId,
+      recipientCryptoKeyId: myId.cryptoKeyId,
+      recipientEcdhPublicKeyJwk: myId.ecdhPublicKeyJwk!,
+      sessionId: 'sess-neg',
+      idempotencyKey: 'idem-neg-1',
+    });
+
+    // 1. Forged ECDSA signature -> rejected, zero ACK
+    const forgedSigEnv = {
+      ...env,
+      signature: Buffer.alloc(64, 7).toString('base64'),
+    };
+    const forgedRes = await syncEngine.ingestInboundEvent({
+      id: 801,
+      type: 'notification',
+      payload: '[E2EE_CIPHERTEXT]',
+      e2eeEnvelope: forgedSigEnv,
+      sourceDeviceId: peerDevice.publicId,
+      targetDeviceId: myId.publicId,
+      createdAt: 2222,
+      status: 'IN_PROGRESS',
+      retryCount: 0,
+      nextRetryAt: null,
+      idempotencyKey: 'idem-neg-1',
+      encrypted: true,
+      localEncrypted: false,
+      e2eeProtected: false,
+      e2eeVerified: false,
+    });
+    assert.equal(forgedRes, false);
+    assert.equal(transport.ackedRelayEventIds.length, 0);
+
+    // 2. Wrong ECDH key encrypted by rogue keypair -> AES-GCM/signature mismatch -> zero ACK
+    const rogueCrypto = new NodeTestCryptoProvider();
+    const rogueEcdh = (await rogueCrypto.getOrCreateDeviceKeyPair()).ecdhPublicKeyJwk!;
+    const wrongKeyEnv = await peerCrypto.encryptForPeer({
+      plaintext: '{"title":"wrong"}',
+      senderDeviceId: peerDevice.publicId,
+      recipientDeviceId: myId.publicId,
+      senderCryptoKeyId: peerDevice.cryptoKeyId,
+      recipientCryptoKeyId: myId.cryptoKeyId,
+      recipientEcdhPublicKeyJwk: rogueEcdh,
+      sessionId: 'sess-wrong',
+      idempotencyKey: 'idem-wrong-key',
+    });
+    const wrongKeyRes = await syncEngine.ingestInboundEvent({
+      id: 802,
+      type: 'notification',
+      payload: '[E2EE_CIPHERTEXT]',
+      e2eeEnvelope: wrongKeyEnv,
+      sourceDeviceId: peerDevice.publicId,
+      targetDeviceId: myId.publicId,
+      createdAt: 2223,
+      status: 'IN_PROGRESS',
+      retryCount: 0,
+      nextRetryAt: null,
+      idempotencyKey: 'idem-wrong-key',
+      encrypted: true,
+      localEncrypted: false,
+      e2eeProtected: false,
+      e2eeVerified: false,
+    });
+    assert.equal(wrongKeyRes, false);
+    assert.equal(transport.ackedRelayEventIds.length, 0);
+
+    // 3. Storage insert failure -> MUST NOT ACK and MUST NOT cache nonce
+    const origInsert = syncRepo.insert.bind(syncRepo);
+    syncRepo.insert = async () => {
+      throw new Error('Simulated disk full');
+    };
+    const storageFailRes = await syncEngine.ingestInboundEvent({
+      id: 803,
+      type: 'notification',
+      payload: '[E2EE_CIPHERTEXT]',
+      e2eeEnvelope: env,
+      sourceDeviceId: peerDevice.publicId,
+      targetDeviceId: myId.publicId,
+      createdAt: 2222,
+      status: 'IN_PROGRESS',
+      retryCount: 0,
+      nextRetryAt: null,
+      idempotencyKey: 'idem-neg-1',
+      encrypted: true,
+      localEncrypted: false,
+      e2eeProtected: false,
+      e2eeVerified: false,
+    });
+    assert.equal(storageFailRes, false);
+    assert.equal(transport.ackedRelayEventIds.length, 0);
+    assert.equal(syncEngine.getEvents().length, 0);
+
+    // 4. Recover storage & verify same event now succeeds and ACKs cleanly
+    syncRepo.insert = origInsert;
+    const recoveredRes = await syncEngine.ingestInboundEvent({
+      id: 803,
+      type: 'notification',
+      payload: '[E2EE_CIPHERTEXT]',
+      e2eeEnvelope: env,
+      sourceDeviceId: peerDevice.publicId,
+      targetDeviceId: myId.publicId,
+      createdAt: 2222,
+      status: 'IN_PROGRESS',
+      retryCount: 0,
+      nextRetryAt: null,
+      idempotencyKey: 'idem-neg-1',
+      encrypted: true,
+      localEncrypted: false,
+      e2eeProtected: false,
+      e2eeVerified: false,
+    });
+    assert.equal(recoveredRes, true);
+    assert.deepEqual(transport.ackedRelayEventIds, [803]);
+    assert.equal(syncEngine.getEvents().length, 1);
+  });
+
+  it('retries delayed inbound /sync/ack upon reconnect without duplicating local stored events', async () => {
+    const { syncEngine, transport, devices, peerCrypto, peerDevice } =
+      await setupSyncHarness();
+    await transport.connect();
+    const myId = devices.getIdentity()!;
+
+    const env = await peerCrypto.encryptForPeer({
+      plaintext: JSON.stringify({
+        packageName: 'com.whatsapp',
+        title: 'Transient ACK drop',
+        text: 'Stored once, ACK retried',
+        postedAt: 3333,
+      }),
+      senderDeviceId: peerDevice.publicId,
+      recipientDeviceId: myId.publicId,
+      senderCryptoKeyId: peerDevice.cryptoKeyId,
+      recipientCryptoKeyId: myId.cryptoKeyId,
+      recipientEcdhPublicKeyJwk: myId.ecdhPublicKeyJwk!,
+      sessionId: 'sess-ack-drop',
+      idempotencyKey: 'idem-ack-drop-1',
+    });
+
+    const origAck = transport.acknowledgeInboundDelivery.bind(transport);
+    transport.acknowledgeInboundDelivery = async () => {
+      throw new Error('Network dropped before ACK');
+    };
+
+    const wireItem: SyncEvent = {
+      id: 850,
+      type: 'notification',
+      payload: '[E2EE_CIPHERTEXT]',
+      e2eeEnvelope: env,
+      sourceDeviceId: peerDevice.publicId,
+      targetDeviceId: myId.publicId,
+      createdAt: 3333,
+      status: 'IN_PROGRESS',
+      retryCount: 0,
+      nextRetryAt: null,
+      idempotencyKey: 'idem-ack-drop-1',
+      encrypted: true,
+      localEncrypted: false,
+      e2eeProtected: false,
+      e2eeVerified: false,
+    };
+
+    const firstIngest = await syncEngine.ingestInboundEvent(wireItem);
+    assert.equal(firstIngest, true);
+    assert.equal(syncEngine.getEvents().length, 1);
+    assert.equal(syncEngine.getEvents()[0].inboundAckConfirmed, false);
+    assert.equal(transport.ackedRelayEventIds.length, 0);
+
+    // Network recovers -> /inbox returns same un-ACKed event #850 -> ACK completes with 0 duplicates!
+    transport.acknowledgeInboundDelivery = origAck;
+    const secondIngest = await syncEngine.ingestInboundEvent(wireItem);
+    assert.equal(secondIngest, true);
+    assert.equal(syncEngine.getEvents().length, 1);
+    assert.equal(syncEngine.getEvents()[0].inboundAckConfirmed, true);
+    assert.deepEqual(transport.ackedRelayEventIds, [850]);
   });
 
   it('computes bounded exponential backoff correctly', () => {

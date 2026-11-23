@@ -561,13 +561,22 @@ export function NotificationHistoryView({
                           E2EE (ECDH+HKDF+AES-GCM)
                         </span>
                       </>
-                    ) : event.encrypted ? (
+                    ) : (event.localEncrypted ?? event.encrypted) ? (
                       <>
                         <span aria-hidden="true" className="text-[#A5B1C6]">
                           ·
                         </span>
                         <span className="text-xs font-normal text-[#4B91FF]">
                           مشفّر محلياً (AES-GCM)
+                        </span>
+                      </>
+                    ) : event.encrypted ? (
+                      <>
+                        <span aria-hidden="true" className="text-[#A5B1C6]">
+                          ·
+                        </span>
+                        <span className="text-xs font-normal text-[#FFBE50]">
+                          مغلف مشفّر (بانتظار التحقق الطرفي)
                         </span>
                       </>
                     ) : (

@@ -286,14 +286,38 @@ describe('End-to-End Authenticated Relay Transport, Mutual Pairing, E2EE & Peer 
       assert.ok(midFlightOnA.relayAcceptedAt !== null);
       assert.equal(midFlightOnA.deliveredAt, null);
 
+      // Inspect raw Relay /inbox wire format BEFORE B ingests/ACKs:
+      // Must NOT claim status === 'SYNCED' or encrypted === false or e2eeProtected === true!
+      const rawInboxBeforeAck = await deviceB.transport.fetchInboundEvents(
+        deviceB.identity.publicId
+      );
+      assert.equal(rawInboxBeforeAck.length, 1);
+      assert.equal(rawInboxBeforeAck[0].status, 'IN_PROGRESS');
+      assert.equal(rawInboxBeforeAck[0].relayDeliveryState, 'QUEUED_AT_RELAY');
+      assert.equal(rawInboxBeforeAck[0].encrypted, true);
+      assert.equal(rawInboxBeforeAck[0].localEncrypted, false);
+      assert.equal(rawInboxBeforeAck[0].e2eeProtected, false);
+      assert.equal(rawInboxBeforeAck[0].e2eeVerified, false);
+      assert.equal(rawInboxBeforeAck[0].relaySignatureVerified, true);
+      assert.equal(rawInboxBeforeAck[0].deliveredAt, null);
+      assert.equal(rawInboxBeforeAck[0].payload, '[E2EE_CIPHERTEXT]');
+
       // Device B comes back online -> auto-pulls /inbox, decrypts E2EE, stores locally, and sends /sync/ack
       await deviceB.devices.connectRelay('basic', 'Receiver Tablet');
       await new Promise((r) => setTimeout(r, 150));
 
       assert.equal(deviceB.syncEngine.getEvents().length, 1);
+      assert.equal(deviceB.syncEngine.getEvents()[0].e2eeProtected, true);
+      assert.equal(deviceB.syncEngine.getEvents()[0].e2eeVerified, true);
       assert.ok(
         deviceB.syncEngine.getEvents()[0].payload.includes('Delivered once B reconnects')
       );
+
+      // After B ACKs, /inbox no longer serves the delivered event
+      const rawInboxAfterAck = await deviceB.transport.fetchInboundEvents(
+        deviceB.identity.publicId
+      );
+      assert.equal(rawInboxAfterAck.length, 0);
 
       // Polling / status or WS sync:delivered moves A to SYNCED with deliveredAt
       await deviceA.syncEngine.runSyncCycle();

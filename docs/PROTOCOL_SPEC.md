@@ -120,13 +120,29 @@ REGISTER|{publicId}|{cryptoKeyId}|{sha256Hex(JSON.stringify(ecdhPublicKeyJwk))}|
      E2EE|{sha256Hex(aad)}|{sha256Hex(ivBase64 + ":" + ciphertextBase64)}
      ```
 
-4. **التحقق على الخادم والمستلم**:
-   - يرفض خادم Relay أي حدث بلا `e2eeEnvelope` صحيح (`422 E2EE_ENVELOPE_REQUIRED`) أو عند عدم تطابق `senderCryptoKeyId` / `recipientCryptoKeyId` (`422 E2EE_KEY_ID_MISMATCH`).
-   - يتحقق المستلم من ارتباطه بالمرسل (`PAIRED` وبصمة مطابقة)، ومن تطابق `aad` مع الغلاف ومع `remoteEvent.idempotencyKey`، ومن توقيع ECDSA قبل فك تشفير AES-GCM، ويرفض تكرار `messageNonce` أو `idempotencyKey`.
+4. **التحقق على الخادم والمستلم ودلالات حقول التشفير**:
+   - يرفض خادم Relay أي حدث بلا `e2eeEnvelope` صحيح (`422 E2EE_ENVELOPE_REQUIRED`)، أو عند عدم تطابق `senderCryptoKeyId` / `recipientCryptoKeyId` (`422 E2EE_KEY_ID_MISMATCH`)، أو عدم تطابق `aad` مع الحدث (`422 E2EE_AAD_INVALID`)، أو فشل توقيع ECDSA للمرسل على الغلاف (`422 E2EE_ENVELOPE_SIGNATURE_INVALID`)، أو تكرار `messageNonce` لحدث مختلف (`409 E2EE_NONCE_REUSED`).
+   - **دلالات الحقول عبر السلك (`sync:event` و`GET /sync/:deviceId/inbox`)**:
+     - `encrypted: true` (الحمولة على السلك نص مشفر `[E2EE_CIPHERTEXT]` بلا أي نص صريح).
+     - `localEncrypted: false` (خادم Relay لا يمتلك مفتاح تشفير محلي للنص الصريح).
+     - `e2eeProtected: false` و`e2eeVerified: false` (خادم Relay لا يملك مفاتيح ECDH الخاصة ولا يستطيع إثبات فك التشفير الطرفي؛ يثبت فقط `relaySignatureVerified: true`).
+     - يصبح `e2eeProtected: true` و`e2eeVerified: true` **فقط** على جهاز المستلم بعد التحقق الكامل من الاقتران + التوقيع + AAD + فك تشفير AES-256-GCM + الحفظ المحلي.
+   - يتحقق المستلم من ارتباطه بالمرسل (`PAIRED` وبصمة مطابقة)، ومن تطابق `aad` مع الغلاف ومع `remoteEvent.idempotencyKey`، ومن توقيع ECDSA **قبل** اشتقاق مفتاح ECDH/HKDF أو فك تشفير AES-GCM، ويرفض تكرار `messageNonce` بشكل مستمر عبر إعادة التشغيل.
 
 ---
 
-## 5. Delivery-Verified Sync State Machine
+## 5. Delivery-Verified Sync Lifecycle & State Machine
+
+يمر كل حدث متزامن بالمراحل التسع التالية:
+1. **الالتقاط/الإنشاء محلياً (Sender Local Save)**: `status = PENDING`، مشفر محلياً (`localEncrypted = encrypted = true` عند توفر Keystore).
+2. **التشفير الطرفي والإرسال (`POST /sync`)**: يُشفَّر الحدث عبر `encryptForPeer` ويُحوَّل محلياً إلى `status = IN_PROGRESS`.
+3. **استلام Relay والتحقق الأولي**: يتحقق الخادم من التوقيع الرقمي والاقتران وAAD وتكرار `messageNonce`، ويخزن الغلاف المشفّر فقط مع `delivered_at = NULL`.
+4. **استلام المرسل لرد القبول**: في سياسة `PEER_CONFIRMED` المعتمدة يبقى الحدث `IN_PROGRESS` مع ضبط `relayAcceptedAt` وبقاء `deliveredAt = null` (لا يُعدّ `SYNCED` بمجرد وصوله للوسيط).
+5. **الإرسال للمستلم (`sync:event` أو `GET /inbox`)**: يُرسله الخادم بحالة `status = IN_PROGRESS` و`relayDeliveryState = QUEUED_AT_RELAY` (لا يدّعي الخادم أبداً `SYNCED` قبل ACK).
+6. **التحقق وفك التشفير على المستلم**: فحص الاقتران -> فحص عدم تكرار `messageNonce` -> التحقق من توقيع ECDSA وAAD -> فك تشفير AES-256-GCM. أي فشل يوقف المسار فوراً دون إرسال ACK.
+7. **الحفظ المحلي على المستلم**: يُحفظ محلياً مع `e2eeNonce` و`e2eeVerified = true` و`e2eeProtected = true`. إذا فشل الحفظ المحلي يُلغى التسليم ولا يُرسل ACK.
+8. **تأكيد الاستلام (`POST /sync/ack`)**: يُرسل **فقط بعد** نجاح الحفظ المحلي؛ يحدّث الخادم `delivered_at` ويدفع `sync:delivered` للمرسل. عند تعذّر ACK مؤقتاً يظل الحدث في `/inbox` ويعاد ACK عند إعادة الاتصال دون تكرار محلي بفضل `idempotencyKey`.
+9. **اكتمال دورة المرسل**: عند وصول `sync:delivered` أو استعلام `GET /sync/:deviceId/status` ينتقل المرسل من `IN_PROGRESS` إلى `SYNCED` مع ضبط `deliveredAt`.
 
 | الحالة المحلية | المعنى | الانتقالات |
 | --- | --- | --- |
@@ -137,6 +153,6 @@ REGISTER|{publicId}|{cryptoKeyId}|{sha256Hex(JSON.stringify(ecdhPublicKeyJwk))}|
 
 - **نقاط نهاية المزامنة**:
   - `POST /sync`: إرسال دفعة أحداث مشفرة.
-  - `GET /sync/:deviceId/inbox`: سحب الأحداث الواردة للأجهزة المقترنة عند الاتصال أو الاستعادة.
+  - `GET /sync/:deviceId/inbox`: سحب الأحداث الواردة غير المؤكدة (`delivered_at IS NULL`) للأجهزة المقترنة.
   - `POST /sync/ack`: تأكيد المستلم بعد نجاح التحقق التشفيري والحفظ المحلي.
   - `GET /sync/:deviceId/status?ids=1,2`: استعلام المرسل عن تأكيدات التسليم المعلّقة.

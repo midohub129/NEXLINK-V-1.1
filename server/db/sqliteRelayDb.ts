@@ -985,6 +985,30 @@ export class SqliteRelayDatabase {
     });
   }
 
+  hasUsedMessageNonce(
+    sourceDeviceId: string,
+    messageNonce: string,
+    excludingIdempotencyKey?: string
+  ): boolean {
+    const row = excludingIdempotencyKey
+      ? (this.db
+          .prepare(
+            `SELECT id FROM relay_events
+             WHERE source_device_id = ? AND message_nonce = ? AND idempotency_key != ?
+             LIMIT 1`
+          )
+          .get(sourceDeviceId, messageNonce, excludingIdempotencyKey) as
+          { id: number } | undefined)
+      : (this.db
+          .prepare(
+            `SELECT id FROM relay_events
+             WHERE source_device_id = ? AND message_nonce = ?
+             LIMIT 1`
+          )
+          .get(sourceDeviceId, messageNonce) as { id: number } | undefined);
+    return Boolean(row);
+  }
+
   ingestSyncBatch(
     sourceDeviceId: string,
     targetDeviceId: string,
@@ -1015,6 +1039,7 @@ export class SqliteRelayDatabase {
       notificationKey: string | null;
       payloadHash: string | null;
       createdAt: number;
+      receivedAt: number;
     }>;
   } {
     const now = Date.now();
@@ -1033,6 +1058,7 @@ export class SqliteRelayDatabase {
         notificationKey: string | null;
         payloadHash: string | null;
         createdAt: number;
+        receivedAt: number;
       }> = [];
 
       const findStmt = this.db.prepare(
@@ -1081,6 +1107,7 @@ export class SqliteRelayDatabase {
           notificationKey: evt.notificationKey ?? null,
           payloadHash: evt.payloadHash ?? null,
           createdAt: evt.createdAt,
+          receivedAt: now,
         });
       }
 
@@ -1150,19 +1177,22 @@ export class SqliteRelayDatabase {
     type: string;
     payload: string;
     createdAt: number;
+    receivedAt: number;
+    deliveredAt: number | null;
     idempotencyKey: string;
     notificationKey: string | null;
     payloadHash: string | null;
   }> {
     const rows = this.db
       .prepare(
-        `SELECT r.id, r.source_device_id, r.type, r.payload, r.created_at, r.idempotency_key, r.notification_key, r.payload_hash
+        `SELECT r.id, r.source_device_id, r.type, r.payload, r.created_at, r.received_at, r.delivered_at, r.idempotency_key, r.notification_key, r.payload_hash
          FROM relay_events r
          JOIN device_links dl
            ON ((dl.device_a = r.source_device_id AND dl.device_b = r.target_device_id)
             OR (dl.device_b = r.source_device_id AND dl.device_a = r.target_device_id))
          WHERE r.target_device_id = ?
            AND dl.pairing_state = 'PAIRED'
+           AND r.delivered_at IS NULL
          ORDER BY r.created_at DESC
          LIMIT 100`
       )
@@ -1172,6 +1202,8 @@ export class SqliteRelayDatabase {
       type: string;
       payload: string;
       created_at: number;
+      received_at: number;
+      delivered_at: number | null;
       idempotency_key: string;
       notification_key: string | null;
       payload_hash: string | null;
@@ -1183,6 +1215,8 @@ export class SqliteRelayDatabase {
       type: r.type,
       payload: r.payload,
       createdAt: r.created_at,
+      receivedAt: r.received_at,
+      deliveredAt: r.delivered_at,
       idempotencyKey: r.idempotency_key,
       notificationKey: r.notification_key,
       payloadHash: r.payload_hash,
