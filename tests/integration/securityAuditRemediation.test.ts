@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import express from 'express';
-import { WebSocket } from 'ws';
+import { WebSocket, type RawData } from 'ws';
 import { SqliteRelayDatabase } from '../../server/db/sqliteRelayDb';
 import { attachRelayUpgrade, createRelayServer } from '../../server/relay/relayRouter';
 import { SecurityError } from '../../src/domain/errors/appError';
@@ -46,6 +46,175 @@ async function createTestRelayServer() {
       rmSync(dir, { recursive: true, force: true });
     },
   };
+}
+
+
+const WEBSOCKET_TEST_TIMEOUT_MS = 10_000;
+
+function waitForWebSocketClose(
+  ws: WebSocket,
+  label: string,
+  timeoutMs = WEBSOCKET_TEST_TIMEOUT_MS
+): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      ws.off('close', onClose);
+      ws.off('error', onError);
+    };
+    const onClose = (code: number) => {
+      cleanup();
+      resolve(code);
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(new Error(`${label}: WebSocket error: ${error.message}`));
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      ws.terminate();
+      reject(new Error(`${label}: timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    ws.once('close', onClose);
+    ws.once('error', onError);
+  });
+}
+
+function waitForRelayConnected(
+  ws: WebSocket,
+  expectedDeviceId: string,
+  label: string,
+  timeoutMs = WEBSOCKET_TEST_TIMEOUT_MS
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      ws.off('message', onMessage);
+      ws.off('close', onClose);
+      ws.off('error', onError);
+    };
+    const onMessage = (raw: RawData) => {
+      try {
+        const msg = JSON.parse(raw.toString('utf8')) as {
+          type?: string;
+          deviceId?: string;
+        };
+        if (msg.type !== 'relay:connected' || msg.deviceId !== expectedDeviceId) {
+          cleanup();
+          reject(new Error(
+            `${label}: unexpected readiness frame (type=${String(msg.type)}, deviceId=${String(msg.deviceId)})`
+          ));
+          return;
+        }
+        cleanup();
+        resolve();
+      } catch (error) {
+        cleanup();
+        reject(error);
+      }
+    };
+    const onClose = (code: number) => {
+      cleanup();
+      reject(new Error(`${label}: WebSocket closed before relay:connected (code ${code})`));
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(new Error(`${label}: WebSocket error: ${error.message}`));
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      ws.terminate();
+      reject(new Error(`${label}: timed out waiting for relay:connected after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    ws.once('message', onMessage);
+    ws.once('close', onClose);
+    ws.once('error', onError);
+  });
+}
+
+function waitForFirstWebSocketMessage(
+  ws: WebSocket,
+  label: string,
+  timeoutMs = WEBSOCKET_TEST_TIMEOUT_MS
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      ws.off('message', onMessage);
+      ws.off('close', onClose);
+      ws.off('error', onError);
+    };
+    const onMessage = () => {
+      cleanup();
+      resolve();
+    };
+    const onClose = (code: number) => {
+      cleanup();
+      reject(new Error(`${label}: WebSocket closed before its first message (code ${code})`));
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(new Error(`${label}: WebSocket error: ${error.message}`));
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      ws.terminate();
+      reject(new Error(`${label}: timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    ws.once('message', onMessage);
+    ws.once('close', onClose);
+    ws.once('error', onError);
+  });
+}
+
+function waitForWebSocketSyncEvent(
+  ws: WebSocket,
+  label: string,
+  timeoutMs = WEBSOCKET_TEST_TIMEOUT_MS
+): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      ws.off('message', onMessage);
+      ws.off('close', onClose);
+      ws.off('error', onError);
+    };
+    const onMessage = (raw: RawData) => {
+      try {
+        const msg = JSON.parse(raw.toString('utf8')) as {
+          type?: string;
+          event?: Record<string, unknown>;
+        };
+        if (msg.type === 'sync:event' && msg.event) {
+          cleanup();
+          resolve(msg.event);
+        }
+      } catch (error) {
+        cleanup();
+        reject(error);
+      }
+    };
+    const onClose = (code: number) => {
+      cleanup();
+      reject(new Error(`${label}: WebSocket closed before sync:event (code ${code})`));
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(new Error(`${label}: WebSocket error: ${error.message}`));
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      ws.terminate();
+      reject(new Error(`${label}: timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    ws.on('message', onMessage);
+    ws.once('close', onClose);
+    ws.once('error', onError);
+  });
 }
 
 async function registerAndAuthenticate(
@@ -330,6 +499,7 @@ describe('P0/P1 Negative Security, E2EE & Reliability Audit Suite', () => {
 
   it('6. WebSocket Identity Spoofing & 12. Revoked Device Session Rejection', async () => {
     const srv = await createTestRelayServer();
+    let peerWs: WebSocket | undefined;
     try {
       const admin = await registerAndAuthenticate(
         srv.baseUrl,
@@ -345,10 +515,11 @@ describe('P0/P1 Negative Security, E2EE & Reliability Audit Suite', () => {
       );
 
       // 6a. Spoofing WS with legacy ?deviceId= query param without ticket -> closed 1008
-      const spoofCode = await new Promise<number>((resolve) => {
-        const ws = new WebSocket(`${srv.wsBaseUrl}?deviceId=${admin.publicId}`);
-        ws.on('close', (code) => resolve(code));
-      });
+      const spoofWs = new WebSocket(`${srv.wsBaseUrl}?deviceId=${admin.publicId}`);
+      const spoofCode = await waitForWebSocketClose(
+        spoofWs,
+        'Unauthenticated WebSocket rejection'
+      );
       assert.equal(spoofCode, 1008);
 
       // 6b. Obtain legitimate single-use ticket for peer
@@ -357,21 +528,19 @@ describe('P0/P1 Negative Security, E2EE & Reliability Audit Suite', () => {
       const { ticket } = (await ticketRes.json()) as { ticket: string };
 
       // Connect peer WS cleanly
-      const peerWs = new WebSocket(
+      peerWs = new WebSocket(
         `${srv.wsBaseUrl}?ticket=${encodeURIComponent(ticket)}`
       );
-      await new Promise<void>((resolve, reject) => {
-        peerWs.once('message', () => resolve());
-        peerWs.once('error', reject);
-      });
+      await waitForFirstWebSocketMessage(peerWs, 'Authenticated peer WebSocket');
 
       // Replaying the same single-use WS ticket fails with 1008
-      const replayWsCode = await new Promise<number>((resolve) => {
-        const ws2 = new WebSocket(
-          `${srv.wsBaseUrl}?ticket=${encodeURIComponent(ticket)}`
-        );
-        ws2.on('close', (code) => resolve(code));
-      });
+      const replayWs = new WebSocket(
+        `${srv.wsBaseUrl}?ticket=${encodeURIComponent(ticket)}`
+      );
+      const replayWsCode = await waitForWebSocketClose(
+        replayWs,
+        'Replayed single-use WebSocket ticket rejection'
+      );
       assert.equal(replayWsCode, 1008);
 
       // Pair admin <-> peer so admin can revoke trust
@@ -387,9 +556,10 @@ describe('P0/P1 Negative Security, E2EE & Reliability Audit Suite', () => {
       });
 
       // 12. Revoked Device Session Rejection: Admin revokes trust on peer
-      const closePromise = new Promise<number>((resolve) => {
-        peerWs.once('close', (code) => resolve(code));
-      });
+      const closePromise = waitForWebSocketClose(
+        peerWs,
+        'Revoked peer WebSocket closure'
+      );
       const revokeRes = await admin.signedFetch(
         'POST',
         `/devices/${admin.publicId}/revoke`,
@@ -413,12 +583,14 @@ describe('P0/P1 Negative Security, E2EE & Reliability Audit Suite', () => {
       });
       assert.equal(newChal.status, 403);
     } finally {
+      peerWs?.terminate();
       await srv.close();
     }
   });
 
   it('7. Unauthorized Sync, 8. E2EE Integrity, 9. Tampered Ciphertext Rejection & 10. Duplicate Delivery Prevention', async () => {
     const srv = await createTestRelayServer();
+    let rxWs: WebSocket | undefined;
     try {
       const sender = await registerAndAuthenticate(
         srv.baseUrl,
@@ -739,22 +911,18 @@ describe('P0/P1 Negative Security, E2EE & Reliability Audit Suite', () => {
       const wsTicketRes = await receiver.signedFetch('POST', '/ws/ticket', {});
       assert.equal(wsTicketRes.status, 200);
       const { ticket: rxTicket } = (await wsTicketRes.json()) as { ticket: string };
-      const rxWs = new WebSocket(
+      rxWs = new WebSocket(
         `${srv.wsBaseUrl}?ticket=${encodeURIComponent(rxTicket)}`
       );
-      const wsSyncFramePromise = new Promise<Record<string, unknown>>(
-        (resolve, reject) => {
-          rxWs.on('message', (raw) => {
-            const msg = JSON.parse(raw.toString('utf8')) as {
-              type?: string;
-              event?: Record<string, unknown>;
-            };
-            if (msg.type === 'sync:event' && msg.event) {
-              resolve(msg.event);
-            }
-          });
-          rxWs.on('error', reject);
-        }
+      // Do not publish until the relay confirms this receiver is registered.
+      await waitForRelayConnected(
+        rxWs,
+        receiver.publicId,
+        'Authenticated receiver WebSocket'
+      );
+      const wsSyncFramePromise = waitForWebSocketSyncEvent(
+        rxWs,
+        'Relay sync:event delivery'
       );
 
       const wsEnv = await sender.crypto.encryptForPeer({
@@ -793,6 +961,7 @@ describe('P0/P1 Negative Security, E2EE & Reliability Audit Suite', () => {
       assert.equal(wsEvent.relayDeliveryState, 'QUEUED_AT_RELAY');
       rxWs.close();
     } finally {
+      rxWs?.terminate();
       await srv.close();
     }
   });
