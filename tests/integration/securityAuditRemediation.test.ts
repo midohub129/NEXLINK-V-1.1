@@ -81,6 +81,59 @@ function waitForWebSocketClose(
   });
 }
 
+function waitForRelayConnected(
+  ws: WebSocket,
+  expectedDeviceId: string,
+  label: string,
+  timeoutMs = WEBSOCKET_TEST_TIMEOUT_MS
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      ws.off('message', onMessage);
+      ws.off('close', onClose);
+      ws.off('error', onError);
+    };
+    const onMessage = (raw: RawData) => {
+      try {
+        const msg = JSON.parse(raw.toString('utf8')) as {
+          type?: string;
+          deviceId?: string;
+        };
+        if (msg.type !== 'relay:connected' || msg.deviceId !== expectedDeviceId) {
+          cleanup();
+          reject(new Error(
+            `${label}: unexpected readiness frame (type=${String(msg.type)}, deviceId=${String(msg.deviceId)})`
+          ));
+          return;
+        }
+        cleanup();
+        resolve();
+      } catch (error) {
+        cleanup();
+        reject(error);
+      }
+    };
+    const onClose = (code: number) => {
+      cleanup();
+      reject(new Error(`${label}: WebSocket closed before relay:connected (code ${code})`));
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(new Error(`${label}: WebSocket error: ${error.message}`));
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      ws.terminate();
+      reject(new Error(`${label}: timed out waiting for relay:connected after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    ws.once('message', onMessage);
+    ws.once('close', onClose);
+    ws.once('error', onError);
+  });
+}
+
 function waitForFirstWebSocketMessage(
   ws: WebSocket,
   label: string,
@@ -860,6 +913,12 @@ describe('P0/P1 Negative Security, E2EE & Reliability Audit Suite', () => {
       const { ticket: rxTicket } = (await wsTicketRes.json()) as { ticket: string };
       rxWs = new WebSocket(
         `${srv.wsBaseUrl}?ticket=${encodeURIComponent(rxTicket)}`
+      );
+      // Do not publish until the relay confirms this receiver is registered.
+      await waitForRelayConnected(
+        rxWs,
+        receiver.publicId,
+        'Authenticated receiver WebSocket'
       );
       const wsSyncFramePromise = waitForWebSocketSyncEvent(
         rxWs,
