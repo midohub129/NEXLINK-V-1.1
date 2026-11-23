@@ -7,6 +7,7 @@ import type {
   ITransportClient,
 } from '../../domain/interfaces/services';
 import type { LinkedDevice } from '../../domain/models/device';
+import type { E2eeEnvelope } from '../../domain/models/security';
 import type {
   NotificationPayload,
   SyncEvent,
@@ -16,6 +17,19 @@ import type {
 import type { DeviceManager } from '../devices/deviceManager';
 import type { SecurityManager } from '../security/securityManager';
 import type { SettingsService } from '../settings/settingsService';
+
+interface InboundDeliveryContext {
+  localEvent: SyncEvent;
+  remoteEvent: SyncEvent;
+  envelope: E2eeEnvelope;
+  senderPeer: LinkedDevice;
+  devicePublicId: string;
+}
+
+interface InboundConfirmResult {
+  bindingValid: boolean;
+  ackConfirmed: boolean;
+}
 
 const DEDUP_WINDOW_MS = 60_000;
 const BASE_BACKOFF_MS = 1_500;
@@ -468,6 +482,21 @@ export class SyncEngine implements ILifecycleParticipant {
     }
 
     if (
+      typeof remoteEvent.id !== 'number' ||
+      !Number.isInteger(remoteEvent.id) ||
+      remoteEvent.id <= 0
+    ) {
+      await this.security.recordAudit({
+        action: 'ACCESS_DENIED',
+        actorRole: role,
+        deviceId: identity.publicId,
+        outcome: 'DENIED',
+        details: 'رفض حدث وارد لعدم وجود معرف Relay صالح',
+      });
+      return false;
+    }
+
+    if (
       remoteEvent.sourceDeviceId &&
       remoteEvent.sourceDeviceId !== envelope.senderDeviceId
     ) {
@@ -481,31 +510,75 @@ export class SyncEngine implements ILifecycleParticipant {
       return false;
     }
 
+    if (
+      envelope.recipientDeviceId !== identity.publicId ||
+      (remoteEvent.targetDeviceId &&
+        remoteEvent.targetDeviceId !== identity.publicId) ||
+      envelope.senderDeviceId === identity.publicId
+    ) {
+      await this.security.recordAudit({
+        action: 'ACCESS_DENIED',
+        actorRole: role,
+        deviceId: identity.publicId,
+        outcome: 'DENIED',
+        details: `رفض حدث وارد #${remoteEvent.id} لعدم تطابق الجهاز المستلم أو انتحال المرسل`,
+      });
+      return false;
+    }
+
     if (this.seenE2eeNonces.has(envelope.messageNonce)) {
       const existingUnacked = await this.repo.findByIdempotencyKey(
         remoteEvent.idempotencyKey
       );
-      const trustedSender = this.getTrustedPairedPeersMap().get(envelope.senderDeviceId);
+      const trustedSender = this.getTrustedPairedPeersMap().get(
+        envelope.senderDeviceId
+      );
 
       if (
         existingUnacked &&
         trustedSender &&
+        trustedSender.publicKeyJwk &&
+        trustedSender.ecdhPublicKeyJwk &&
         trustedSender.cryptoKeyId === envelope.senderCryptoKeyId &&
         existingUnacked.e2eeNonce === envelope.messageNonce &&
         existingUnacked.relayEventId === remoteEvent.id &&
-        existingUnacked.sourceDeviceId === envelope.senderDeviceId &&
+        existingUnacked.sourceDeviceId === trustedSender.publicId &&
         existingUnacked.targetDeviceId === identity.publicId &&
         existingUnacked.e2eeProtected === true &&
         existingUnacked.e2eeVerified === true &&
         (existingUnacked.inboundAckConfirmed === false ||
           existingUnacked.status !== 'SYNCED')
       ) {
-        await this.confirmInboundDeliveryOrKeepInProgress(
-          existingUnacked,
-          identity.publicId,
-          remoteEvent.id
-        );
-        return true;
+        try {
+          await this.crypto.decryptFromPeer({
+            envelope,
+            senderEcdsaPublicKeyJwk: trustedSender.publicKeyJwk,
+            senderEcdhPublicKeyJwk: trustedSender.ecdhPublicKeyJwk,
+            expectedRecipientDeviceId: identity.publicId,
+            expectedRecipientCryptoKeyId: identity.cryptoKeyId,
+            expectedIdempotencyKey: remoteEvent.idempotencyKey,
+          });
+        } catch (err) {
+          const msg =
+            err instanceof SecurityError ? err.message : 'فشل التحقق وفك التشفير E2EE';
+          await this.security.recordAudit({
+            action: 'E2EE_DECRYPT_FAILED',
+            actorRole: role,
+            deviceId: identity.publicId,
+            outcome: 'DENIED',
+            details: `${msg} (إعادة تسليم #${remoteEvent.id})`,
+          });
+          return false;
+        }
+
+        const confirmOutcome = await this.confirmInboundDeliveryOrKeepInProgress({
+          localEvent: existingUnacked,
+          remoteEvent,
+          envelope,
+          senderPeer: trustedSender,
+          devicePublicId: identity.publicId,
+        });
+        return confirmOutcome.bindingValid;
       }
 
       await this.security.recordAudit({
@@ -518,16 +591,7 @@ export class SyncEngine implements ILifecycleParticipant {
       return false;
     }
 
-    const senderPeer = this.devices
-      .getLinkedDevices()
-      .find(
-        (d) =>
-          d.publicId === envelope.senderDeviceId &&
-          d.pairingState === 'PAIRED' &&
-          d.verifiedByRelay &&
-          d.publicKeyJwk &&
-          d.ecdhPublicKeyJwk
-      );
+    const senderPeer = this.getTrustedPairedPeersMap().get(envelope.senderDeviceId);
 
     if (
       !senderPeer ||
@@ -571,24 +635,37 @@ export class SyncEngine implements ILifecycleParticipant {
     const existingByKey = await this.repo.findByIdempotencyKey(
       remoteEvent.idempotencyKey
     );
-    const existing =
-      existingByKey ??
-      (await this.repo.findRecentDuplicate(
-        remoteEvent.type,
-        remoteEvent.notificationKey ?? remoteEvent.idempotencyKey,
-        remoteEvent.payloadHash ?? remoteEvent.idempotencyKey,
-        DEDUP_WINDOW_MS * 10,
-        Date.now()
-      ));
-
-    if (existing) {
+    if (existingByKey) {
+      const confirmOutcome = await this.confirmInboundDeliveryOrKeepInProgress({
+        localEvent: existingByKey,
+        remoteEvent,
+        envelope,
+        senderPeer,
+        devicePublicId: identity.publicId,
+      });
+      if (!confirmOutcome.bindingValid) {
+        return false;
+      }
       this.seenE2eeNonces.add(envelope.messageNonce);
-      await this.confirmInboundDeliveryOrKeepInProgress(
-        existing,
-        identity.publicId,
-        remoteEvent.id
-      );
       return true;
+    }
+
+    const recentDuplicate = await this.repo.findRecentDuplicate(
+      remoteEvent.type,
+      remoteEvent.notificationKey ?? remoteEvent.idempotencyKey,
+      remoteEvent.payloadHash ?? remoteEvent.idempotencyKey,
+      DEDUP_WINDOW_MS * 10,
+      Date.now()
+    );
+    if (recentDuplicate) {
+      await this.security.recordAudit({
+        action: 'DUPLICATE_BLOCKED',
+        actorRole: role,
+        deviceId: identity.publicId,
+        outcome: 'DENIED',
+        details: `منع استخدام سجل تكرار مختلف (#${recentDuplicate.id}) لتأكيد الحدث الوارد #${remoteEvent.id}`,
+      });
+      return false;
     }
 
     let insertedId: number | null = null;
@@ -642,11 +719,13 @@ export class SyncEngine implements ILifecycleParticipant {
     this.eventsCache = await this.repo.getAll();
     this.notify();
 
-    await this.confirmInboundDeliveryOrKeepInProgress(
-      persistedEvent,
-      identity.publicId,
-      remoteEvent.id
-    );
+    await this.confirmInboundDeliveryOrKeepInProgress({
+      localEvent: persistedEvent,
+      remoteEvent,
+      envelope,
+      senderPeer,
+      devicePublicId: identity.publicId,
+    });
 
     await this.security.recordAudit({
       action: 'E2EE_VERIFIED',
@@ -660,35 +739,96 @@ export class SyncEngine implements ILifecycleParticipant {
   }
 
   private async confirmInboundDeliveryOrKeepInProgress(
-    localEvent: SyncEvent,
-    devicePublicId: string,
-    relayEventId: number
-  ): Promise<boolean> {
+    ctx: InboundDeliveryContext
+  ): Promise<InboundConfirmResult> {
+    const { localEvent, remoteEvent, envelope, senderPeer, devicePublicId } = ctx;
     const pairedSenders = this.getTrustedPairedPeersMap();
-    const isVerifiedInbound =
-      localEvent.targetDeviceId === devicePublicId &&
+    const liveTrustedSender = pairedSenders.get(senderPeer.publicId);
+
+    let parsedAad: Record<string, unknown> | null = null;
+    try {
+      const candidate = JSON.parse(envelope.aad) as unknown;
+      if (candidate && typeof candidate === 'object') {
+        parsedAad = candidate as Record<string, unknown>;
+      }
+    } catch {
+      parsedAad = null;
+    }
+
+    const relayEventIdValid =
+      typeof remoteEvent.id === 'number' &&
+      Number.isInteger(remoteEvent.id) &&
+      remoteEvent.id > 0 &&
+      typeof localEvent.relayEventId === 'number' &&
+      Number.isInteger(localEvent.relayEventId) &&
+      localEvent.relayEventId > 0 &&
+      localEvent.relayEventId === remoteEvent.id;
+
+    const sourceDeviceIdValid =
       typeof localEvent.sourceDeviceId === 'string' &&
+      localEvent.sourceDeviceId.length > 0 &&
       localEvent.sourceDeviceId !== devicePublicId &&
+      localEvent.sourceDeviceId === senderPeer.publicId &&
+      envelope.senderDeviceId === senderPeer.publicId &&
+      (!remoteEvent.sourceDeviceId ||
+        remoteEvent.sourceDeviceId === senderPeer.publicId) &&
+      parsedAad?.senderDeviceId === senderPeer.publicId;
+
+    const targetDeviceIdValid =
+      typeof devicePublicId === 'string' &&
+      devicePublicId.length > 0 &&
+      localEvent.targetDeviceId === devicePublicId &&
+      envelope.recipientDeviceId === devicePublicId &&
+      (!remoteEvent.targetDeviceId || remoteEvent.targetDeviceId === devicePublicId) &&
+      parsedAad?.recipientDeviceId === devicePublicId;
+
+    const idempotencyKeyValid =
+      typeof remoteEvent.idempotencyKey === 'string' &&
+      remoteEvent.idempotencyKey.length > 0 &&
+      localEvent.idempotencyKey === remoteEvent.idempotencyKey &&
+      parsedAad?.idempotencyKey === remoteEvent.idempotencyKey;
+
+    const trustedSenderAndKeyValid =
+      Boolean(liveTrustedSender) &&
+      liveTrustedSender?.publicId === senderPeer.publicId &&
+      liveTrustedSender?.pairingState === 'PAIRED' &&
+      liveTrustedSender?.verifiedByRelay === true &&
+      Boolean(liveTrustedSender?.publicKeyJwk) &&
+      Boolean(liveTrustedSender?.ecdhPublicKeyJwk) &&
+      liveTrustedSender?.cryptoKeyId === senderPeer.cryptoKeyId &&
+      liveTrustedSender?.cryptoKeyId === envelope.senderCryptoKeyId &&
+      parsedAad?.senderCryptoKeyId === liveTrustedSender?.cryptoKeyId &&
+      parsedAad?.messageNonce === envelope.messageNonce &&
       localEvent.e2eeProtected === true &&
       localEvent.e2eeVerified === true &&
       typeof localEvent.e2eeNonce === 'string' &&
-      localEvent.e2eeNonce.length >= 16 &&
-      pairedSenders.has(localEvent.sourceDeviceId);
+      localEvent.e2eeNonce.length >= 16;
 
-    if (!isVerifiedInbound) {
+    if (
+      !relayEventIdValid ||
+      !sourceDeviceIdValid ||
+      !targetDeviceIdValid ||
+      !idempotencyKeyValid ||
+      !trustedSenderAndKeyValid
+    ) {
       const role = this.settings.getSnapshot().role ?? 'none';
       await this.security.recordAudit({
         action: 'ACCESS_DENIED',
         actorRole: role,
         deviceId: devicePublicId,
         outcome: 'DENIED',
-        details: `رفض إرسال ACK لحدث #${localEvent.id} لعدم تحقق شروط التشفير أو الاقتران`,
+        details: `رفض إرسال ACK لحدث #${localEvent.id} لعدم تطابق Relay ID أو هوية الطرفين أو idempotencyKey أو مفتاح المرسل الموثوق`,
       });
-      return false;
+      return { bindingValid: false, ackConfirmed: false };
     }
 
+    const relayEventId = remoteEvent.id;
+
     if (this.transport.getState() !== 'CONNECTED') {
-      if (localEvent.status !== 'IN_PROGRESS' && localEvent.inboundAckConfirmed !== true) {
+      if (
+        localEvent.status !== 'IN_PROGRESS' &&
+        localEvent.inboundAckConfirmed !== true
+      ) {
         await this.repo.updateEvent(localEvent.id, {
           status: 'IN_PROGRESS',
           inboundAckConfirmed: false,
@@ -699,7 +839,7 @@ export class SyncEngine implements ILifecycleParticipant {
         this.eventsCache = await this.repo.getAll();
         this.notify();
       }
-      return false;
+      return { bindingValid: true, ackConfirmed: false };
     }
 
     try {
@@ -714,7 +854,7 @@ export class SyncEngine implements ILifecycleParticipant {
       });
       this.eventsCache = await this.repo.getAll();
       this.notify();
-      return true;
+      return { bindingValid: true, ackConfirmed: true };
     } catch (ackErr) {
       const reason = ackErr instanceof Error ? ackErr.message : 'ack error';
       if (localEvent.inboundAckConfirmed !== true) {
@@ -736,7 +876,7 @@ export class SyncEngine implements ILifecycleParticipant {
           reason,
         }
       );
-      return false;
+      return { bindingValid: true, ackConfirmed: false };
     }
   }
 

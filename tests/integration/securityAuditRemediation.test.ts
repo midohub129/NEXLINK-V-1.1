@@ -739,19 +739,23 @@ describe('P0/P1 Negative Security, E2EE & Reliability Audit Suite', () => {
       const wsTicketRes = await receiver.signedFetch('POST', '/ws/ticket', {});
       assert.equal(wsTicketRes.status, 200);
       const { ticket: rxTicket } = (await wsTicketRes.json()) as { ticket: string };
-      const rxWs = new WebSocket(`${srv.wsBaseUrl}?ticket=${encodeURIComponent(rxTicket)}`);
-      const wsSyncFramePromise = new Promise<Record<string, unknown>>((resolve, reject) => {
-        rxWs.on('message', (raw) => {
-          const msg = JSON.parse(raw.toString('utf8')) as {
-            type?: string;
-            event?: Record<string, unknown>;
-          };
-          if (msg.type === 'sync:event' && msg.event) {
-            resolve(msg.event);
-          }
-        });
-        rxWs.on('error', reject);
-      });
+      const rxWs = new WebSocket(
+        `${srv.wsBaseUrl}?ticket=${encodeURIComponent(rxTicket)}`
+      );
+      const wsSyncFramePromise = new Promise<Record<string, unknown>>(
+        (resolve, reject) => {
+          rxWs.on('message', (raw) => {
+            const msg = JSON.parse(raw.toString('utf8')) as {
+              type?: string;
+              event?: Record<string, unknown>;
+            };
+            if (msg.type === 'sync:event' && msg.event) {
+              resolve(msg.event);
+            }
+          });
+          rxWs.on('error', reject);
+        }
+      );
 
       const wsEnv = await sender.crypto.encryptForPeer({
         plaintext: plaintextMsg,

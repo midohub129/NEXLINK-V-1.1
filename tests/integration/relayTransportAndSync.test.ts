@@ -310,7 +310,9 @@ describe('End-to-End Authenticated Relay Transport, Mutual Pairing, E2EE & Peer 
       assert.equal(deviceB.syncEngine.getEvents()[0].e2eeProtected, true);
       assert.equal(deviceB.syncEngine.getEvents()[0].e2eeVerified, true);
       assert.ok(
-        deviceB.syncEngine.getEvents()[0].payload.includes('Delivered once B reconnects')
+        deviceB.syncEngine
+          .getEvents()[0]
+          .payload.includes('Delivered once B reconnects')
       );
 
       // After B ACKs, /inbox no longer serves the delivered event
