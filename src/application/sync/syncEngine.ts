@@ -749,7 +749,7 @@ export class SyncEngine implements ILifecycleParticipant {
           senderPeer: trustedSender,
           devicePublicId: identity.publicId,
           deviceCryptoKeyId: identity.cryptoKeyId,
-        decryptedPlaintext: retryPlaintext,
+          decryptedPlaintext: retryPlaintext,
         });
         return confirmOutcome.bindingValid;
       }
@@ -816,7 +816,7 @@ export class SyncEngine implements ILifecycleParticipant {
         senderPeer,
         devicePublicId: identity.publicId,
         deviceCryptoKeyId: identity.cryptoKeyId,
-      decryptedPlaintext: decryptedPlaintext,
+        decryptedPlaintext,
       });
       if (!confirmOutcome.bindingValid) {
         return false;
@@ -926,7 +926,7 @@ export class SyncEngine implements ILifecycleParticipant {
       senderPeer,
       devicePublicId: identity.publicId,
       deviceCryptoKeyId: identity.cryptoKeyId,
-    decryptedPlaintext: decryptedPlaintext,
+      decryptedPlaintext,
     });
 
     await this.security.recordAudit({

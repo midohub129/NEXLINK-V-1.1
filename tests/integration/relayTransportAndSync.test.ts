@@ -329,6 +329,26 @@ describe('End-to-End Authenticated Relay Transport, Mutual Pairing, E2EE & Peer 
         relayAckRow.id,
       ]);
 
+      await assert.rejects(
+        deviceB.transport.acknowledgeInboundDelivery(deviceB.identity.publicId, [
+          relayAckRow.id,
+          relayAckRow.id + 999999,
+        ]),
+        (error: unknown) =>
+          error instanceof Error &&
+          'code' in error &&
+          error.code === 'RELAY_ACK_INCOMPLETE'
+      );
+      await assert.rejects(
+        deviceB.transport.acknowledgeInboundDelivery(deviceB.identity.publicId, [
+          relayAckRow.id + 999999,
+        ]),
+        (error: unknown) =>
+          error instanceof Error &&
+          'code' in error &&
+          error.code === 'RELAY_ACK_INCOMPLETE'
+      );
+
       // After B ACKs, /inbox no longer serves the delivered event
       const rawInboxAfterAck = await deviceB.transport.fetchInboundEvents(
         deviceB.identity.publicId
