@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import express from 'express';
-import { WebSocket } from 'ws';
+import { WebSocket, type RawData } from 'ws';
 import { SqliteRelayDatabase } from '../../server/db/sqliteRelayDb';
 import { attachRelayUpgrade, createRelayServer } from '../../server/relay/relayRouter';
 import { SecurityError } from '../../src/domain/errors/appError';
@@ -129,7 +129,7 @@ function waitForWebSocketSyncEvent(
       ws.off('close', onClose);
       ws.off('error', onError);
     };
-    const onMessage = (raw: WebSocket.RawData) => {
+    const onMessage = (raw: RawData) => {
       try {
         const msg = JSON.parse(raw.toString('utf8')) as {
           type?: string;
