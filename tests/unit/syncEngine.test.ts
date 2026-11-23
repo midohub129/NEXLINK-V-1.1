@@ -876,20 +876,23 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
     assert.equal(firstIngest, true);
     assert.equal(syncEngine.getEvents().length, 1);
 
-    // Must NOT be SYNCED while inboundAckConfirmed is false
+    // Must NOT be SYNCED while inboundAckConfirmed is false (verify BOTH memory and persisted repository)
     const unackedStored = syncEngine.getEvents()[0];
+    const unackedPersisted = await syncRepo.findById(unackedStored.id);
     assert.equal(unackedStored.status, 'IN_PROGRESS');
-    assert.equal(unackedStored.inboundAckConfirmed, false);
-    assert.equal(unackedStored.deliveredAt, null);
-    assert.equal(unackedStored.syncedAt, null);
+    assert.equal(unackedPersisted?.status, 'IN_PROGRESS');
+    assert.equal(unackedPersisted?.inboundAckConfirmed, false);
+    assert.equal(unackedPersisted?.deliveredAt, null);
+    assert.equal(unackedPersisted?.syncedAt, null);
     assert.equal(transport.ackedRelayEventIds.length, 0);
 
     // Outbound delivery ACK for colliding local ID must NOT falsely promote inbound event
     await syncEngine.handleDeliveryAcks([unackedStored.id], Date.now());
-    assert.equal(syncEngine.getEvents()[0].status, 'IN_PROGRESS');
-    assert.equal(syncEngine.getEvents()[0].inboundAckConfirmed, false);
+    const afterCollidingAck = await syncRepo.findById(unackedStored.id);
+    assert.equal(afterCollidingAck?.status, 'IN_PROGRESS');
+    assert.equal(afterCollidingAck?.inboundAckConfirmed, false);
 
-    // Simulate app restart before ACK succeeds -> inbound row stays IN_PROGRESS (never reverted to PENDING outbound!)
+    // Simulate app restart before ACK succeeds -> inbound row stays IN_PROGRESS in DB (never reverted to PENDING outbound!)
     await syncEngine.stop();
     const restartedEngine = new SyncEngine({
       repo: syncRepo,
@@ -902,29 +905,30 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
     });
     await restartedEngine.start();
 
+    const persistedAfterRestart = await syncRepo.findById(unackedStored.id);
     assert.equal(restartedEngine.getEvents().length, 1);
-    assert.equal(restartedEngine.getEvents()[0].status, 'IN_PROGRESS');
-    assert.equal(restartedEngine.getEvents()[0].inboundAckConfirmed, false);
+    assert.equal(persistedAfterRestart?.status, 'IN_PROGRESS');
+    assert.equal(persistedAfterRestart?.inboundAckConfirmed, false);
 
     // Outbound cycle must never pick up the un-ACKed inbound row
     const summaryBeforeRecovery = await restartedEngine.runSyncCycle();
     assert.equal(summaryBeforeRecovery.attempted, 0);
     assert.equal(transport.sentBatches.length, 0);
-    assert.equal(restartedEngine.getEvents()[0].status, 'IN_PROGRESS');
+    assert.equal((await syncRepo.findById(unackedStored.id))?.status, 'IN_PROGRESS');
 
-    // Network recovers -> re-ingesting same un-ACKed relay event #850 completes ACK and transitions to SYNCED!
+    // Network recovers -> re-ingesting same un-ACKed relay event #850 completes ACK and transitions DB row to SYNCED!
     transport.acknowledgeInboundDelivery = origAck;
     const secondIngest = await restartedEngine.ingestInboundEvent(wireItem);
     assert.equal(secondIngest, true);
     assert.equal(restartedEngine.getEvents().length, 1);
-    const syncedRow = restartedEngine.getEvents()[0];
-    assert.equal(syncedRow.status, 'SYNCED');
-    assert.equal(syncedRow.inboundAckConfirmed, true);
-    assert.ok(syncedRow.deliveredAt !== null);
-    assert.ok(syncedRow.syncedAt !== null);
+    const syncedRow = await syncRepo.findById(unackedStored.id);
+    assert.equal(syncedRow?.status, 'SYNCED');
+    assert.equal(syncedRow?.inboundAckConfirmed, true);
+    assert.ok(syncedRow?.deliveredAt !== null);
+    assert.ok(syncedRow?.syncedAt !== null);
     assert.deepEqual(transport.ackedRelayEventIds, [850]);
 
-    // Offline ingest followed by transport reconnect automatically retries ACK -> SYNCED
+    // Offline ingest followed by transport reconnect automatically retries ACK -> DB becomes SYNCED
     await transport.disconnect();
     const env2 = await peerCrypto.encryptForPeer({
       plaintext: JSON.stringify({
@@ -960,24 +964,132 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
       e2eeVerified: false,
     });
     assert.equal(offlineIngest, true);
-    const offlineRow = restartedEngine
-      .getEvents()
-      .find((e) => e.idempotencyKey === 'idem-ack-offline-2')!;
-    assert.equal(offlineRow.status, 'IN_PROGRESS');
-    assert.equal(offlineRow.inboundAckConfirmed, false);
-    assert.equal(offlineRow.deliveredAt, null);
+    const offlineRow = await syncRepo.findByIdempotencyKey('idem-ack-offline-2');
+    assert.equal(offlineRow?.status, 'IN_PROGRESS');
+    assert.equal(offlineRow?.inboundAckConfirmed, false);
+    assert.equal(offlineRow?.deliveredAt, null);
 
-    // Reconnect triggers retryPendingInboundAcks() -> ACK #851 sent -> SYNCED
+    // Reconnect triggers retryPendingInboundAcks() -> ACK #851 sent -> persisted DB row becomes SYNCED
     await transport.connect();
     await new Promise((r) => setTimeout(r, 30));
-    const reconnectedRow = restartedEngine
-      .getEvents()
-      .find((e) => e.idempotencyKey === 'idem-ack-offline-2')!;
-    assert.equal(reconnectedRow.status, 'SYNCED');
-    assert.equal(reconnectedRow.inboundAckConfirmed, true);
-    assert.ok(reconnectedRow.deliveredAt !== null);
+    const reconnectedRow = await syncRepo.findByIdempotencyKey('idem-ack-offline-2');
+    assert.equal(reconnectedRow?.status, 'SYNCED');
+    assert.equal(reconnectedRow?.inboundAckConfirmed, true);
+    assert.ok(reconnectedRow?.deliveredAt !== null);
     assert.ok(transport.ackedRelayEventIds.includes(851));
     await restartedEngine.stop();
+  });
+
+  it('refuses retryPendingInboundAcks for unverified rows, missing E2EE nonce, outbound collisions, or revoked/unpaired senders', async () => {
+    const {
+      syncEngine,
+      syncRepo,
+      transport,
+      security,
+      devices,
+      peerCrypto,
+      peerDevice,
+    } = await setupSyncHarness();
+    await transport.connect();
+    const myId = devices.getIdentity()!;
+
+    // 1. Unverified DB row with relayEventId -> MUST NOT send ACK
+    const unverified = await syncRepo.insert({
+      type: 'notification',
+      payload: '{"title":"forged"}',
+      idempotencyKey: 'forged-in-db-1',
+      sourceDeviceId: peerDevice.publicId,
+      targetDeviceId: myId.publicId,
+      e2eeProtected: true,
+      e2eeVerified: false,
+      e2eeNonce: 'nonce-long-enough-1234',
+      relayEventId: 991,
+      inboundAckConfirmed: false,
+    });
+    await syncRepo.updateEvent(unverified.id, { status: 'IN_PROGRESS' });
+
+    // 2. Row missing valid e2eeNonce -> MUST NOT send ACK
+    const missingNonce = await syncRepo.insert({
+      type: 'notification',
+      payload: '{"title":"missing-nonce"}',
+      idempotencyKey: 'forged-in-db-2',
+      sourceDeviceId: peerDevice.publicId,
+      targetDeviceId: myId.publicId,
+      e2eeProtected: true,
+      e2eeVerified: true,
+      e2eeNonce: null,
+      relayEventId: 992,
+      inboundAckConfirmed: false,
+    });
+    await syncRepo.updateEvent(missingNonce.id, { status: 'IN_PROGRESS' });
+
+    // 3. Outbound row colliding with accidental relayEventId -> MUST NOT send inbound ACK
+    const outboundRow = await syncRepo.insert({
+      type: 'notification',
+      payload: '{"title":"outbound"}',
+      idempotencyKey: 'outbound-collision-3',
+      sourceDeviceId: myId.publicId,
+      targetDeviceId: peerDevice.publicId,
+      e2eeProtected: true,
+      e2eeVerified: true,
+      e2eeNonce: 'nonce-long-enough-5678',
+      relayEventId: 993,
+      inboundAckConfirmed: false,
+    });
+    await syncRepo.updateEvent(outboundRow.id, { status: 'IN_PROGRESS' });
+
+    const ackedBad = await syncEngine.retryPendingInboundAcks();
+    assert.equal(ackedBad, 0);
+    assert.equal(transport.ackedRelayEventIds.length, 0);
+    assert.ok(security.getAuditLog().some((a) => a.action === 'ACCESS_DENIED'));
+    assert.equal((await syncRepo.findById(unverified.id))?.status, 'IN_PROGRESS');
+    assert.equal((await syncRepo.findById(missingNonce.id))?.status, 'IN_PROGRESS');
+
+    // 4. Legitimate offline inbound row whose sender gets REVOKED before ACK retry -> MUST NOT send ACK!
+    await transport.disconnect();
+    const validEnv = await peerCrypto.encryptForPeer({
+      plaintext: JSON.stringify({
+        packageName: 'com.whatsapp',
+        title: 'Revoked Later',
+        text: 'Must not ACK after revocation',
+        postedAt: 5555,
+      }),
+      senderDeviceId: peerDevice.publicId,
+      recipientDeviceId: myId.publicId,
+      senderCryptoKeyId: peerDevice.cryptoKeyId,
+      recipientCryptoKeyId: myId.cryptoKeyId,
+      recipientEcdhPublicKeyJwk: myId.ecdhPublicKeyJwk!,
+      sessionId: 'sess-revoke-ack',
+      idempotencyKey: 'idem-revoke-ack-4',
+    });
+    const savedBeforeRevoke = await syncEngine.ingestInboundEvent({
+      id: 994,
+      type: 'notification',
+      payload: '[E2EE_CIPHERTEXT]',
+      e2eeEnvelope: validEnv,
+      sourceDeviceId: peerDevice.publicId,
+      targetDeviceId: myId.publicId,
+      createdAt: 5555,
+      status: 'IN_PROGRESS',
+      retryCount: 0,
+      nextRetryAt: null,
+      idempotencyKey: 'idem-revoke-ack-4',
+      encrypted: true,
+      localEncrypted: false,
+      e2eeProtected: false,
+      e2eeVerified: false,
+    });
+    assert.equal(savedBeforeRevoke, true);
+
+    await devices.revokeLinkedDevice(peerDevice.publicId, false);
+    await transport.connect();
+    await new Promise((r) => setTimeout(r, 30));
+
+    const persistedRevoked = await syncRepo.findByIdempotencyKey('idem-revoke-ack-4');
+    assert.equal(persistedRevoked?.status, 'IN_PROGRESS');
+    assert.equal(persistedRevoked?.inboundAckConfirmed, false);
+    assert.equal(transport.ackedRelayEventIds.includes(994), false);
+    await syncEngine.stop();
   });
 
   it('computes bounded exponential backoff correctly', () => {

@@ -460,13 +460,22 @@ describe('End-to-End Authenticated Relay Transport, Mutual Pairing, E2EE & Peer 
       await deviceA.syncEngine.runSyncCycle();
       await new Promise((r) => setTimeout(r, 150));
 
-      // Both Receiver B and Sender A must remain IN_PROGRESS (NOT SYNCED!)
-      assert.equal(syncEngineB.getEvents().length, 1);
-      assert.equal(syncEngineB.getEvents()[0].status, 'IN_PROGRESS');
-      assert.equal(syncEngineB.getEvents()[0].inboundAckConfirmed, false);
-      assert.equal(syncEngineB.getEvents()[0].deliveredAt, null);
+      // Both Receiver B repo, SQLite relay_events, and Sender A must remain IN_PROGRESS (NOT SYNCED!)
+      const bStoredBeforeAck = await repoB.getAll();
+      assert.equal(bStoredBeforeAck.length, 1);
+      assert.equal(bStoredBeforeAck[0].status, 'IN_PROGRESS');
+      assert.equal(bStoredBeforeAck[0].inboundAckConfirmed, false);
+      assert.equal(bStoredBeforeAck[0].deliveredAt, null);
       assert.equal(deviceA.syncEngine.getEvents()[0].status, 'IN_PROGRESS');
       assert.equal(deviceA.syncEngine.getEvents()[0].deliveredAt, null);
+
+      const relayRowBeforeAck = db.db
+        .prepare('SELECT id, delivered_at FROM relay_events WHERE idempotency_key = ?')
+        .get(bStoredBeforeAck[0].idempotencyKey) as {
+        id: number;
+        delivered_at: number | null;
+      };
+      assert.equal(relayRowBeforeAck.delivered_at, null);
 
       // Receiver B restarts while offline with ACK still unconfirmed
       await syncEngineB.stop();
@@ -483,18 +492,28 @@ describe('End-to-End Authenticated Relay Transport, Mutual Pairing, E2EE & Peer 
         logger: loggerB,
       });
       await syncEngineB.start();
-      assert.equal(syncEngineB.getEvents()[0].status, 'IN_PROGRESS');
-      assert.equal(syncEngineB.getEvents()[0].inboundAckConfirmed, false);
+      const bStoredAfterRestart = await repoB.findById(bStoredBeforeAck[0].id);
+      assert.equal(bStoredAfterRestart?.status, 'IN_PROGRESS');
+      assert.equal(bStoredAfterRestart?.inboundAckConfirmed, false);
 
       // Reconnect triggers retryPendingInboundAcks() + /inbox reconciliation -> ACK succeeds with 0 duplicates!
       await devicesB.connectRelay('basic', 'Receiver');
       await new Promise((r) => setTimeout(r, 180));
 
-      assert.equal(syncEngineB.getEvents().length, 1);
-      assert.equal(syncEngineB.getEvents()[0].status, 'SYNCED');
-      assert.equal(syncEngineB.getEvents()[0].inboundAckConfirmed, true);
-      assert.ok(syncEngineB.getEvents()[0].deliveredAt !== null);
+      const bStoredAfterRecovery = await repoB.getAll();
+      assert.equal(bStoredAfterRecovery.length, 1);
+      assert.equal(bStoredAfterRecovery[0].status, 'SYNCED');
+      assert.equal(bStoredAfterRecovery[0].inboundAckConfirmed, true);
+      assert.ok(bStoredAfterRecovery[0].deliveredAt !== null);
       assert.equal((await transportB.fetchInboundEvents(idB.publicId)).length, 0);
+
+      const relayRowAfterAck = db.db
+        .prepare('SELECT id, delivered_at FROM relay_events WHERE idempotency_key = ?')
+        .get(bStoredBeforeAck[0].idempotencyKey) as {
+        id: number;
+        delivered_at: number | null;
+      };
+      assert.ok(relayRowAfterAck.delivered_at !== null);
 
       // Sender A received sync:delivered / status poll and transitioned to SYNCED
       await deviceA.syncEngine.runSyncCycle();

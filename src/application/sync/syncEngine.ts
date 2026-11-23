@@ -318,15 +318,88 @@ export class SyncEngine implements ILifecycleParticipant {
     return confirmedCount;
   }
 
+  private getTrustedPairedPeersMap(): Map<string, LinkedDevice> {
+    return new Map(
+      this.devices
+        .getLinkedDevices()
+        .filter(
+          (d) =>
+            d.pairingState === 'PAIRED' &&
+            d.verifiedByRelay &&
+            Boolean(d.publicKeyJwk) &&
+            Boolean(d.ecdhPublicKeyJwk)
+        )
+        .map((d) => [d.publicId, d])
+    );
+  }
+
+  private isEligibleForInboundAck(
+    evt: SyncEvent,
+    identityPublicId: string,
+    pairedSenders: ReadonlyMap<string, LinkedDevice>
+  ): evt is SyncEvent & { relayEventId: number; sourceDeviceId: string } {
+    if (evt.status !== 'IN_PROGRESS' || evt.inboundAckConfirmed === true) {
+      return false;
+    }
+    if (
+      typeof evt.relayEventId !== 'number' ||
+      !Number.isInteger(evt.relayEventId) ||
+      evt.relayEventId <= 0
+    ) {
+      return false;
+    }
+    if (
+      evt.targetDeviceId !== identityPublicId ||
+      typeof evt.sourceDeviceId !== 'string' ||
+      evt.sourceDeviceId.length === 0 ||
+      evt.sourceDeviceId === identityPublicId
+    ) {
+      return false;
+    }
+    if (
+      evt.e2eeProtected !== true ||
+      evt.e2eeVerified !== true ||
+      typeof evt.e2eeNonce !== 'string' ||
+      evt.e2eeNonce.length < 16
+    ) {
+      return false;
+    }
+    return pairedSenders.has(evt.sourceDeviceId);
+  }
+
   async retryPendingInboundAcks(): Promise<number> {
     const identity = this.devices.getIdentity();
     if (!identity || this.transport.getState() !== 'CONNECTED') return 0;
 
+    const pairedSenders = this.getTrustedPairedPeersMap();
     const inProgress = await this.repo.getByStatus('IN_PROGRESS');
-    const pendingInbound = inProgress.filter(
-      (e): e is SyncEvent & { relayEventId: number } =>
-        typeof e.relayEventId === 'number' && e.inboundAckConfirmed !== true
-    );
+    const pendingInbound: (SyncEvent & {
+      relayEventId: number;
+      sourceDeviceId: string;
+    })[] = [];
+
+    for (const evt of inProgress) {
+      if (this.isEligibleForInboundAck(evt, identity.publicId, pairedSenders)) {
+        pendingInbound.push(evt);
+        continue;
+      }
+
+      const looksLikeUnackedInbound =
+        typeof evt.relayEventId === 'number' &&
+        evt.inboundAckConfirmed !== true &&
+        evt.sourceDeviceId !== identity.publicId;
+      if (looksLikeUnackedInbound) {
+        const role = this.settings.getSnapshot().role ?? 'none';
+        await this.security.recordAudit({
+          action: 'ACCESS_DENIED',
+          actorRole: role,
+          deviceId: identity.publicId,
+          outcome: 'DENIED',
+          details: `رفض إرسال ACK لحدث وارد #${evt.id} لعدم استيفاء تحقق E2EE أو فقدان اقتران المصدر (${evt.sourceDeviceId ?? 'unknown'})`,
+        });
+      }
+    }
+
     if (pendingInbound.length === 0) return 0;
 
     const relayIds = Array.from(new Set(pendingInbound.map((e) => e.relayEventId)));
@@ -412,22 +485,18 @@ export class SyncEngine implements ILifecycleParticipant {
       const existingUnacked = await this.repo.findByIdempotencyKey(
         remoteEvent.idempotencyKey
       );
-      const trustedSender = this.devices
-        .getLinkedDevices()
-        .find(
-          (d) =>
-            d.publicId === envelope.senderDeviceId &&
-            d.pairingState === 'PAIRED' &&
-            d.verifiedByRelay &&
-            d.cryptoKeyId === envelope.senderCryptoKeyId
-        );
+      const trustedSender = this.getTrustedPairedPeersMap().get(envelope.senderDeviceId);
 
       if (
         existingUnacked &&
         trustedSender &&
+        trustedSender.cryptoKeyId === envelope.senderCryptoKeyId &&
         existingUnacked.e2eeNonce === envelope.messageNonce &&
         existingUnacked.relayEventId === remoteEvent.id &&
         existingUnacked.sourceDeviceId === envelope.senderDeviceId &&
+        existingUnacked.targetDeviceId === identity.publicId &&
+        existingUnacked.e2eeProtected === true &&
+        existingUnacked.e2eeVerified === true &&
         (existingUnacked.inboundAckConfirmed === false ||
           existingUnacked.status !== 'SYNCED')
       ) {
@@ -595,6 +664,29 @@ export class SyncEngine implements ILifecycleParticipant {
     devicePublicId: string,
     relayEventId: number
   ): Promise<boolean> {
+    const pairedSenders = this.getTrustedPairedPeersMap();
+    const isVerifiedInbound =
+      localEvent.targetDeviceId === devicePublicId &&
+      typeof localEvent.sourceDeviceId === 'string' &&
+      localEvent.sourceDeviceId !== devicePublicId &&
+      localEvent.e2eeProtected === true &&
+      localEvent.e2eeVerified === true &&
+      typeof localEvent.e2eeNonce === 'string' &&
+      localEvent.e2eeNonce.length >= 16 &&
+      pairedSenders.has(localEvent.sourceDeviceId);
+
+    if (!isVerifiedInbound) {
+      const role = this.settings.getSnapshot().role ?? 'none';
+      await this.security.recordAudit({
+        action: 'ACCESS_DENIED',
+        actorRole: role,
+        deviceId: devicePublicId,
+        outcome: 'DENIED',
+        details: `رفض إرسال ACK لحدث #${localEvent.id} لعدم تحقق شروط التشفير أو الاقتران`,
+      });
+      return false;
+    }
+
     if (this.transport.getState() !== 'CONNECTED') {
       if (localEvent.status !== 'IN_PROGRESS' && localEvent.inboundAckConfirmed !== true) {
         await this.repo.updateEvent(localEvent.id, {
