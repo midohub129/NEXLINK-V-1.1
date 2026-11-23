@@ -6,7 +6,7 @@ import type {
   ILogger,
   ITransportClient,
 } from '../../domain/interfaces/services';
-import type { LinkedDevice } from '../../domain/models/device';
+import type { DeviceIdentityProfile, LinkedDevice } from '../../domain/models/device';
 import type { E2eeEnvelope } from '../../domain/models/security';
 import type {
   NotificationPayload,
@@ -24,6 +24,7 @@ interface InboundDeliveryContext {
   envelope: E2eeEnvelope;
   senderPeer: LinkedDevice;
   devicePublicId: string;
+  deviceCryptoKeyId: string;
 }
 
 interface InboundConfirmResult {
@@ -347,38 +348,175 @@ export class SyncEngine implements ILifecycleParticipant {
     );
   }
 
-  private isEligibleForInboundAck(
+  private buildInboundAckProofPayload(params: {
+    devicePublicId: string;
+    deviceCryptoKeyId: string;
+    relayEventId: number;
+    sourceDeviceId: string;
+    targetDeviceId: string;
+    idempotencyKey: string;
+    senderCryptoKeyId: string;
+    e2eeNonce: string;
+  }): string {
+    return [
+      'INBOUND_ACK_ELIGIBLE_V1',
+      params.devicePublicId,
+      params.deviceCryptoKeyId,
+      String(params.relayEventId),
+      params.sourceDeviceId,
+      params.targetDeviceId,
+      params.idempotencyKey,
+      params.senderCryptoKeyId,
+      params.e2eeNonce,
+    ].join('|');
+  }
+
+  private async verifyRetryInboundAckEligibility(
     evt: SyncEvent,
-    identityPublicId: string,
+    identity: DeviceIdentityProfile,
     pairedSenders: ReadonlyMap<string, LinkedDevice>
-  ): evt is SyncEvent & { relayEventId: number; sourceDeviceId: string } {
+  ): Promise<
+    | {
+        eligible: true;
+        event: SyncEvent & { relayEventId: number; sourceDeviceId: string };
+      }
+    | { eligible: false; shouldAuditDeny: boolean; reason: string }
+  > {
     if (evt.status !== 'IN_PROGRESS' || evt.inboundAckConfirmed === true) {
-      return false;
+      return { eligible: false, shouldAuditDeny: false, reason: 'not pending ack' };
     }
+
+    const looksLikeInboundCandidate =
+      typeof evt.relayEventId === 'number' ||
+      evt.targetDeviceId === identity.publicId ||
+      evt.e2eeVerified === true;
+
     if (
       typeof evt.relayEventId !== 'number' ||
       !Number.isInteger(evt.relayEventId) ||
       evt.relayEventId <= 0
     ) {
-      return false;
+      return {
+        eligible: false,
+        shouldAuditDeny:
+          looksLikeInboundCandidate && evt.sourceDeviceId !== identity.publicId,
+        reason: 'missing valid relayEventId',
+      };
     }
+
     if (
-      evt.targetDeviceId !== identityPublicId ||
+      evt.targetDeviceId !== identity.publicId ||
       typeof evt.sourceDeviceId !== 'string' ||
       evt.sourceDeviceId.length === 0 ||
-      evt.sourceDeviceId === identityPublicId
+      evt.sourceDeviceId === identity.publicId
     ) {
-      return false;
+      return {
+        eligible: false,
+        shouldAuditDeny: evt.sourceDeviceId !== identity.publicId,
+        reason: 'source/target identity mismatch',
+      };
     }
+
     if (
       evt.e2eeProtected !== true ||
       evt.e2eeVerified !== true ||
       typeof evt.e2eeNonce !== 'string' ||
       evt.e2eeNonce.length < 16
     ) {
-      return false;
+      return {
+        eligible: false,
+        shouldAuditDeny: true,
+        reason: 'missing local E2EE verification flags or nonce',
+      };
     }
-    return pairedSenders.has(evt.sourceDeviceId);
+
+    const senderPeer = pairedSenders.get(evt.sourceDeviceId);
+    if (
+      !senderPeer ||
+      !senderPeer.publicKeyJwk ||
+      !senderPeer.ecdhPublicKeyJwk ||
+      !identity.publicKeyJwk
+    ) {
+      return {
+        eligible: false,
+        shouldAuditDeny: true,
+        reason: `peer unpaired or revoked (${evt.sourceDeviceId})`,
+      };
+    }
+
+    const storedEnvelope = evt.e2eeEnvelope;
+    if (
+      !storedEnvelope ||
+      storedEnvelope.senderDeviceId !== senderPeer.publicId ||
+      storedEnvelope.recipientDeviceId !== identity.publicId ||
+      storedEnvelope.senderCryptoKeyId !== senderPeer.cryptoKeyId ||
+      storedEnvelope.recipientCryptoKeyId !== identity.cryptoKeyId ||
+      storedEnvelope.messageNonce !== evt.e2eeNonce
+    ) {
+      return {
+        eligible: false,
+        shouldAuditDeny: true,
+        reason: 'missing or mismatched E2EE envelope/nonce binding',
+      };
+    }
+
+    if (typeof evt.inboundAckProof !== 'string' || evt.inboundAckProof.length === 0) {
+      return {
+        eligible: false,
+        shouldAuditDeny: true,
+        reason: 'missing trusted inbound ACK attestation proof',
+      };
+    }
+
+    const expectedProofPayload = this.buildInboundAckProofPayload({
+      devicePublicId: identity.publicId,
+      deviceCryptoKeyId: identity.cryptoKeyId,
+      relayEventId: evt.relayEventId,
+      sourceDeviceId: senderPeer.publicId,
+      targetDeviceId: identity.publicId,
+      idempotencyKey: evt.idempotencyKey,
+      senderCryptoKeyId: senderPeer.cryptoKeyId,
+      e2eeNonce: evt.e2eeNonce,
+    });
+
+    const proofValid = await this.crypto.verifySignatureWithJwk(
+      identity.publicKeyJwk,
+      identity.cryptoKeyId,
+      expectedProofPayload,
+      evt.inboundAckProof
+    );
+    if (!proofValid) {
+      return {
+        eligible: false,
+        shouldAuditDeny: true,
+        reason: 'invalid inbound ACK attestation signature',
+      };
+    }
+
+    try {
+      await this.crypto.decryptFromPeer({
+        envelope: storedEnvelope,
+        senderEcdsaPublicKeyJwk: senderPeer.publicKeyJwk,
+        senderEcdhPublicKeyJwk: senderPeer.ecdhPublicKeyJwk,
+        expectedRecipientDeviceId: identity.publicId,
+        expectedRecipientCryptoKeyId: identity.cryptoKeyId,
+        expectedIdempotencyKey: evt.idempotencyKey,
+      });
+    } catch (err) {
+      return {
+        eligible: false,
+        shouldAuditDeny: true,
+        reason:
+          err instanceof Error
+            ? `envelope verification failed on retry: ${err.message}`
+            : 'envelope verification failed on retry',
+      };
+    }
+
+    return {
+      eligible: true,
+      event: evt as SyncEvent & { relayEventId: number; sourceDeviceId: string },
+    };
   }
 
   async retryPendingInboundAcks(): Promise<number> {
@@ -393,35 +531,49 @@ export class SyncEngine implements ILifecycleParticipant {
     })[] = [];
 
     for (const evt of inProgress) {
-      if (this.isEligibleForInboundAck(evt, identity.publicId, pairedSenders)) {
-        pendingInbound.push(evt);
+      const eligibility = await this.verifyRetryInboundAckEligibility(
+        evt,
+        identity,
+        pairedSenders
+      );
+      if (eligibility.eligible) {
+        pendingInbound.push(eligibility.event);
         continue;
       }
 
-      const looksLikeUnackedInbound =
-        typeof evt.relayEventId === 'number' &&
-        evt.inboundAckConfirmed !== true &&
-        evt.sourceDeviceId !== identity.publicId;
-      if (looksLikeUnackedInbound) {
+      if (eligibility.shouldAuditDeny) {
         const role = this.settings.getSnapshot().role ?? 'none';
         await this.security.recordAudit({
           action: 'ACCESS_DENIED',
           actorRole: role,
           deviceId: identity.publicId,
           outcome: 'DENIED',
-          details: `رفض إرسال ACK لحدث وارد #${evt.id} لعدم استيفاء تحقق E2EE أو فقدان اقتران المصدر (${evt.sourceDeviceId ?? 'unknown'})`,
+          details: `رفض إرسال ACK عند إعادة المحاولة للحدث #${evt.id}: ${eligibility.reason}`,
         });
       }
     }
 
     if (pendingInbound.length === 0) return 0;
 
-    const relayIds = Array.from(new Set(pendingInbound.map((e) => e.relayEventId)));
+    // Re-verify live transport state and active pairing immediately prior to dispatch
+    if (this.transport.getState() !== 'CONNECTED') return 0;
+    const activeSendersBeforeAck = this.getTrustedPairedPeersMap();
+    const stillPaired = pendingInbound.filter((evt) => {
+      const peer = activeSendersBeforeAck.get(evt.sourceDeviceId);
+      return Boolean(
+        peer &&
+        evt.e2eeEnvelope &&
+        peer.cryptoKeyId === evt.e2eeEnvelope.senderCryptoKeyId
+      );
+    });
+    if (stillPaired.length === 0) return 0;
+
+    const relayIds = Array.from(new Set(stillPaired.map((e) => e.relayEventId)));
     await this.transport.acknowledgeInboundDelivery(identity.publicId, relayIds);
 
     const ackedAt = Date.now();
     let confirmed = 0;
-    for (const evt of pendingInbound) {
+    for (const evt of stillPaired) {
       const updated = await this.repo.updateEvent(evt.id, {
         status: 'SYNCED',
         inboundAckConfirmed: true,
@@ -577,6 +729,7 @@ export class SyncEngine implements ILifecycleParticipant {
           envelope,
           senderPeer: trustedSender,
           devicePublicId: identity.publicId,
+          deviceCryptoKeyId: identity.cryptoKeyId,
         });
         return confirmOutcome.bindingValid;
       }
@@ -642,6 +795,7 @@ export class SyncEngine implements ILifecycleParticipant {
         envelope,
         senderPeer,
         devicePublicId: identity.publicId,
+        deviceCryptoKeyId: identity.cryptoKeyId,
       });
       if (!confirmOutcome.bindingValid) {
         return false;
@@ -668,6 +822,29 @@ export class SyncEngine implements ILifecycleParticipant {
       return false;
     }
 
+    const inboundAckProof = await this.crypto.signPayload(
+      this.buildInboundAckProofPayload({
+        devicePublicId: identity.publicId,
+        deviceCryptoKeyId: identity.cryptoKeyId,
+        relayEventId: remoteEvent.id,
+        sourceDeviceId: senderPeer.publicId,
+        targetDeviceId: identity.publicId,
+        idempotencyKey: remoteEvent.idempotencyKey,
+        senderCryptoKeyId: senderPeer.cryptoKeyId,
+        e2eeNonce: envelope.messageNonce,
+      })
+    );
+    if (!inboundAckProof) {
+      await this.security.recordAudit({
+        action: 'E2EE_DECRYPT_FAILED',
+        actorRole: role,
+        deviceId: identity.publicId,
+        outcome: 'DENIED',
+        details: `تعذّر توقيع إثبات الأهلية المحلي للحدث الوارد #${remoteEvent.id} — لن يتم إرسال ACK`,
+      });
+      return false;
+    }
+
     let insertedId: number | null = null;
     let persistedEvent: SyncEvent | null = null;
     try {
@@ -682,6 +859,8 @@ export class SyncEngine implements ILifecycleParticipant {
         e2eeProtected: true,
         e2eeVerified: true,
         e2eeNonce: envelope.messageNonce,
+        e2eeEnvelope: envelope,
+        inboundAckProof,
         relayEventId: remoteEvent.id,
         inboundAckConfirmed: false,
         createdAt: remoteEvent.createdAt,
@@ -725,6 +904,7 @@ export class SyncEngine implements ILifecycleParticipant {
       envelope,
       senderPeer,
       devicePublicId: identity.publicId,
+      deviceCryptoKeyId: identity.cryptoKeyId,
     });
 
     await this.security.recordAudit({
@@ -741,7 +921,14 @@ export class SyncEngine implements ILifecycleParticipant {
   private async confirmInboundDeliveryOrKeepInProgress(
     ctx: InboundDeliveryContext
   ): Promise<InboundConfirmResult> {
-    const { localEvent, remoteEvent, envelope, senderPeer, devicePublicId } = ctx;
+    const {
+      localEvent,
+      remoteEvent,
+      envelope,
+      senderPeer,
+      devicePublicId,
+      deviceCryptoKeyId,
+    } = ctx;
     const pairedSenders = this.getTrustedPairedPeersMap();
     const liveTrustedSender = pairedSenders.get(senderPeer.publicId);
 
@@ -788,6 +975,14 @@ export class SyncEngine implements ILifecycleParticipant {
       localEvent.idempotencyKey === remoteEvent.idempotencyKey &&
       parsedAad?.idempotencyKey === remoteEvent.idempotencyKey;
 
+    const nonceBindingValid =
+      typeof envelope.messageNonce === 'string' &&
+      envelope.messageNonce.length >= 16 &&
+      typeof localEvent.e2eeNonce === 'string' &&
+      localEvent.e2eeNonce.length >= 16 &&
+      localEvent.e2eeNonce === envelope.messageNonce &&
+      parsedAad?.messageNonce === envelope.messageNonce;
+
     const trustedSenderAndKeyValid =
       Boolean(liveTrustedSender) &&
       liveTrustedSender?.publicId === senderPeer.publicId &&
@@ -797,18 +992,18 @@ export class SyncEngine implements ILifecycleParticipant {
       Boolean(liveTrustedSender?.ecdhPublicKeyJwk) &&
       liveTrustedSender?.cryptoKeyId === senderPeer.cryptoKeyId &&
       liveTrustedSender?.cryptoKeyId === envelope.senderCryptoKeyId &&
+      envelope.recipientCryptoKeyId === deviceCryptoKeyId &&
       parsedAad?.senderCryptoKeyId === liveTrustedSender?.cryptoKeyId &&
-      parsedAad?.messageNonce === envelope.messageNonce &&
+      parsedAad?.recipientCryptoKeyId === deviceCryptoKeyId &&
       localEvent.e2eeProtected === true &&
-      localEvent.e2eeVerified === true &&
-      typeof localEvent.e2eeNonce === 'string' &&
-      localEvent.e2eeNonce.length >= 16;
+      localEvent.e2eeVerified === true;
 
     if (
       !relayEventIdValid ||
       !sourceDeviceIdValid ||
       !targetDeviceIdValid ||
       !idempotencyKeyValid ||
+      !nonceBindingValid ||
       !trustedSenderAndKeyValid
     ) {
       const role = this.settings.getSnapshot().role ?? 'none';
@@ -817,7 +1012,7 @@ export class SyncEngine implements ILifecycleParticipant {
         actorRole: role,
         deviceId: devicePublicId,
         outcome: 'DENIED',
-        details: `رفض إرسال ACK لحدث #${localEvent.id} لعدم تطابق Relay ID أو هوية الطرفين أو idempotencyKey أو مفتاح المرسل الموثوق`,
+        details: `رفض إرسال ACK لحدث #${localEvent.id} لعدم تطابق Relay ID أو Nonce أو هوية الطرفين أو idempotencyKey أو مفتاح المرسل الموثوق`,
       });
       return { bindingValid: false, ackConfirmed: false };
     }

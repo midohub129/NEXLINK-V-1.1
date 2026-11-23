@@ -677,8 +677,8 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
     assert.equal(mismatchedRelayDenied, false);
     assert.equal(transport.ackedRelayEventIds.includes(778), false);
 
-    // Legitimate re-delivery of the SAME relay event (#777) & matching idempotencyKey deduplicates and ACKs cleanly
-    const sameRelayRedelivery = await peerCrypto.encryptForPeer({
+    // Even with matching relayEventId (#777) & idempotencyKey, a DIFFERENT messageNonce must NOT confirm existingByKey
+    const sameRelayDifferentNonce = await peerCrypto.encryptForPeer({
       plaintext: JSON.stringify({
         packageName: 'com.whatsapp',
         title: 'Offline Missed Msg',
@@ -694,11 +694,11 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
       idempotencyKey: 'idem-reconnect-old',
     });
 
-    const deduped = await restartedEngine.ingestInboundEvent({
+    const differentNonceDenied = await restartedEngine.ingestInboundEvent({
       id: 777,
       type: 'notification',
       payload: '[E2EE_CIPHERTEXT]',
-      e2eeEnvelope: sameRelayRedelivery,
+      e2eeEnvelope: sameRelayDifferentNonce,
       sourceDeviceId: peerDevice.publicId,
       targetDeviceId: myId.publicId,
       createdAt: oldTs,
@@ -711,10 +711,9 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
       e2eeProtected: false,
       e2eeVerified: false,
     });
-    assert.equal(deduped, true);
-    // Stored count stays 1 (no duplicate row) and matching relay event #777 ACKs cleanly
+    assert.equal(differentNonceDenied, false);
     assert.equal(restartedEngine.getEvents().length, 1);
-    assert.ok(transport.ackedRelayEventIds.includes(777));
+    assert.deepEqual(transport.ackedRelayEventIds, [777]);
     await restartedEngine.stop();
   });
 
@@ -1069,14 +1068,73 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
     });
     await syncRepo.updateEvent(outboundRow.id, { status: 'IN_PROGRESS' });
 
+    // 4. Local DB row claiming e2eeVerified=true & e2eeProtected=true WITHOUT inboundAckProof/e2eeEnvelope (never passed ingest security) -> MUST NOT send ACK
+    const unattestedFlagsRow = await syncRepo.insert({
+      type: 'notification',
+      payload: '{"title":"forged-flags-only"}',
+      idempotencyKey: 'forged-in-db-4',
+      sourceDeviceId: peerDevice.publicId,
+      targetDeviceId: myId.publicId,
+      e2eeProtected: true,
+      e2eeVerified: true,
+      e2eeNonce: 'forged-local-nonce-16',
+      relayEventId: 995,
+      inboundAckConfirmed: false,
+    });
+    await syncRepo.updateEvent(unattestedFlagsRow.id, { status: 'IN_PROGRESS' });
+
+    // 5. Row with valid-looking fields & tampered e2eeEnvelope signature / forged inboundAckProof -> MUST NOT bypass signature verification!
+    const validProofEnv = await peerCrypto.encryptForPeer({
+      plaintext: '{"title":"tampered-retry-sig"}',
+      senderDeviceId: peerDevice.publicId,
+      recipientDeviceId: myId.publicId,
+      senderCryptoKeyId: peerDevice.cryptoKeyId,
+      recipientCryptoKeyId: myId.cryptoKeyId,
+      recipientEcdhPublicKeyJwk: myId.ecdhPublicKeyJwk!,
+      sessionId: 'sess-retry-tamper',
+      idempotencyKey: 'forged-in-db-5',
+    });
+    const tamperedStoredEnv = {
+      ...validProofEnv,
+      signature: Buffer.alloc(64, 9).toString('base64'),
+    };
+    const tamperedEnvRow = await syncRepo.insert({
+      type: 'notification',
+      payload: '{"title":"tampered-retry-sig"}',
+      idempotencyKey: 'forged-in-db-5',
+      sourceDeviceId: peerDevice.publicId,
+      targetDeviceId: myId.publicId,
+      e2eeProtected: true,
+      e2eeVerified: true,
+      e2eeNonce: validProofEnv.messageNonce,
+      e2eeEnvelope: tamperedStoredEnv,
+      inboundAckProof: Buffer.alloc(64, 5).toString('base64'),
+      relayEventId: 996,
+      inboundAckConfirmed: false,
+    });
+    await syncRepo.updateEvent(tamperedEnvRow.id, { status: 'IN_PROGRESS' });
+
     const ackedBad = await syncEngine.retryPendingInboundAcks();
     assert.equal(ackedBad, 0);
     assert.equal(transport.ackedRelayEventIds.length, 0);
     assert.ok(security.getAuditLog().some((a) => a.action === 'ACCESS_DENIED'));
     assert.equal((await syncRepo.findById(unverified.id))?.status, 'IN_PROGRESS');
     assert.equal((await syncRepo.findById(missingNonce.id))?.status, 'IN_PROGRESS');
+    assert.equal(
+      (await syncRepo.findById(unattestedFlagsRow.id))?.status,
+      'IN_PROGRESS'
+    );
+    assert.equal(
+      (await syncRepo.findById(unattestedFlagsRow.id))?.inboundAckConfirmed,
+      false
+    );
+    assert.equal((await syncRepo.findById(tamperedEnvRow.id))?.status, 'IN_PROGRESS');
+    assert.equal(
+      (await syncRepo.findById(tamperedEnvRow.id))?.inboundAckConfirmed,
+      false
+    );
 
-    // 4. Legitimate offline inbound row whose sender gets REVOKED before ACK retry -> MUST NOT send ACK!
+    // 6. Legitimate offline inbound row whose sender gets REVOKED before ACK retry -> MUST NOT send ACK!
     await transport.disconnect();
     const validEnv = await peerCrypto.encryptForPeer({
       plaintext: JSON.stringify({
@@ -1116,6 +1174,8 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
     await transport.connect();
     await new Promise((r) => setTimeout(r, 30));
 
+    const explicitRetryAfterRevoke = await syncEngine.retryPendingInboundAcks();
+    assert.equal(explicitRetryAfterRevoke, 0);
     const persistedRevoked = await syncRepo.findByIdempotencyKey('idem-revoke-ack-4');
     assert.equal(persistedRevoked?.status, 'IN_PROGRESS');
     assert.equal(persistedRevoked?.inboundAckConfirmed, false);
@@ -1478,6 +1538,196 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
     const afterRotatedKey = await syncRepo.findById(preRotatedRow.id);
     assert.equal(afterRotatedKey?.status, 'IN_PROGRESS');
     assert.equal(afterRotatedKey?.inboundAckConfirmed, false);
+
+    await syncEngine.stop();
+  });
+
+  it('requires exact localEvent.e2eeNonce === envelope.messageNonce match on existingByKey and allows continuation only when nonce and cryptographic retry checks pass', async () => {
+    const {
+      syncEngine,
+      syncRepo,
+      transport,
+      security,
+      devices,
+      peerCrypto,
+      peerDevice,
+    } = await setupSyncHarness();
+    await transport.connect();
+    const myId = devices.getIdentity()!;
+
+    // Force transient ACK failure on first ingest so #960 stays IN_PROGRESS
+    const origAck = transport.acknowledgeInboundDelivery.bind(transport);
+    transport.acknowledgeInboundDelivery = async () => {
+      throw new Error('Temporary ACK outage');
+    };
+
+    const ts = Date.now();
+    const originalEnv = await peerCrypto.encryptForPeer({
+      plaintext: JSON.stringify({
+        packageName: 'com.whatsapp',
+        title: 'Nonce Binding Test',
+        text: 'Must bind localEvent.e2eeNonce === envelope.messageNonce',
+        postedAt: ts,
+      }),
+      senderDeviceId: peerDevice.publicId,
+      recipientDeviceId: myId.publicId,
+      senderCryptoKeyId: peerDevice.cryptoKeyId,
+      recipientCryptoKeyId: myId.cryptoKeyId,
+      recipientEcdhPublicKeyJwk: myId.ecdhPublicKeyJwk!,
+      sessionId: 'sess-nonce-bind-1',
+      idempotencyKey: 'idem-nonce-bind-960',
+    });
+
+    const firstIngest = await syncEngine.ingestInboundEvent({
+      id: 960,
+      type: 'notification',
+      payload: '[E2EE_CIPHERTEXT]',
+      e2eeEnvelope: originalEnv,
+      sourceDeviceId: peerDevice.publicId,
+      targetDeviceId: myId.publicId,
+      createdAt: ts,
+      status: 'IN_PROGRESS',
+      retryCount: 0,
+      nextRetryAt: null,
+      idempotencyKey: 'idem-nonce-bind-960',
+      encrypted: true,
+      localEncrypted: false,
+      e2eeProtected: false,
+      e2eeVerified: false,
+    });
+    assert.equal(firstIngest, true);
+
+    const savedRow = (await syncRepo.findByIdempotencyKey('idem-nonce-bind-960'))!;
+    assert.equal(savedRow.status, 'IN_PROGRESS');
+    assert.equal(savedRow.inboundAckConfirmed, false);
+    assert.equal(savedRow.e2eeNonce, originalEnv.messageNonce);
+    assert.ok(savedRow.inboundAckProof && savedRow.inboundAckProof.length > 0);
+    assert.equal(savedRow.e2eeEnvelope?.messageNonce, originalEnv.messageNonce);
+
+    // Restore live ACK endpoint
+    transport.acknowledgeInboundDelivery = origAck;
+
+    // 1. existingByKey with DIFFERENT messageNonce (same idempotencyKey + same relayEventId #960 + valid sender sig) -> MUST REFUSE ACK!
+    const differentNonceEnv = await peerCrypto.encryptForPeer({
+      plaintext: JSON.stringify({
+        packageName: 'com.whatsapp',
+        title: 'Nonce Binding Test',
+        text: 'Re-wrapped with a DIFFERENT messageNonce',
+        postedAt: ts,
+      }),
+      senderDeviceId: peerDevice.publicId,
+      recipientDeviceId: myId.publicId,
+      senderCryptoKeyId: peerDevice.cryptoKeyId,
+      recipientCryptoKeyId: myId.cryptoKeyId,
+      recipientEcdhPublicKeyJwk: myId.ecdhPublicKeyJwk!,
+      sessionId: 'sess-nonce-bind-2',
+      idempotencyKey: 'idem-nonce-bind-960',
+    });
+    assert.notEqual(differentNonceEnv.messageNonce, savedRow.e2eeNonce);
+
+    const diffNonceRes = await syncEngine.ingestInboundEvent({
+      id: 960,
+      type: 'notification',
+      payload: '[E2EE_CIPHERTEXT]',
+      e2eeEnvelope: differentNonceEnv,
+      sourceDeviceId: peerDevice.publicId,
+      targetDeviceId: myId.publicId,
+      createdAt: ts,
+      status: 'IN_PROGRESS',
+      retryCount: 0,
+      nextRetryAt: null,
+      idempotencyKey: 'idem-nonce-bind-960',
+      encrypted: true,
+      localEncrypted: false,
+      e2eeProtected: false,
+      e2eeVerified: false,
+    });
+    assert.equal(diffNonceRes, false);
+    assert.deepEqual([...transport.ackedRelayEventIds], []);
+    const afterDiffNonce = await syncRepo.findById(savedRow.id);
+    assert.equal(afterDiffNonce?.status, 'IN_PROGRESS');
+    assert.equal(afterDiffNonce?.inboundAckConfirmed, false);
+    assert.equal(afterDiffNonce?.deliveredAt, null);
+    assert.ok(security.getAuditLog().some((a) => a.action === 'ACCESS_DENIED'));
+
+    // 2. Matching localEvent.e2eeNonce === envelope.messageNonce (same originalEnv) with all bindings intact -> ALLOWS ACK and transitions to SYNCED
+    const matchingNonceRes = await syncEngine.ingestInboundEvent({
+      id: 960,
+      type: 'notification',
+      payload: '[E2EE_CIPHERTEXT]',
+      e2eeEnvelope: originalEnv,
+      sourceDeviceId: peerDevice.publicId,
+      targetDeviceId: myId.publicId,
+      createdAt: ts,
+      status: 'IN_PROGRESS',
+      retryCount: 0,
+      nextRetryAt: null,
+      idempotencyKey: 'idem-nonce-bind-960',
+      encrypted: true,
+      localEncrypted: false,
+      e2eeProtected: false,
+      e2eeVerified: false,
+    });
+    assert.equal(matchingNonceRes, true);
+    assert.deepEqual([...transport.ackedRelayEventIds], [960]);
+    const syncedAfterMatch = await syncRepo.findById(savedRow.id);
+    assert.equal(syncedAfterMatch?.status, 'SYNCED');
+    assert.equal(syncedAfterMatch?.inboundAckConfirmed, true);
+    assert.ok(syncedAfterMatch?.deliveredAt !== null);
+
+    // 3. Offline ingest + eligible retryPendingInboundAcks while pairing stays valid -> verifies proof + signature & ACKs cleanly
+    await transport.disconnect();
+    const env961 = await peerCrypto.encryptForPeer({
+      plaintext: JSON.stringify({
+        packageName: 'com.whatsapp',
+        title: 'Retry Proof Valid',
+        text: 'Eligible retry with live valid pairing',
+        postedAt: ts + 500,
+      }),
+      senderDeviceId: peerDevice.publicId,
+      recipientDeviceId: myId.publicId,
+      senderCryptoKeyId: peerDevice.cryptoKeyId,
+      recipientCryptoKeyId: myId.cryptoKeyId,
+      recipientEcdhPublicKeyJwk: myId.ecdhPublicKeyJwk!,
+      sessionId: 'sess-nonce-bind-3',
+      idempotencyKey: 'idem-nonce-bind-961',
+    });
+
+    const offlineSaved961 = await syncEngine.ingestInboundEvent({
+      id: 961,
+      type: 'notification',
+      payload: '[E2EE_CIPHERTEXT]',
+      e2eeEnvelope: env961,
+      sourceDeviceId: peerDevice.publicId,
+      targetDeviceId: myId.publicId,
+      createdAt: ts + 500,
+      status: 'IN_PROGRESS',
+      retryCount: 0,
+      nextRetryAt: null,
+      idempotencyKey: 'idem-nonce-bind-961',
+      encrypted: true,
+      localEncrypted: false,
+      e2eeProtected: false,
+      e2eeVerified: false,
+    });
+    assert.equal(offlineSaved961, true);
+    assert.equal(
+      (await syncRepo.findByIdempotencyKey('idem-nonce-bind-961'))?.status,
+      'IN_PROGRESS'
+    );
+
+    await transport.connect();
+    for (let i = 0; i < 20; i += 1) {
+      const candidate = await syncRepo.findByIdempotencyKey('idem-nonce-bind-961');
+      if (candidate?.status === 'SYNCED' && candidate?.inboundAckConfirmed === true) {
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 15));
+    }
+    const final961 = await syncRepo.findByIdempotencyKey('idem-nonce-bind-961');
+    assert.equal(final961?.status, 'SYNCED');
+    assert.equal(final961?.inboundAckConfirmed, true);
+    assert.ok(transport.ackedRelayEventIds.includes(961));
 
     await syncEngine.stop();
   });

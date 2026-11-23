@@ -54,6 +54,8 @@ export interface SyncEvent {
   e2eeEnvelope?: E2eeEnvelope;
   /** Persisted messageNonce from verified inbound E2EE envelope to block cross-restart replays. */
   e2eeNonce?: string | null;
+  /** Cryptographic ECDSA attestation signed by local device key upon passing initial E2EE verification. */
+  inboundAckProof?: string | null;
   /** Relay row ID for un-ACKed inbound delivery recovery. */
   relayEventId?: number | null;
   /** True once recipient confirmed POST /sync/ack back to Relay. */

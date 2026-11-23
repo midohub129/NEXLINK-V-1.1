@@ -11,6 +11,7 @@ import type {
 import type { ICryptoProvider } from '../../domain/interfaces/services';
 import type { DeviceIdentityProfile, LinkedDevice } from '../../domain/models/device';
 import type {
+  E2eeEnvelope,
   EncryptedEnvelope,
   SecurityAuditEntry,
 } from '../../domain/models/security';
@@ -28,6 +29,7 @@ interface StoredSyncEventRecord {
   type: string;
   payload: string;
   envelope?: EncryptedEnvelope;
+  e2eeEnvelope?: E2eeEnvelope;
   createdAt: number;
   status: SyncEventStatus;
   retryCount: number;
@@ -40,6 +42,7 @@ interface StoredSyncEventRecord {
   e2eeProtected?: boolean;
   e2eeVerified?: boolean;
   e2eeNonce?: string | null;
+  inboundAckProof?: string | null;
   relayEventId?: number | null;
   inboundAckConfirmed?: boolean;
   targetDeviceId?: string | null;
@@ -113,6 +116,8 @@ export class IndexedDbSyncEventRepository implements ISyncEventRepository {
       e2eeProtected: record.e2eeProtected ?? false,
       e2eeVerified: record.e2eeVerified ?? false,
       e2eeNonce: record.e2eeNonce ?? null,
+      e2eeEnvelope: record.e2eeEnvelope,
+      inboundAckProof: record.inboundAckProof ?? null,
       relayEventId: record.relayEventId ?? null,
       inboundAckConfirmed: record.inboundAckConfirmed ?? false,
       targetDeviceId: record.targetDeviceId ?? null,
@@ -133,6 +138,7 @@ export class IndexedDbSyncEventRepository implements ISyncEventRepository {
       type: input.type,
       payload: envelope ? '[ENCRYPTED_AES_256_GCM]' : input.payload,
       envelope: envelope ?? undefined,
+      e2eeEnvelope: input.e2eeEnvelope,
       createdAt: input.createdAt ?? Date.now(),
       status: 'PENDING',
       retryCount: 0,
@@ -145,6 +151,7 @@ export class IndexedDbSyncEventRepository implements ISyncEventRepository {
       e2eeProtected: input.e2eeProtected ?? false,
       e2eeVerified: input.e2eeVerified ?? false,
       e2eeNonce: input.e2eeNonce ?? null,
+      inboundAckProof: input.inboundAckProof ?? null,
       relayEventId: input.relayEventId ?? null,
       inboundAckConfirmed: input.inboundAckConfirmed ?? false,
       targetDeviceId: input.targetDeviceId ?? null,
@@ -579,6 +586,7 @@ export class IndexedDbBackupProvider implements IBackupProvider {
         type: evt.type,
         payload: envelope ? '[ENCRYPTED_AES_256_GCM]' : evt.payload,
         envelope: envelope ?? undefined,
+        e2eeEnvelope: evt.e2eeEnvelope,
         createdAt: evt.createdAt,
         status: evt.status,
         retryCount: evt.retryCount,
@@ -591,6 +599,7 @@ export class IndexedDbBackupProvider implements IBackupProvider {
         e2eeProtected: evt.e2eeProtected ?? false,
         e2eeVerified: evt.e2eeVerified ?? false,
         e2eeNonce: evt.e2eeNonce ?? null,
+        inboundAckProof: evt.inboundAckProof ?? null,
         relayEventId: evt.relayEventId ?? null,
         inboundAckConfirmed: evt.inboundAckConfirmed ?? false,
         targetDeviceId: evt.targetDeviceId ?? null,
@@ -688,6 +697,8 @@ export class InMemorySyncEventRepository implements ISyncEventRepository {
       e2eeProtected: input.e2eeProtected ?? false,
       e2eeVerified: input.e2eeVerified ?? false,
       e2eeNonce: input.e2eeNonce ?? null,
+      e2eeEnvelope: input.e2eeEnvelope,
+      inboundAckProof: input.inboundAckProof ?? null,
       relayEventId: input.relayEventId ?? null,
       inboundAckConfirmed: input.inboundAckConfirmed ?? false,
       targetDeviceId: input.targetDeviceId ?? null,

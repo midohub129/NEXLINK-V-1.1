@@ -1,5 +1,5 @@
 import type { DeviceIdentityProfile, LinkedDevice } from '../models/device';
-import type { SecurityAuditEntry } from '../models/security';
+import type { E2eeEnvelope, SecurityAuditEntry } from '../models/security';
 import type { AppSettings } from '../models/settings';
 import type { SyncEvent, SyncEventStatus } from '../models/syncEvent';
 
@@ -14,6 +14,8 @@ export interface CreateSyncEventInput {
   e2eeProtected?: boolean;
   e2eeVerified?: boolean;
   e2eeNonce?: string | null;
+  e2eeEnvelope?: E2eeEnvelope;
+  inboundAckProof?: string | null;
   relayEventId?: number | null;
   inboundAckConfirmed?: boolean;
   createdAt?: number;
