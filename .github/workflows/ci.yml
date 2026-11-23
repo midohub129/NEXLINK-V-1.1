@@ -96,8 +96,10 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Accept Android SDK Licenses & Install Platform 35
+        shell: bash
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
+          set -o pipefail
+          (yes || true) | sdkmanager --licenses > /dev/null
           sdkmanager "platforms;android-35" "build-tools;35.0.0"
 
       - name: Validate Gradle Wrapper

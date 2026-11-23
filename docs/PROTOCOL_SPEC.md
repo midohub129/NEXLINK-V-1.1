@@ -140,15 +140,15 @@ REGISTER|{publicId}|{cryptoKeyId}|{sha256Hex(JSON.stringify(ecdhPublicKeyJwk))}|
 4. **استلام المرسل لرد القبول**: في سياسة `PEER_CONFIRMED` المعتمدة يبقى الحدث `IN_PROGRESS` مع ضبط `relayAcceptedAt` وبقاء `deliveredAt = null` (لا يُعدّ `SYNCED` بمجرد وصوله للوسيط).
 5. **الإرسال للمستلم (`sync:event` أو `GET /inbox`)**: يُرسله الخادم بحالة `status = IN_PROGRESS` و`relayDeliveryState = QUEUED_AT_RELAY` (لا يدّعي الخادم أبداً `SYNCED` قبل ACK).
 6. **التحقق وفك التشفير على المستلم**: فحص الاقتران -> فحص عدم تكرار `messageNonce` -> التحقق من توقيع ECDSA وAAD -> فك تشفير AES-256-GCM. أي فشل يوقف المسار فوراً دون إرسال ACK.
-7. **الحفظ المحلي على المستلم**: يُحفظ محلياً مع `e2eeNonce` و`e2eeVerified = true` و`e2eeProtected = true`. إذا فشل الحفظ المحلي يُلغى التسليم ولا يُرسل ACK.
-8. **تأكيد الاستلام (`POST /sync/ack`)**: يُرسل **فقط بعد** نجاح الحفظ المحلي؛ يحدّث الخادم `delivered_at` ويدفع `sync:delivered` للمرسل. عند تعذّر ACK مؤقتاً يظل الحدث في `/inbox` ويعاد ACK عند إعادة الاتصال دون تكرار محلي بفضل `idempotencyKey`.
+7. **الحفظ المحلي على المستلم**: يُحفظ محلياً بحالة `IN_PROGRESS` مع `e2eeNonce` و`e2eeVerified = true` و`e2eeProtected = true` و`inboundAckConfirmed = false` و`deliveredAt = null` و`syncedAt = null` (لا يُعلن `SYNCED` قبل إتمام `ACK`). إذا فشل الحفظ المحلي يُلغى التسليم ولا يُرسل `ACK`.
+8. **تأكيد الاستلام (`POST /sync/ack`)**: يُرسل **فقط بعد** نجاح الحفظ المحلي؛ وعند نجاح استجابة الخادم ينتقل الحدث على المستلم إلى `SYNCED` مع `inboundAckConfirmed = true` وضبط `deliveredAt`/`syncedAt`، ويحدّث الخادم `delivered_at` ويدفع `sync:delivered` للمرسل. عند تعذّر `ACK` مؤقتاً يظل الحدث لدى المستلم بحالة `IN_PROGRESS` (`inboundAckConfirmed = false`) وفي `/inbox` على Relay ويُعاد تأكيده تلقائياً عند استعادة الاتصال أو إعادة التشغيل دون تكرار محلي بفضل `idempotencyKey`.
 9. **اكتمال دورة المرسل**: عند وصول `sync:delivered` أو استعلام `GET /sync/:deviceId/status` ينتقل المرسل من `IN_PROGRESS` إلى `SYNCED` مع ضبط `deliveredAt`.
 
 | الحالة المحلية | المعنى | الانتقالات |
 | --- | --- | --- |
 | `PENDING` | محفوظ ومشفّر محلياً بانتظار الإرسال أو إعادة المحاولة بعد Backoff | `→ IN_PROGRESS` عند بدء الإرسال |
-| `IN_PROGRESS` | أُرسل وقَبِله Relay (`relayAcceptedAt != null`) وبانتظار تأكيد الطرف المقابل | `→ SYNCED` عند `/sync/ack` أو `sync:delivered`؛ `→ PENDING` عند إعادة التشغيل أو سحب الاقتران |
-| `SYNCED` | للوارد: فُك تشفيره وحُفظ محلياً وأُرسل ACK. للصادر: تم استلام تأكيد المستلم (`deliveredAt != null`) في سياسة `PEER_CONFIRMED` | حالة نهائية |
+| `IN_PROGRESS` | للصادر: قَبِله Relay (`relayAcceptedAt != null`) بانتظار تأكيد الطرف المقابل. للوارد: فُك تشفيره وحُفظ محلياً وبانتظار نجاح `POST /sync/ack` (`inboundAckConfirmed = false`) | `→ SYNCED` عند إتمام `POST /sync/ack` أو وصول `sync:delivered`؛ `→ PENDING` (للصادر فقط) عند إعادة التشغيل أو سحب الاقتران |
+| `SYNCED` | للوارد: فُك تشفيره وحُفظ محلياً واكتمل تأكيد `POST /sync/ack` (`inboundAckConfirmed = true`, `deliveredAt != null`). للصادر: تم استلام تأكيد المستلم (`deliveredAt != null`) في سياسة `PEER_CONFIRMED` | حالة نهائية |
 | `FAILED` | تجاوز الحد الأقصى لإعادة المحاولة (`maxSyncRetries`) | `→ PENDING` عند إعادة المحاولة اليدوية |
 
 - **نقاط نهاية المزامنة**:

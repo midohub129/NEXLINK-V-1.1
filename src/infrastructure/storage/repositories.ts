@@ -295,7 +295,8 @@ export class IndexedDbSyncEventRepository implements ISyncEventRepository {
         const all = (await reqToPromise(store.getAll())) as StoredSyncEventRecord[];
         let updated = 0;
         for (const rec of all) {
-          if (rec.status === 'IN_PROGRESS') {
+          const isOutboundInFlight = rec.relayEventId == null && !rec.e2eeVerified;
+          if (rec.status === 'IN_PROGRESS' && isOutboundInFlight) {
             await reqToPromise(
               store.put({
                 ...rec,
@@ -778,7 +779,8 @@ export class InMemorySyncEventRepository implements ISyncEventRepository {
   async resetInProgressToPending(): Promise<number> {
     let count = 0;
     this.events = this.events.map((e) => {
-      if (e.status === 'IN_PROGRESS') {
+      const isOutboundInFlight = e.relayEventId == null && !e.e2eeVerified;
+      if (e.status === 'IN_PROGRESS' && isOutboundInFlight) {
         count += 1;
         return { ...e, status: 'PENDING', nextRetryAt: Date.now() };
       }

@@ -817,9 +817,19 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
     assert.equal(syncEngine.getEvents().length, 1);
   });
 
-  it('retries delayed inbound /sync/ack upon reconnect without duplicating local stored events', async () => {
-    const { syncEngine, transport, devices, peerCrypto, peerDevice } =
-      await setupSyncHarness();
+  it('keeps inbound event IN_PROGRESS until /sync/ack succeeds, survives app restart without outbound re-dispatch, and transitions to SYNCED on ACK recovery', async () => {
+    const {
+      syncEngine,
+      syncRepo,
+      transport,
+      security,
+      settings,
+      devices,
+      crypto,
+      logger,
+      peerCrypto,
+      peerDevice,
+    } = await setupSyncHarness();
     await transport.connect();
     const myId = devices.getIdentity()!;
 
@@ -865,16 +875,109 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
     const firstIngest = await syncEngine.ingestInboundEvent(wireItem);
     assert.equal(firstIngest, true);
     assert.equal(syncEngine.getEvents().length, 1);
-    assert.equal(syncEngine.getEvents()[0].inboundAckConfirmed, false);
+
+    // Must NOT be SYNCED while inboundAckConfirmed is false
+    const unackedStored = syncEngine.getEvents()[0];
+    assert.equal(unackedStored.status, 'IN_PROGRESS');
+    assert.equal(unackedStored.inboundAckConfirmed, false);
+    assert.equal(unackedStored.deliveredAt, null);
+    assert.equal(unackedStored.syncedAt, null);
     assert.equal(transport.ackedRelayEventIds.length, 0);
 
-    // Network recovers -> /inbox returns same un-ACKed event #850 -> ACK completes with 0 duplicates!
+    // Outbound delivery ACK for colliding local ID must NOT falsely promote inbound event
+    await syncEngine.handleDeliveryAcks([unackedStored.id], Date.now());
+    assert.equal(syncEngine.getEvents()[0].status, 'IN_PROGRESS');
+    assert.equal(syncEngine.getEvents()[0].inboundAckConfirmed, false);
+
+    // Simulate app restart before ACK succeeds -> inbound row stays IN_PROGRESS (never reverted to PENDING outbound!)
+    await syncEngine.stop();
+    const restartedEngine = new SyncEngine({
+      repo: syncRepo,
+      transport,
+      crypto,
+      security,
+      settings,
+      devices,
+      logger,
+    });
+    await restartedEngine.start();
+
+    assert.equal(restartedEngine.getEvents().length, 1);
+    assert.equal(restartedEngine.getEvents()[0].status, 'IN_PROGRESS');
+    assert.equal(restartedEngine.getEvents()[0].inboundAckConfirmed, false);
+
+    // Outbound cycle must never pick up the un-ACKed inbound row
+    const summaryBeforeRecovery = await restartedEngine.runSyncCycle();
+    assert.equal(summaryBeforeRecovery.attempted, 0);
+    assert.equal(transport.sentBatches.length, 0);
+    assert.equal(restartedEngine.getEvents()[0].status, 'IN_PROGRESS');
+
+    // Network recovers -> re-ingesting same un-ACKed relay event #850 completes ACK and transitions to SYNCED!
     transport.acknowledgeInboundDelivery = origAck;
-    const secondIngest = await syncEngine.ingestInboundEvent(wireItem);
+    const secondIngest = await restartedEngine.ingestInboundEvent(wireItem);
     assert.equal(secondIngest, true);
-    assert.equal(syncEngine.getEvents().length, 1);
-    assert.equal(syncEngine.getEvents()[0].inboundAckConfirmed, true);
+    assert.equal(restartedEngine.getEvents().length, 1);
+    const syncedRow = restartedEngine.getEvents()[0];
+    assert.equal(syncedRow.status, 'SYNCED');
+    assert.equal(syncedRow.inboundAckConfirmed, true);
+    assert.ok(syncedRow.deliveredAt !== null);
+    assert.ok(syncedRow.syncedAt !== null);
     assert.deepEqual(transport.ackedRelayEventIds, [850]);
+
+    // Offline ingest followed by transport reconnect automatically retries ACK -> SYNCED
+    await transport.disconnect();
+    const env2 = await peerCrypto.encryptForPeer({
+      plaintext: JSON.stringify({
+        packageName: 'com.whatsapp',
+        title: 'Offline Ingest',
+        text: 'ACK deferred until reconnect',
+        postedAt: 4444,
+      }),
+      senderDeviceId: peerDevice.publicId,
+      recipientDeviceId: myId.publicId,
+      senderCryptoKeyId: peerDevice.cryptoKeyId,
+      recipientCryptoKeyId: myId.cryptoKeyId,
+      recipientEcdhPublicKeyJwk: myId.ecdhPublicKeyJwk!,
+      sessionId: 'sess-ack-offline',
+      idempotencyKey: 'idem-ack-offline-2',
+    });
+
+    const offlineIngest = await restartedEngine.ingestInboundEvent({
+      id: 851,
+      type: 'notification',
+      payload: '[E2EE_CIPHERTEXT]',
+      e2eeEnvelope: env2,
+      sourceDeviceId: peerDevice.publicId,
+      targetDeviceId: myId.publicId,
+      createdAt: 4444,
+      status: 'IN_PROGRESS',
+      retryCount: 0,
+      nextRetryAt: null,
+      idempotencyKey: 'idem-ack-offline-2',
+      encrypted: true,
+      localEncrypted: false,
+      e2eeProtected: false,
+      e2eeVerified: false,
+    });
+    assert.equal(offlineIngest, true);
+    const offlineRow = restartedEngine
+      .getEvents()
+      .find((e) => e.idempotencyKey === 'idem-ack-offline-2')!;
+    assert.equal(offlineRow.status, 'IN_PROGRESS');
+    assert.equal(offlineRow.inboundAckConfirmed, false);
+    assert.equal(offlineRow.deliveredAt, null);
+
+    // Reconnect triggers retryPendingInboundAcks() -> ACK #851 sent -> SYNCED
+    await transport.connect();
+    await new Promise((r) => setTimeout(r, 30));
+    const reconnectedRow = restartedEngine
+      .getEvents()
+      .find((e) => e.idempotencyKey === 'idem-ack-offline-2')!;
+    assert.equal(reconnectedRow.status, 'SYNCED');
+    assert.equal(reconnectedRow.inboundAckConfirmed, true);
+    assert.ok(reconnectedRow.deliveredAt !== null);
+    assert.ok(transport.ackedRelayEventIds.includes(851));
+    await restartedEngine.stop();
   });
 
   it('computes bounded exponential backoff correctly', () => {

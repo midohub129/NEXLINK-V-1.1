@@ -360,4 +360,155 @@ describe('End-to-End Authenticated Relay Transport, Mutual Pairing, E2EE & Peer 
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('keeps recipient IN_PROGRESS when /sync/ack fails transiently across restart and promotes both peers to SYNCED only after ACK succeeds on reconnect', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'nexlink-ack-recovery-'));
+    const db = new SqliteRelayDatabase(path.join(dir, 'relay.sqlite'));
+    const relay = createRelayServer(db);
+    const app = express();
+    app.use('/api/relay', relay.router);
+
+    const server = http.createServer(app);
+    attachRelayUpgrade(server, relay);
+
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', () => resolve());
+    });
+    const addr = server.address();
+    assert.ok(addr && typeof addr !== 'string');
+    const baseUrl = `http://127.0.0.1:${addr.port}/api/relay`;
+
+    const deviceA = await buildDeviceStack(baseUrl, 'admin');
+    const loggerB = new RotatingLogger();
+    const cryptoB = new NodeTestCryptoProvider();
+    const settingsB = new SettingsService(new InMemorySettingsRepository(), loggerB);
+    await settingsB.initialize();
+    await settingsB.update({
+      role: 'basic',
+      notificationAccessGranted: true,
+      selectedNotificationApps: ['com.whatsapp'],
+      relayEndpoint: baseUrl,
+      syncDeliveryPolicy: 'PEER_CONFIRMED',
+    });
+    const securityB = new SecurityManager(
+      cryptoB,
+      new InMemoryAuditRepository(),
+      loggerB
+    );
+    await securityB.initialize();
+    const transportB = new RelayTransportClient({
+      baseUrl,
+      requestTimeoutMs: 4000,
+      logger: loggerB,
+      crypto: cryptoB,
+      webSocketFactory: (url) => new WebSocket(url) as unknown as globalThis.WebSocket,
+    });
+    const devicesB = new DeviceManager({
+      deviceRepo: new InMemoryDeviceRepository(),
+      crypto: cryptoB,
+      transport: transportB,
+      security: securityB,
+      settings: settingsB,
+      logger: loggerB,
+    });
+    await devicesB.start();
+    const idB = devicesB.getIdentity()!;
+    securityB.issueSession(idB.publicId, idB.cryptoKeyId, 30);
+
+    const repoB = new InMemorySyncEventRepository();
+    let syncEngineB = new SyncEngine({
+      repo: repoB,
+      transport: transportB,
+      crypto: cryptoB,
+      security: securityB,
+      settings: settingsB,
+      devices: devicesB,
+      logger: loggerB,
+    });
+    await syncEngineB.start();
+
+    try {
+      await deviceA.devices.connectRelay('admin', 'Sender');
+      await devicesB.connectRelay('basic', 'Receiver');
+
+      const req = await deviceA.devices.createPairingRequest();
+      const pending = await devicesB.acceptPairingCode(
+        req.pairingCode,
+        'basic',
+        'Receiver'
+      );
+      await deviceA.devices.confirmPairingApproval(
+        pending.pairingId,
+        true,
+        idB.cryptoKeyId
+      );
+      await new Promise((r) => setTimeout(r, 60));
+      await devicesB.refreshLinkedDevicesFromRelay();
+
+      // Simulate transient ACK transport failure on Receiver B
+      const origAckB = transportB.acknowledgeInboundDelivery.bind(transportB);
+      transportB.acknowledgeInboundDelivery = async () => {
+        throw new Error('Simulated /sync/ack timeout');
+      };
+
+      await deviceA.syncEngine.enqueueNotification({
+        packageName: 'com.whatsapp',
+        title: 'ACK Failure Drill',
+        text: 'Must remain IN_PROGRESS until ACK succeeds',
+        notificationKey: 'ack-drill-1',
+      });
+      await deviceA.syncEngine.runSyncCycle();
+      await new Promise((r) => setTimeout(r, 150));
+
+      // Both Receiver B and Sender A must remain IN_PROGRESS (NOT SYNCED!)
+      assert.equal(syncEngineB.getEvents().length, 1);
+      assert.equal(syncEngineB.getEvents()[0].status, 'IN_PROGRESS');
+      assert.equal(syncEngineB.getEvents()[0].inboundAckConfirmed, false);
+      assert.equal(syncEngineB.getEvents()[0].deliveredAt, null);
+      assert.equal(deviceA.syncEngine.getEvents()[0].status, 'IN_PROGRESS');
+      assert.equal(deviceA.syncEngine.getEvents()[0].deliveredAt, null);
+
+      // Receiver B restarts while offline with ACK still unconfirmed
+      await syncEngineB.stop();
+      await devicesB.disconnectRelay();
+      transportB.acknowledgeInboundDelivery = origAckB;
+
+      syncEngineB = new SyncEngine({
+        repo: repoB,
+        transport: transportB,
+        crypto: cryptoB,
+        security: securityB,
+        settings: settingsB,
+        devices: devicesB,
+        logger: loggerB,
+      });
+      await syncEngineB.start();
+      assert.equal(syncEngineB.getEvents()[0].status, 'IN_PROGRESS');
+      assert.equal(syncEngineB.getEvents()[0].inboundAckConfirmed, false);
+
+      // Reconnect triggers retryPendingInboundAcks() + /inbox reconciliation -> ACK succeeds with 0 duplicates!
+      await devicesB.connectRelay('basic', 'Receiver');
+      await new Promise((r) => setTimeout(r, 180));
+
+      assert.equal(syncEngineB.getEvents().length, 1);
+      assert.equal(syncEngineB.getEvents()[0].status, 'SYNCED');
+      assert.equal(syncEngineB.getEvents()[0].inboundAckConfirmed, true);
+      assert.ok(syncEngineB.getEvents()[0].deliveredAt !== null);
+      assert.equal((await transportB.fetchInboundEvents(idB.publicId)).length, 0);
+
+      // Sender A received sync:delivered / status poll and transitioned to SYNCED
+      await deviceA.syncEngine.runSyncCycle();
+      assert.equal(deviceA.syncEngine.getEvents()[0].status, 'SYNCED');
+      assert.ok(deviceA.syncEngine.getEvents()[0].deliveredAt !== null);
+    } finally {
+      await deviceA.syncEngine.stop();
+      await deviceA.devices.stop();
+      await syncEngineB.stop();
+      await devicesB.stop();
+      await relay.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

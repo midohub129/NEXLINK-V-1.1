@@ -20,8 +20,11 @@ export type RelayDeliveryState = 'QUEUED_AT_RELAY' | 'DELIVERED';
  * - Recipient ingest (`SyncEngine.ingestInboundEvent`):
  *   1. Verifies paired sender + cryptoKeyId + nonce uniqueness + ECDSA signature + AAD + AES-256-GCM decrypt.
  *   2. Persists plaintext locally (encrypted at rest if WebCrypto/Keystore available) with
- *      `e2eeProtected: true`, `e2eeVerified: true`, `e2eeNonce`.
+ *      `status: 'IN_PROGRESS'`, `e2eeProtected: true`, `e2eeVerified: true`, `e2eeNonce`, `relayEventId`,
+ *      `inboundAckConfirmed: false`, `deliveredAt: null`, `syncedAt: null`.
  *   3. ONLY AFTER local persistence succeeds, sends `POST /sync/ack`.
+ *   4. ONLY AFTER `POST /sync/ack` succeeds, transitions local row to `status: 'SYNCED'`,
+ *      `inboundAckConfirmed: true`, `deliveredAt`, `syncedAt`.
  */
 export interface SyncEvent {
   id: number;

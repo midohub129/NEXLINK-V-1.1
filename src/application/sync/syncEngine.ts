@@ -141,6 +141,7 @@ export class SyncEngine implements ILifecycleParticipant {
   }
 
   private async handleTransportConnected(isReconnect: boolean): Promise<void> {
+    await this.retryPendingInboundAcks().catch(() => 0);
     await this.pullInboundEvents().catch(() => 0);
     if (isReconnect) {
       await this.runSyncCycle().catch(() => null);
@@ -293,7 +294,12 @@ export class SyncEngine implements ILifecycleParticipant {
     let confirmedCount = 0;
     for (const id of clientEventIds) {
       const existing = await this.repo.findById(id);
-      if (existing && existing.status === 'IN_PROGRESS') {
+      if (
+        existing &&
+        existing.status === 'IN_PROGRESS' &&
+        existing.relayEventId == null &&
+        !existing.e2eeVerified
+      ) {
         await this.repo.updateEvent(id, {
           status: 'SYNCED',
           deliveredAt: serverTimestamp,
@@ -310,6 +316,40 @@ export class SyncEngine implements ILifecycleParticipant {
       this.notify();
     }
     return confirmedCount;
+  }
+
+  async retryPendingInboundAcks(): Promise<number> {
+    const identity = this.devices.getIdentity();
+    if (!identity || this.transport.getState() !== 'CONNECTED') return 0;
+
+    const inProgress = await this.repo.getByStatus('IN_PROGRESS');
+    const pendingInbound = inProgress.filter(
+      (e): e is SyncEvent & { relayEventId: number } =>
+        typeof e.relayEventId === 'number' && e.inboundAckConfirmed !== true
+    );
+    if (pendingInbound.length === 0) return 0;
+
+    const relayIds = Array.from(new Set(pendingInbound.map((e) => e.relayEventId)));
+    await this.transport.acknowledgeInboundDelivery(identity.publicId, relayIds);
+
+    const ackedAt = Date.now();
+    let confirmed = 0;
+    for (const evt of pendingInbound) {
+      const updated = await this.repo.updateEvent(evt.id, {
+        status: 'SYNCED',
+        inboundAckConfirmed: true,
+        deliveredAt: evt.deliveredAt ?? ackedAt,
+        syncedAt: evt.syncedAt ?? ackedAt,
+        lastError: null,
+      });
+      if (updated) confirmed += 1;
+    }
+
+    if (confirmed > 0) {
+      this.eventsCache = await this.repo.getAll();
+      this.notify();
+    }
+    return confirmed;
   }
 
   async pullInboundEvents(): Promise<number> {
@@ -372,26 +412,30 @@ export class SyncEngine implements ILifecycleParticipant {
       const existingUnacked = await this.repo.findByIdempotencyKey(
         remoteEvent.idempotencyKey
       );
+      const trustedSender = this.devices
+        .getLinkedDevices()
+        .find(
+          (d) =>
+            d.publicId === envelope.senderDeviceId &&
+            d.pairingState === 'PAIRED' &&
+            d.verifiedByRelay &&
+            d.cryptoKeyId === envelope.senderCryptoKeyId
+        );
+
       if (
         existingUnacked &&
+        trustedSender &&
         existingUnacked.e2eeNonce === envelope.messageNonce &&
         existingUnacked.relayEventId === remoteEvent.id &&
-        existingUnacked.inboundAckConfirmed === false
+        existingUnacked.sourceDeviceId === envelope.senderDeviceId &&
+        (existingUnacked.inboundAckConfirmed === false ||
+          existingUnacked.status !== 'SYNCED')
       ) {
-        if (this.transport.getState() === 'CONNECTED') {
-          try {
-            await this.transport.acknowledgeInboundDelivery(identity.publicId, [
-              remoteEvent.id,
-            ]);
-            await this.repo.updateEvent(existingUnacked.id, {
-              inboundAckConfirmed: true,
-            });
-            this.eventsCache = await this.repo.getAll();
-            this.notify();
-          } catch {
-            // keep inboundAckConfirmed=false for next reconnect retry
-          }
-        }
+        await this.confirmInboundDeliveryOrKeepInProgress(
+          existingUnacked,
+          identity.publicId,
+          remoteEvent.id
+        );
         return true;
       }
 
@@ -470,20 +514,16 @@ export class SyncEngine implements ILifecycleParticipant {
 
     if (existing) {
       this.seenE2eeNonces.add(envelope.messageNonce);
-      if (this.transport.getState() === 'CONNECTED') {
-        try {
-          await this.transport.acknowledgeInboundDelivery(identity.publicId, [
-            remoteEvent.id,
-          ]);
-          await this.repo.updateEvent(existing.id, { inboundAckConfirmed: true });
-        } catch {
-          // defer ACK retry until next pull
-        }
-      }
+      await this.confirmInboundDeliveryOrKeepInProgress(
+        existing,
+        identity.publicId,
+        remoteEvent.id
+      );
       return true;
     }
 
     let insertedId: number | null = null;
+    let persistedEvent: SyncEvent | null = null;
     try {
       const inserted = await this.repo.insert({
         type: remoteEvent.type,
@@ -502,18 +542,19 @@ export class SyncEngine implements ILifecycleParticipant {
       });
       insertedId = inserted.id;
 
-      const now = Date.now();
       const updated = await this.repo.updateEvent(inserted.id, {
-        status: 'SYNCED',
-        syncedAt: now,
-        deliveredAt: now,
+        status: 'IN_PROGRESS',
+        syncedAt: null,
+        deliveredAt: null,
         e2eeProtected: true,
         e2eeVerified: true,
         inboundAckConfirmed: false,
+        lastError: null,
       });
       if (!updated) {
-        throw new Error('Failed to finalize persisted inbound event status');
+        throw new Error('Failed to persist inbound event prior to ACK');
       }
+      persistedEvent = updated;
     } catch (storageErr) {
       if (insertedId !== null) {
         await this.repo.delete(insertedId).catch(() => false);
@@ -532,25 +573,11 @@ export class SyncEngine implements ILifecycleParticipant {
     this.eventsCache = await this.repo.getAll();
     this.notify();
 
-    if (this.transport.getState() === 'CONNECTED') {
-      try {
-        await this.transport.acknowledgeInboundDelivery(identity.publicId, [
-          remoteEvent.id,
-        ]);
-        await this.repo.updateEvent(insertedId, { inboundAckConfirmed: true });
-        this.eventsCache = await this.repo.getAll();
-        this.notify();
-      } catch (ackErr) {
-        this.logger.warn(
-          'SYNC',
-          'تم حفظ الحدث محلياً لكن تعذّر إرسال تأكيد ACK للخادم وسيُعاد لاحقاً',
-          {
-            relayEventId: remoteEvent.id,
-            reason: ackErr instanceof Error ? ackErr.message : 'ack error',
-          }
-        );
-      }
-    }
+    await this.confirmInboundDeliveryOrKeepInProgress(
+      persistedEvent,
+      identity.publicId,
+      remoteEvent.id
+    );
 
     await this.security.recordAudit({
       action: 'E2EE_VERIFIED',
@@ -561,6 +588,64 @@ export class SyncEngine implements ILifecycleParticipant {
     });
 
     return true;
+  }
+
+  private async confirmInboundDeliveryOrKeepInProgress(
+    localEvent: SyncEvent,
+    devicePublicId: string,
+    relayEventId: number
+  ): Promise<boolean> {
+    if (this.transport.getState() !== 'CONNECTED') {
+      if (localEvent.status !== 'IN_PROGRESS' && localEvent.inboundAckConfirmed !== true) {
+        await this.repo.updateEvent(localEvent.id, {
+          status: 'IN_PROGRESS',
+          inboundAckConfirmed: false,
+          deliveredAt: null,
+          syncedAt: null,
+          lastError: 'تم حفظ الحدث محلياً بانتظار الاتصال لإرسال تأكيد ACK إلى المرحل',
+        });
+        this.eventsCache = await this.repo.getAll();
+        this.notify();
+      }
+      return false;
+    }
+
+    try {
+      await this.transport.acknowledgeInboundDelivery(devicePublicId, [relayEventId]);
+      const ackTime = Date.now();
+      await this.repo.updateEvent(localEvent.id, {
+        status: 'SYNCED',
+        inboundAckConfirmed: true,
+        deliveredAt: localEvent.deliveredAt ?? ackTime,
+        syncedAt: localEvent.syncedAt ?? ackTime,
+        lastError: null,
+      });
+      this.eventsCache = await this.repo.getAll();
+      this.notify();
+      return true;
+    } catch (ackErr) {
+      const reason = ackErr instanceof Error ? ackErr.message : 'ack error';
+      if (localEvent.inboundAckConfirmed !== true) {
+        await this.repo.updateEvent(localEvent.id, {
+          status: 'IN_PROGRESS',
+          inboundAckConfirmed: false,
+          deliveredAt: null,
+          syncedAt: null,
+          lastError: `تم حفظ الحدث محلياً بانتظار إعادة إرسال تأكيد ACK (${reason})`,
+        });
+        this.eventsCache = await this.repo.getAll();
+        this.notify();
+      }
+      this.logger.warn(
+        'SYNC',
+        'تم حفظ الحدث محلياً لكن تعذّر إرسال تأكيد ACK للخادم وسيبقى قيد المزامنة حتى نجاح التأكيد',
+        {
+          relayEventId,
+          reason,
+        }
+      );
+      return false;
+    }
   }
 
   /**
@@ -617,7 +702,10 @@ export class SyncEngine implements ILifecycleParticipant {
 
     const activePeer = this.resolveTargetPeer();
     if (!activePeer || !activePeer.publicKeyJwk || !activePeer.ecdhPublicKeyJwk) {
-      const stuckInProgress = await this.repo.getByStatus('IN_PROGRESS');
+      await this.retryPendingInboundAcks().catch(() => 0);
+      const stuckInProgress = (await this.repo.getByStatus('IN_PROGRESS')).filter(
+        (evt) => evt.relayEventId == null && !evt.e2eeVerified
+      );
       if (stuckInProgress.length > 0) {
         for (const evt of stuckInProgress) {
           await this.repo.updateEvent(evt.id, {
@@ -649,14 +737,18 @@ export class SyncEngine implements ILifecycleParticipant {
     this.notify();
 
     try {
-      // Revert any IN_PROGRESS events targeting a peer whose link was revoked
+      await this.retryPendingInboundAcks().catch(() => 0);
+
+      // Revert any outbound IN_PROGRESS events targeting a peer whose link was revoked
       const pairedIds = new Set(
         this.devices
           .getLinkedDevices()
           .filter((d) => d.pairingState === 'PAIRED' && d.verifiedByRelay)
           .map((d) => d.publicId)
       );
-      const currentInProgress = await this.repo.getByStatus('IN_PROGRESS');
+      const currentInProgress = (await this.repo.getByStatus('IN_PROGRESS')).filter(
+        (evt) => evt.relayEventId == null && !evt.e2eeVerified
+      );
       for (const evt of currentInProgress) {
         if (!evt.targetDeviceId || !pairedIds.has(evt.targetDeviceId)) {
           await this.repo.updateEvent(evt.id, {
@@ -670,11 +762,14 @@ export class SyncEngine implements ILifecycleParticipant {
         }
       }
 
-      // Refresh delivery receipts for relay-accepted IN_PROGRESS events
+      // Refresh delivery receipts for relay-accepted outbound IN_PROGRESS events
       let resolvedAckCount = 0;
       if (currentSettings.syncDeliveryPolicy === 'PEER_CONFIRMED') {
         const waitingDelivery = (await this.repo.getByStatus('IN_PROGRESS'))
-          .filter((e) => e.relayAcceptedAt != null)
+          .filter(
+            (e) =>
+              e.relayAcceptedAt != null && e.relayEventId == null && !e.e2eeVerified
+          )
           .map((e) => e.id);
         if (waitingDelivery.length > 0) {
           const delivered = await this.transport
@@ -684,9 +779,13 @@ export class SyncEngine implements ILifecycleParticipant {
         }
       }
 
-      const dueEvents = await this.repo.getDuePendingEvents(nowMs);
+      const dueEvents = (await this.repo.getDuePendingEvents(nowMs)).filter(
+        (e) => e.relayEventId == null && !e.e2eeVerified
+      );
       if (dueEvents.length === 0) {
-        const remainingWaiting = (await this.repo.getByStatus('IN_PROGRESS')).length;
+        const remainingWaiting = (await this.repo.getByStatus('IN_PROGRESS')).filter(
+          (e) => e.relayEventId == null && !e.e2eeVerified
+        ).length;
         const emptySummary: SyncRunSummary = {
           attempted: 0,
           synced: resolvedAckCount,
