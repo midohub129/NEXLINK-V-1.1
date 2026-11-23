@@ -5,7 +5,9 @@ build/
 local.properties
 *.jks
 *.keystore
-*.env
+.env
+.env.*
+!.env.example
 google-services.json
 *.bak
 *.save
@@ -18,5 +20,10 @@ google-services.json
 *.sqlite-shm
 *.db-wal
 *.db-shm
+
+# TypeScript incremental build & test/tooling outputs
+*.tsbuildinfo
 node_modules/
 dist/
+test-results/
+.playwright-cli/

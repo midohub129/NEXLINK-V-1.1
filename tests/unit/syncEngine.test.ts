@@ -28,9 +28,11 @@ class MockTransportClient implements ITransportClient {
   state: ConnectionState = 'DISCONNECTED';
   sentBatches: SyncEvent[][] = [];
   ackedRelayEventIds: number[] = [];
+  inboundQueue: SyncEvent[] = [];
   nextAckHandler: ((events: SyncEvent[]) => Promise<SyncDispatchAck>) | null = null;
   linkedDevices: LinkedDevice[] = [];
   deliveredClientEventIds: number[] = [];
+  private stateListeners = new Set<() => void>();
 
   getState(): ConnectionState {
     return this.state;
@@ -53,12 +55,15 @@ class MockTransportClient implements ITransportClient {
   }
   async connect(): Promise<void> {
     this.state = 'CONNECTED';
+    this.stateListeners.forEach((l) => l());
   }
   async disconnect(): Promise<void> {
     this.state = 'DISCONNECTED';
+    this.stateListeners.forEach((l) => l());
   }
   async revokeServerSession(): Promise<void> {
     this.state = 'DISCONNECTED';
+    this.stateListeners.forEach((l) => l());
   }
   async createPairingRequest(): Promise<PairingRequest> {
     throw new Error('Not used');
@@ -94,7 +99,7 @@ class MockTransportClient implements ITransportClient {
     };
   }
   async fetchInboundEvents(): Promise<SyncEvent[]> {
-    return [];
+    return [...this.inboundQueue];
   }
   async acknowledgeInboundDelivery(
     _deviceId: string,
@@ -105,8 +110,11 @@ class MockTransportClient implements ITransportClient {
   async fetchSyncDeliveryStatus(): Promise<number[]> {
     return this.deliveredClientEventIds;
   }
-  subscribe(): () => void {
-    return () => {};
+  subscribe(listener: () => void): () => void {
+    this.stateListeners.add(listener);
+    return () => {
+      this.stateListeners.delete(listener);
+    };
   }
   subscribeEvents(): () => void {
     return () => {};
@@ -398,7 +406,26 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
         .some((a) => a.action === 'E2EE_DECRYPT_FAILED' && a.outcome === 'DENIED')
     );
 
-    // Valid E2EE envelope succeeds once, and replay of same messageNonce is rejected!
+    // Mismatched wrapper idempotencyKey vs signed AAD idempotencyKey is rejected without ACK
+    const mismatchIdem = await syncEngine.ingestInboundEvent({
+      id: 9015,
+      type: 'notification',
+      payload: '[E2EE_CIPHERTEXT]',
+      e2eeEnvelope: validEnvelope,
+      sourceDeviceId: peerDevice.publicId,
+      targetDeviceId: myId.publicId,
+      createdAt: 1000,
+      status: 'SYNCED',
+      retryCount: 0,
+      nextRetryAt: null,
+      idempotencyKey: 'idem-wrong-wrapper',
+      encrypted: false,
+      e2eeProtected: true,
+    });
+    assert.equal(mismatchIdem, false);
+    assert.equal(transport.ackedRelayEventIds.length, 0);
+
+    // Valid E2EE envelope with matching idempotencyKey succeeds once, and replay of same messageNonce is rejected!
     const acceptedValid = await syncEngine.ingestInboundEvent({
       id: 902,
       type: 'notification',
@@ -410,7 +437,7 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
       status: 'SYNCED',
       retryCount: 0,
       nextRetryAt: null,
-      idempotencyKey: 'idem-valid-1',
+      idempotencyKey: 'idem-tamper-1',
       encrypted: false,
       e2eeProtected: true,
     });
@@ -428,7 +455,7 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
       status: 'SYNCED',
       retryCount: 0,
       nextRetryAt: null,
-      idempotencyKey: 'idem-replay-1',
+      idempotencyKey: 'idem-tamper-1',
       encrypted: false,
       e2eeProtected: true,
     });
@@ -461,6 +488,160 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
 
     const recovered = recoveredEngine.getEvents().find((e) => e.id === inserted.id);
     assert.equal(recovered?.status, 'PENDING');
+    await recoveredEngine.stop();
+  });
+
+  it('reverts IN_PROGRESS events safely to PENDING if pairing is revoked while PENDING/IN_PROGRESS events exist', async () => {
+    const { syncEngine, transport, devices, peerDevice } = await setupSyncHarness(
+      3,
+      'PEER_CONFIRMED',
+      true
+    );
+    await transport.connect();
+
+    const baseTime = Date.now() - 2000;
+    const ev1 = await syncEngine.enqueueNotification({
+      packageName: 'com.whatsapp',
+      title: 'In Flight',
+      text: 'Dispatched before revocation',
+      notificationKey: 'rev-1',
+      postedAt: baseTime,
+    });
+    assert.equal(ev1.status, 'SAVED');
+
+    // Run cycle -> becomes IN_PROGRESS awaiting peer ACK
+    const firstRun = await syncEngine.runSyncCycle(baseTime + 100);
+    assert.equal(firstRun.awaitingPeerAck, 1);
+
+    // Enqueue a second event while PENDING
+    const ev2 = await syncEngine.enqueueNotification({
+      packageName: 'com.whatsapp',
+      title: 'Still Pending',
+      text: 'Waiting in queue',
+      notificationKey: 'rev-2',
+      postedAt: baseTime + 200,
+    });
+    assert.equal(ev2.status, 'SAVED');
+
+    // Revoke peer trust
+    await devices.revokeLinkedDevice(peerDevice.publicId, true);
+
+    const afterRevokeRun = await syncEngine.runSyncCycle(baseTime + 300);
+    assert.equal(afterRevokeRun.skippedReason, 'UNPAIRED');
+
+    // Both events must now safely sit in PENDING (no stuck IN_PROGRESS, no data loss)
+    const allEvents = syncEngine.getEvents();
+    assert.equal(allEvents.length, 2);
+    assert.ok(allEvents.every((e) => e.status === 'PENDING'));
+  });
+
+  it('automatically pulls missed inbound events on transport reconnect and deduplicates across restarts via findByIdempotencyKey', async () => {
+    const {
+      syncEngine,
+      syncRepo,
+      transport,
+      security,
+      settings,
+      devices,
+      crypto,
+      logger,
+      peerCrypto,
+      peerDevice,
+    } = await setupSyncHarness();
+
+    const myId = devices.getIdentity()!;
+    // Old event created > 1 hour ago (outside 10-minute findRecentDuplicate window)
+    const oldTs = Date.now() - 2 * 60 * 60 * 1000;
+    const envelope1 = await peerCrypto.encryptForPeer({
+      plaintext: JSON.stringify({
+        packageName: 'com.whatsapp',
+        title: 'Offline Missed Msg',
+        text: 'Arrived while offline',
+        postedAt: oldTs,
+      }),
+      senderDeviceId: peerDevice.publicId,
+      recipientDeviceId: myId.publicId,
+      senderCryptoKeyId: peerDevice.cryptoKeyId,
+      recipientCryptoKeyId: myId.cryptoKeyId,
+      recipientEcdhPublicKeyJwk: myId.ecdhPublicKeyJwk!,
+      sessionId: 'sess-reconnect',
+      idempotencyKey: 'idem-reconnect-old',
+    });
+
+    transport.inboundQueue = [
+      {
+        id: 777,
+        type: 'notification',
+        payload: '[E2EE_CIPHERTEXT]',
+        e2eeEnvelope: envelope1,
+        sourceDeviceId: peerDevice.publicId,
+        targetDeviceId: myId.publicId,
+        createdAt: oldTs,
+        status: 'SYNCED',
+        retryCount: 0,
+        nextRetryAt: null,
+        idempotencyKey: 'idem-reconnect-old',
+        encrypted: false,
+        e2eeProtected: true,
+      },
+    ];
+
+    // Transition from DISCONNECTED -> CONNECTED triggers automatic inbound pull
+    await transport.connect();
+    await new Promise((r) => setTimeout(r, 40));
+
+    assert.equal(syncEngine.getEvents().length, 1);
+    assert.deepEqual(transport.ackedRelayEventIds, [777]);
+
+    // Simulate app restart (fresh seenE2eeNonces) receiving a redelivered copy of the same old idempotencyKey
+    await syncEngine.stop();
+    const restartedEngine = new SyncEngine({
+      repo: syncRepo,
+      transport,
+      crypto,
+      security,
+      settings,
+      devices,
+      logger,
+    });
+    await restartedEngine.start();
+
+    const freshNonceCopy = await peerCrypto.encryptForPeer({
+      plaintext: JSON.stringify({
+        packageName: 'com.whatsapp',
+        title: 'Offline Missed Msg',
+        text: 'Arrived while offline',
+        postedAt: oldTs,
+      }),
+      senderDeviceId: peerDevice.publicId,
+      recipientDeviceId: myId.publicId,
+      senderCryptoKeyId: peerDevice.cryptoKeyId,
+      recipientCryptoKeyId: myId.cryptoKeyId,
+      recipientEcdhPublicKeyJwk: myId.ecdhPublicKeyJwk!,
+      sessionId: 'sess-reconnect-2',
+      idempotencyKey: 'idem-reconnect-old',
+    });
+
+    const deduped = await restartedEngine.ingestInboundEvent({
+      id: 778,
+      type: 'notification',
+      payload: '[E2EE_CIPHERTEXT]',
+      e2eeEnvelope: freshNonceCopy,
+      sourceDeviceId: peerDevice.publicId,
+      targetDeviceId: myId.publicId,
+      createdAt: oldTs,
+      status: 'SYNCED',
+      retryCount: 0,
+      nextRetryAt: null,
+      idempotencyKey: 'idem-reconnect-old',
+      encrypted: false,
+      e2eeProtected: true,
+    });
+    assert.equal(deduped, true);
+    // Stored count stays 1 (no duplicate row) and relay event #778 gets ACKed cleanly
+    assert.equal(restartedEngine.getEvents().length, 1);
+    assert.ok(transport.ackedRelayEventIds.includes(778));
+    await restartedEngine.stop();
   });
 
   it('computes bounded exponential backoff correctly', () => {

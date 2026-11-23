@@ -184,8 +184,10 @@ export function App() {
           serviceRunning={settings.connectionServiceEnabled}
           connectionState={connectionState}
           linkedDevices={linkedDevices}
+          pendingApprovalsCount={pendingPairingApprovals.length}
           notificationAccess={settings.notificationAccessGranted}
           usageAccess={settings.usageAccessGranted}
+          testFixtureModeEnabled={settings.testFixtureModeEnabled}
           sessionValid={sessionValid}
           cryptoSupported={container.crypto.isSupported()}
           health={health}

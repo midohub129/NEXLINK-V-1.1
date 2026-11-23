@@ -13,7 +13,9 @@
     "typecheck": "tsc -b --noEmit",
     "lint": "eslint .",
     "format:check": "prettier --check \"src/**/*.{ts,tsx}\" \"server/**/*.ts\" server.ts",
-    "test": "tsx --test tests/**/*.test.ts"
+    "test": "tsx --test tests/**/*.test.ts",
+    "test:unit": "tsx --test tests/unit/*.test.ts",
+    "test:integration": "tsx --test tests/integration/*.test.ts"
   },
   "dependencies": {
     "express": "^5.1.0",

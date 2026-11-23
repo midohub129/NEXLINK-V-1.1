@@ -140,7 +140,20 @@ export class IndexedDbSyncEventRepository implements ISyncEventRepository {
       syncedAt: null,
     };
 
-    const generatedId = await this.db.add(STORES.SYNC_EVENTS, record);
+    let generatedId: IDBValidKey;
+    try {
+      generatedId = await this.db.add(STORES.SYNC_EVENTS, record);
+    } catch (err) {
+      if (err instanceof Error && err.name === 'ConstraintError') {
+        throw new StorageError(
+          'DUPLICATE_IDEMPOTENCY_KEY',
+          'حدث مكرر بمفتاح عدم التكرار نفسه.',
+          `Duplicate idempotencyKey ${input.idempotencyKey}`,
+          err
+        );
+      }
+      throw err;
+    }
     const savedRecord: StoredSyncEventRecord = {
       ...record,
       id: Number(generatedId),
@@ -154,6 +167,25 @@ export class IndexedDbSyncEventRepository implements ISyncEventRepository {
 
   async findById(id: number): Promise<SyncEvent | null> {
     const rec = await this.db.readOne<StoredSyncEventRecord>(STORES.SYNC_EVENTS, id);
+    return rec ? this.toDomainEvent(rec) : null;
+  }
+
+  async findByIdempotencyKey(idempotencyKey: string): Promise<SyncEvent | null> {
+    const rec = await this.db.runTransaction(
+      [STORES.SYNC_EVENTS],
+      'readonly',
+      async (tx) => {
+        const store = tx.objectStore(STORES.SYNC_EVENTS);
+        if (store.indexNames.contains('by_idempotencyKey')) {
+          const found = (await reqToPromise(
+            store.index('by_idempotencyKey').get(idempotencyKey)
+          )) as StoredSyncEventRecord | undefined;
+          return found ?? null;
+        }
+        const all = (await reqToPromise(store.getAll())) as StoredSyncEventRecord[];
+        return all.find((r) => r.idempotencyKey === idempotencyKey) ?? null;
+      }
+    );
     return rec ? this.toDomainEvent(rec) : null;
   }
 
@@ -644,6 +676,11 @@ export class InMemorySyncEventRepository implements ISyncEventRepository {
 
   async findById(id: number): Promise<SyncEvent | null> {
     const found = this.events.find((e) => e.id === id);
+    return found ? { ...found } : null;
+  }
+
+  async findByIdempotencyKey(idempotencyKey: string): Promise<SyncEvent | null> {
+    const found = this.events.find((e) => e.idempotencyKey === idempotencyKey);
     return found ? { ...found } : null;
   }
 

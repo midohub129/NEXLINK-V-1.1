@@ -7,6 +7,4 @@ export type DashboardModalType =
   | 'app-usage'
   | 'privacy-auth'
   | 'pair-device'
-  | 'screen-share'
-  | 'files-media'
   | null;

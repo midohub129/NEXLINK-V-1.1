@@ -121,7 +121,7 @@ export function TopBar({
             </button>
           ) : (
             <span className="text-xs text-[#A5B1C6] whitespace-nowrap shrink-0">
-              الإصدار 2.0
+              الإصدار 1.1
             </span>
           )}
         </div>

@@ -581,6 +581,149 @@ describe('P0/P1 Negative Security, E2EE & Reliability Audit Suite', () => {
       };
       assert.deepEqual(ackDup.acceptedIds, []);
       assert.deepEqual(ackDup.duplicateIds, [101]);
+
+      // 11. Tampered AAD metadata rejection & direction mismatch binding
+      const tamperedAad = {
+        ...envelope,
+        aad: envelope.aad.replace('e2ee-idem-1', 'e2ee-idem-evil'),
+      };
+      await assert.rejects(
+        () =>
+          receiver.crypto.decryptFromPeer({
+            envelope: tamperedAad,
+            senderEcdsaPublicKeyJwk: sender.keys.publicKeyJwk!,
+            senderEcdhPublicKeyJwk: sender.keys.ecdhPublicKeyJwk!,
+            expectedRecipientDeviceId: receiver.publicId,
+            expectedRecipientCryptoKeyId: receiver.keys.cryptoKeyId,
+          }),
+        (err: unknown) =>
+          err instanceof SecurityError && err.code === 'E2EE_INVALID_SIGNATURE'
+      );
+
+      // Sender/wrong-direction binding rejected
+      await assert.rejects(
+        () =>
+          sender.crypto.decryptFromPeer({
+            envelope,
+            senderEcdsaPublicKeyJwk: sender.keys.publicKeyJwk!,
+            senderEcdhPublicKeyJwk: sender.keys.ecdhPublicKeyJwk!,
+            expectedRecipientDeviceId: sender.publicId,
+            expectedRecipientCryptoKeyId: sender.keys.cryptoKeyId,
+          }),
+        (err: unknown) =>
+          err instanceof SecurityError && err.code === 'E2EE_BINDING_MISMATCH'
+      );
+
+      // 12. Relay rejects mismatched senderCryptoKeyId / recipientCryptoKeyId in envelope (422)
+      const spoofedKeyIdEnvelope = {
+        ...envelope,
+        senderCryptoKeyId: 'ecdsa-spoofed000000000000000',
+      };
+      const badKeyIdSync = await sender.signedFetch('POST', '/sync', {
+        deviceId: sender.publicId,
+        targetDeviceId: receiver.publicId,
+        events: [
+          {
+            ...wireEvent,
+            id: 102,
+            idempotencyKey: 'e2ee-idem-spoofed',
+            e2eeEnvelope: spoofedKeyIdEnvelope,
+          },
+        ],
+      });
+      assert.equal(badKeyIdSync.status, 422);
+      const badKeyJson = (await badKeyIdSync.json()) as { code: string };
+      assert.equal(badKeyJson.code, 'E2EE_KEY_ID_MISMATCH');
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('13. Pairing code wrong/expired rejection, 5-attempt brute-force lockout (423), and mutual pairing rejection (approve=false)', async () => {
+    const srv = await createTestRelayServer();
+    try {
+      const admin = await registerAndAuthenticate(
+        srv.baseUrl,
+        'lock-admin',
+        'admin',
+        'Lock Admin'
+      );
+      const peer = await registerAndAuthenticate(
+        srv.baseUrl,
+        'lock-peer',
+        'basic',
+        'Lock Peer'
+      );
+
+      // Issue pairing request #1 and test mutual rejection (approve: false)
+      const p1 = (await (
+        await admin.signedFetch('POST', '/pairing/request', {})
+      ).json()) as { pairingId: string; pairingCode: string };
+
+      // Wrong code -> 404 NOT_FOUND
+      const wrongCodeRes = await peer.signedFetch('POST', '/pairing/accept', {
+        pairingCode: p1.pairingCode === '000000' ? '111111' : '000000',
+      });
+      assert.equal(wrongCodeRes.status, 404);
+
+      // Valid accept then Admin explicitly rejects (approve: false)
+      const acc1 = await peer.signedFetch('POST', '/pairing/accept', {
+        pairingCode: p1.pairingCode,
+      });
+      assert.equal(acc1.status, 200);
+
+      const rejectRes = await admin.signedFetch('POST', '/pairing/confirm', {
+        pairingId: p1.pairingId,
+        approve: false,
+      });
+      assert.equal(rejectRes.status, 200);
+      const rejectBody = (await rejectRes.json()) as {
+        approved: boolean;
+        peer: unknown;
+      };
+      assert.equal(rejectBody.approved, false);
+      assert.equal(rejectBody.peer, null);
+
+      const linksAfterReject = (await (
+        await admin.signedFetch('GET', `/devices/${admin.publicId}/links`)
+      ).json()) as { devices: unknown[] };
+      assert.equal(linksAfterReject.devices.length, 0);
+
+      // Issue pairing request #2 and exhaust 5 failed guesses -> LOCKED (423)
+      const p2 = (await (
+        await admin.signedFetch('POST', '/pairing/request', {})
+      ).json()) as { pairingId: string; pairingCode: string };
+      const wrongGuess = p2.pairingCode === '999999' ? '888888' : '999999';
+
+      for (let i = 0; i < 5; i += 1) {
+        const miss = await peer.signedFetch('POST', '/pairing/accept', {
+          pairingCode: wrongGuess,
+        });
+        assert.equal(miss.status, 404);
+      }
+
+      // Now even the real pairing code p2.pairingCode is locked -> 423 LOCKED
+      const lockedRes = await peer.signedFetch('POST', '/pairing/accept', {
+        pairingCode: p2.pairingCode,
+      });
+      assert.equal(lockedRes.status, 423);
+      const lockedBody = (await lockedRes.json()) as { code: string };
+      assert.equal(lockedBody.code, 'LOCKED');
+
+      // Issue pairing request #3 and expire it in SQLite -> 404 EXPIRED
+      const p3 = (await (
+        await admin.signedFetch('POST', '/pairing/request', {})
+      ).json()) as { pairingId: string; pairingCode: string };
+      srv.db.db
+        .prepare('UPDATE pairing_requests SET expires_at = ? WHERE pairing_id = ?')
+        .run(Date.now() - 5000, p3.pairingId);
+
+      const expiredRes = await peer.signedFetch('POST', '/pairing/accept', {
+        pairingCode: p3.pairingCode,
+      });
+      assert.equal(expiredRes.status, 404);
+      const expiredBody = (await expiredRes.json()) as { code: string };
+      assert.equal(expiredBody.code, 'EXPIRED');
     } finally {
       await srv.close();
     }

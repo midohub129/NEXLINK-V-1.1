@@ -222,4 +222,118 @@ describe('End-to-End Authenticated Relay Transport, Mutual Pairing, E2EE & Peer 
     );
     assert.equal(client.getState(), 'ERROR');
   });
+
+  it('handles full 2-device offline->online cycle: target offline keeps IN_PROGRESS, reconnect pulls & ACKs without duplicates, and revocation halts sync', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'nexlink-offline-cycle-'));
+    const db = new SqliteRelayDatabase(path.join(dir, 'relay.sqlite'));
+    const relay = createRelayServer(db);
+    const app = express();
+    app.use('/api/relay', relay.router);
+
+    const server = http.createServer(app);
+    attachRelayUpgrade(server, relay);
+
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', () => resolve());
+    });
+    const addr = server.address();
+    assert.ok(addr && typeof addr !== 'string');
+    const baseUrl = `http://127.0.0.1:${addr.port}/api/relay`;
+
+    const deviceA = await buildDeviceStack(baseUrl, 'admin');
+    const deviceB = await buildDeviceStack(baseUrl, 'basic');
+
+    try {
+      await deviceA.devices.connectRelay('admin', 'Sender Phone');
+      await deviceB.devices.connectRelay('basic', 'Receiver Tablet');
+
+      // Pair A <-> B
+      const req = await deviceA.devices.createPairingRequest();
+      const pending = await deviceB.devices.acceptPairingCode(
+        req.pairingCode,
+        'basic',
+        'Receiver Tablet'
+      );
+      await deviceA.devices.confirmPairingApproval(
+        pending.pairingId,
+        true,
+        deviceB.identity.cryptoKeyId
+      );
+      await new Promise((r) => setTimeout(r, 60));
+      await deviceB.devices.refreshLinkedDevicesFromRelay();
+
+      // Target device B goes offline
+      await deviceB.devices.disconnectRelay();
+      assert.equal(deviceB.transport.getState(), 'DISCONNECTED');
+
+      // Device A sends event while B is offline
+      const enqueued = await deviceA.syncEngine.enqueueNotification({
+        packageName: 'com.whatsapp',
+        title: 'Offline Queued',
+        text: 'Delivered once B reconnects',
+        notificationKey: 'off-1',
+      });
+      assert.equal(enqueued.status, 'SAVED');
+
+      const sendWhileOffline = await deviceA.syncEngine.runSyncCycle();
+      assert.equal(sendWhileOffline.attempted, 1);
+      assert.equal(sendWhileOffline.awaitingPeerAck, 1);
+      assert.equal(sendWhileOffline.synced, 0);
+
+      // Verify A's event is IN_PROGRESS (relayAcceptedAt set, deliveredAt still null!)
+      const midFlightOnA = deviceA.syncEngine.getEvents()[0];
+      assert.equal(midFlightOnA.status, 'IN_PROGRESS');
+      assert.ok(midFlightOnA.relayAcceptedAt !== null);
+      assert.equal(midFlightOnA.deliveredAt, null);
+
+      // Device B comes back online -> auto-pulls /inbox, decrypts E2EE, stores locally, and sends /sync/ack
+      await deviceB.devices.connectRelay('basic', 'Receiver Tablet');
+      await new Promise((r) => setTimeout(r, 150));
+
+      assert.equal(deviceB.syncEngine.getEvents().length, 1);
+      assert.ok(
+        deviceB.syncEngine.getEvents()[0].payload.includes('Delivered once B reconnects')
+      );
+
+      // Polling / status or WS sync:delivered moves A to SYNCED with deliveredAt
+      await deviceA.syncEngine.runSyncCycle();
+      const finalOnA = deviceA.syncEngine.getEvents()[0];
+      assert.equal(finalOnA.status, 'SYNCED');
+      assert.ok(finalOnA.deliveredAt !== null);
+
+      // Device B disconnects & reconnects again -> pulls /inbox again -> ZERO duplicates stored
+      await deviceB.devices.disconnectRelay();
+      await deviceB.devices.connectRelay('basic', 'Receiver Tablet');
+      await new Promise((r) => setTimeout(r, 120));
+      assert.equal(deviceB.syncEngine.getEvents().length, 1);
+
+      // Device A enqueues another event -> dispatches -> IN_PROGRESS -> then revokes pairing
+      const ev2 = await deviceA.syncEngine.enqueueNotification({
+        packageName: 'com.whatsapp',
+        title: 'Before Revoke',
+        text: 'Must revert on revocation',
+        notificationKey: 'off-2',
+      });
+      assert.equal(ev2.status, 'SAVED');
+      await deviceA.devices.revokeLinkedDevice(deviceB.identity.publicId, false);
+
+      const postRevoke = await deviceA.syncEngine.runSyncCycle();
+      assert.equal(postRevoke.skippedReason, 'UNPAIRED');
+
+      // Revoked B's /inbox returns empty because link is no longer PAIRED
+      const inboxAfterRevoke = await deviceB.transport.fetchInboundEvents(
+        deviceB.identity.publicId
+      );
+      assert.equal(inboxAfterRevoke.length, 0);
+    } finally {
+      await deviceA.syncEngine.stop();
+      await deviceA.devices.stop();
+      await deviceB.syncEngine.stop();
+      await deviceB.devices.stop();
+      await relay.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

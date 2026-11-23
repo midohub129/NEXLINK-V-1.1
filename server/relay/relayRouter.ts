@@ -959,7 +959,12 @@ export function createRelayServer(db: SqliteRelayDatabase): RelayServerHandle {
     }
 
     const cleanTarget = targetDeviceId.trim();
-    if (!db.isLinkPaired(auth.publicId, cleanTarget)) {
+    const targetDevice = db.getDevice(cleanTarget);
+    if (
+      !targetDevice ||
+      targetDevice.status !== 'ACTIVE' ||
+      !db.isLinkPaired(auth.publicId, cleanTarget)
+    ) {
       res.status(403).json({
         error: 'الجهاز المستهدف غير مقترن أو تم سحب الثقة منه.',
         code: 'NOT_PAIRED_OR_REVOKED',
@@ -998,6 +1003,17 @@ export function createRelayServer(db: SqliteRelayDatabase): RelayServerHandle {
       }
 
       const env = evt.e2eeEnvelope as Record<string, unknown>;
+      if (
+        env.senderCryptoKeyId !== auth.cryptoKeyId ||
+        env.recipientCryptoKeyId !== targetDevice.cryptoKeyId
+      ) {
+        res.status(422).json({
+          error: 'بصمة مفاتيح E2EE في المغلف لا تطابق بصمة المرسل أو المستلم المسجلة.',
+          code: 'E2EE_KEY_ID_MISMATCH',
+        });
+        return;
+      }
+
       normalizedEvents.push({
         id: evt.id,
         idempotencyKey: evt.idempotencyKey,

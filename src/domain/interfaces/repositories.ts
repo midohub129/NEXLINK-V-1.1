@@ -19,6 +19,7 @@ export interface ISyncEventRepository {
   initialize(): Promise<void>;
   insert(input: CreateSyncEventInput): Promise<SyncEvent>;
   findById(id: number): Promise<SyncEvent | null>;
+  findByIdempotencyKey(idempotencyKey: string): Promise<SyncEvent | null>;
   findRecentDuplicate(
     type: string,
     notificationKey: string,

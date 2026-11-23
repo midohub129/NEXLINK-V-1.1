@@ -69,6 +69,9 @@ export class SyncEngine implements ILifecycleParticipant {
   private listeners = new Set<() => void>();
   private unsubInbound: (() => void) | null = null;
   private unsubDeliveryAcks: (() => void) | null = null;
+  private unsubTransportState: (() => void) | null = null;
+  private lastTransportState = 'DISCONNECTED';
+  private pullInFlight: Promise<number> | null = null;
 
   constructor(deps: {
     repo: ISyncEventRepository;
@@ -100,6 +103,7 @@ export class SyncEngine implements ILifecycleParticipant {
     }
 
     this.eventsCache = await this.repo.getAll();
+    this.lastTransportState = this.transport.getState();
 
     if (!this.unsubInbound) {
       this.unsubInbound = this.transport.subscribeEvents((remoteEvent) => {
@@ -115,7 +119,26 @@ export class SyncEngine implements ILifecycleParticipant {
       );
     }
 
+    if (!this.unsubTransportState) {
+      this.unsubTransportState = this.transport.subscribe(() => {
+        const nextState = this.transport.getState();
+        const prevState = this.lastTransportState;
+        this.lastTransportState = nextState;
+        if (nextState === 'CONNECTED' && prevState !== 'CONNECTED') {
+          const isReconnect = prevState === 'RECONNECTING' || prevState === 'ERROR';
+          void this.handleTransportConnected(isReconnect);
+        }
+      });
+    }
+
     this.notify();
+  }
+
+  private async handleTransportConnected(isReconnect: boolean): Promise<void> {
+    await this.pullInboundEvents().catch(() => 0);
+    if (isReconnect) {
+      await this.runSyncCycle().catch(() => null);
+    }
   }
 
   async stop(): Promise<void> {
@@ -127,7 +150,12 @@ export class SyncEngine implements ILifecycleParticipant {
       this.unsubDeliveryAcks();
       this.unsubDeliveryAcks = null;
     }
+    if (this.unsubTransportState) {
+      this.unsubTransportState();
+      this.unsubTransportState = null;
+    }
     this.isProcessing = false;
+    this.pullInFlight = null;
     this.notify();
   }
 
@@ -254,9 +282,9 @@ export class SyncEngine implements ILifecycleParticipant {
   async handleDeliveryAcks(
     clientEventIds: number[],
     serverTimestamp = Date.now()
-  ): Promise<void> {
-    if (clientEventIds.length === 0) return;
-    let changed = false;
+  ): Promise<number> {
+    if (clientEventIds.length === 0) return 0;
+    let confirmedCount = 0;
     for (const id of clientEventIds) {
       const existing = await this.repo.findById(id);
       if (existing && existing.status === 'IN_PROGRESS') {
@@ -267,27 +295,40 @@ export class SyncEngine implements ILifecycleParticipant {
           nextRetryAt: null,
           lastError: null,
         });
-        changed = true;
+        confirmedCount += 1;
       }
     }
-    if (changed) {
+    if (confirmedCount > 0) {
       this.lastSuccessfulSyncAt = serverTimestamp;
       this.eventsCache = await this.repo.getAll();
       this.notify();
     }
+    return confirmedCount;
   }
 
   async pullInboundEvents(): Promise<number> {
     const identity = this.devices.getIdentity();
     if (!identity || this.transport.getState() !== 'CONNECTED') return 0;
 
-    const inbound = await this.transport.fetchInboundEvents(identity.publicId);
-    let ingested = 0;
-    for (const evt of inbound) {
-      const ok = await this.ingestInboundEvent(evt);
-      if (ok) ingested += 1;
+    if (this.pullInFlight) {
+      return this.pullInFlight;
     }
-    return ingested;
+
+    this.pullInFlight = (async () => {
+      try {
+        const inbound = await this.transport.fetchInboundEvents(identity.publicId);
+        let ingested = 0;
+        for (const evt of inbound) {
+          const ok = await this.ingestInboundEvent(evt);
+          if (ok) ingested += 1;
+        }
+        return ingested;
+      } finally {
+        this.pullInFlight = null;
+      }
+    })();
+
+    return this.pullInFlight;
   }
 
   async ingestInboundEvent(remoteEvent: SyncEvent): Promise<boolean> {
@@ -303,6 +344,20 @@ export class SyncEngine implements ILifecycleParticipant {
         deviceId: identity.publicId,
         outcome: 'DENIED',
         details: `رفض حدث وارد #${remoteEvent.id} لعدم وجود مغلف E2EE`,
+      });
+      return false;
+    }
+
+    if (
+      remoteEvent.sourceDeviceId &&
+      remoteEvent.sourceDeviceId !== envelope.senderDeviceId
+    ) {
+      await this.security.recordAudit({
+        action: 'E2EE_DECRYPT_FAILED',
+        actorRole: role,
+        deviceId: identity.publicId,
+        outcome: 'DENIED',
+        details: `رفض حدث وارد #${remoteEvent.id} لعدم تطابق هوية المرسل مع المغلف`,
       });
       return false;
     }
@@ -354,6 +409,15 @@ export class SyncEngine implements ILifecycleParticipant {
         expectedRecipientDeviceId: identity.publicId,
         expectedRecipientCryptoKeyId: identity.cryptoKeyId,
       });
+
+      const parsedAad = JSON.parse(envelope.aad) as { idempotencyKey?: unknown };
+      if (parsedAad.idempotencyKey !== remoteEvent.idempotencyKey) {
+        throw new SecurityError(
+          'E2EE_AAD_TAMPERED',
+          'عدم تطابق مفتاح عدم التكرار بين الحدث ومغلف E2EE.',
+          'AAD idempotencyKey mismatch'
+        );
+      }
     } catch (err) {
       const msg =
         err instanceof SecurityError ? err.message : 'فشل التحقق وفك التشفير E2EE';
@@ -369,13 +433,18 @@ export class SyncEngine implements ILifecycleParticipant {
 
     this.seenE2eeNonces.add(envelope.messageNonce);
 
-    const existing = await this.repo.findRecentDuplicate(
-      remoteEvent.type,
-      remoteEvent.notificationKey ?? remoteEvent.idempotencyKey,
-      remoteEvent.payloadHash ?? remoteEvent.idempotencyKey,
-      DEDUP_WINDOW_MS * 10,
-      Date.now()
+    const existingByKey = await this.repo.findByIdempotencyKey(
+      remoteEvent.idempotencyKey
     );
+    const existing =
+      existingByKey ??
+      (await this.repo.findRecentDuplicate(
+        remoteEvent.type,
+        remoteEvent.notificationKey ?? remoteEvent.idempotencyKey,
+        remoteEvent.payloadHash ?? remoteEvent.idempotencyKey,
+        DEDUP_WINDOW_MS * 10,
+        Date.now()
+      ));
 
     if (existing) {
       if (this.transport.getState() === 'CONNECTED') {
@@ -479,6 +548,20 @@ export class SyncEngine implements ILifecycleParticipant {
 
     const activePeer = this.resolveTargetPeer();
     if (!activePeer || !activePeer.publicKeyJwk || !activePeer.ecdhPublicKeyJwk) {
+      const stuckInProgress = await this.repo.getByStatus('IN_PROGRESS');
+      if (stuckInProgress.length > 0) {
+        for (const evt of stuckInProgress) {
+          await this.repo.updateEvent(evt.id, {
+            status: 'PENDING',
+            targetDeviceId: null,
+            relayAcceptedAt: null,
+            nextRetryAt: nowMs,
+            lastError:
+              'تم إلغاء أو فقدان اقتران الجهاز المستهدف — بانتظار إعادة الاقتران.',
+          });
+        }
+        this.eventsCache = await this.repo.getAll();
+      }
       const summary: SyncRunSummary = {
         attempted: 0,
         synced: 0,
@@ -497,7 +580,29 @@ export class SyncEngine implements ILifecycleParticipant {
     this.notify();
 
     try {
+      // Revert any IN_PROGRESS events targeting a peer whose link was revoked
+      const pairedIds = new Set(
+        this.devices
+          .getLinkedDevices()
+          .filter((d) => d.pairingState === 'PAIRED' && d.verifiedByRelay)
+          .map((d) => d.publicId)
+      );
+      const currentInProgress = await this.repo.getByStatus('IN_PROGRESS');
+      for (const evt of currentInProgress) {
+        if (!evt.targetDeviceId || !pairedIds.has(evt.targetDeviceId)) {
+          await this.repo.updateEvent(evt.id, {
+            status: 'PENDING',
+            targetDeviceId: null,
+            relayAcceptedAt: null,
+            nextRetryAt: nowMs,
+            lastError:
+              'تم تغيير حالة الاقتران للطرف المستهدف — أُعيد الحدث لطابور الانتظار.',
+          });
+        }
+      }
+
       // Refresh delivery receipts for relay-accepted IN_PROGRESS events
+      let resolvedAckCount = 0;
       if (currentSettings.syncDeliveryPolicy === 'PEER_CONFIRMED') {
         const waitingDelivery = (await this.repo.getByStatus('IN_PROGRESS'))
           .filter((e) => e.relayAcceptedAt != null)
@@ -506,16 +611,17 @@ export class SyncEngine implements ILifecycleParticipant {
           const delivered = await this.transport
             .fetchSyncDeliveryStatus(identity.publicId, waitingDelivery)
             .catch(() => []);
-          await this.handleDeliveryAcks(delivered, Date.now());
+          resolvedAckCount = await this.handleDeliveryAcks(delivered, Date.now());
         }
       }
 
       const dueEvents = await this.repo.getDuePendingEvents(nowMs);
       if (dueEvents.length === 0) {
+        const remainingWaiting = (await this.repo.getByStatus('IN_PROGRESS')).length;
         const emptySummary: SyncRunSummary = {
           attempted: 0,
-          synced: 0,
-          awaitingPeerAck: 0,
+          synced: resolvedAckCount,
+          awaitingPeerAck: remainingWaiting,
           duplicates: 0,
           failed: 0,
           completedAt: Date.now(),

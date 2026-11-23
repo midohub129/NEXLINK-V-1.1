@@ -31,6 +31,20 @@ export function NotificationAppSelectionView({
   const [sourceApps, setSourceApps] = useState<DataSourceAppInfo[]>([]);
   const [customPackage, setCustomPackage] = useState('');
   const [packageNotice, setPackageNotice] = useState<string | null>(null);
+  const [pendingToggleMap, setPendingToggleMap] = useState<Record<string, boolean>>({});
+
+  const handleToggle = async (packageName: string, nextChecked: boolean) => {
+    setPendingToggleMap((prev) => ({ ...prev, [packageName]: nextChecked }));
+    try {
+      await onToggleApp(packageName, nextChecked);
+    } finally {
+      setPendingToggleMap((prev) => {
+        const next = { ...prev };
+        delete next[packageName];
+        return next;
+      });
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -172,7 +186,8 @@ export function NotificationAppSelectionView({
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-6">
           {displayedApps.map((app) => {
-            const checked = selectedApps.has(app.packageName);
+            const checked =
+              pendingToggleMap[app.packageName] ?? selectedApps.has(app.packageName);
             return (
               <label
                 key={app.packageName}
@@ -183,7 +198,7 @@ export function NotificationAppSelectionView({
                     type="checkbox"
                     checked={checked}
                     onChange={(e) =>
-                      void onToggleApp(app.packageName, e.target.checked)
+                      void handleToggle(app.packageName, e.target.checked)
                     }
                     className="w-5 h-5 rounded accent-[#4B91FF] cursor-pointer shrink-0"
                   />

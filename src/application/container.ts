@@ -147,6 +147,8 @@ export function createAppContainer(): AppContainer {
       if (current.role && current.connectionServiceEnabled) {
         try {
           await deviceManager.connectRelay(current.role);
+          await syncEngine.pullInboundEvents();
+          await syncEngine.runSyncCycle();
         } catch (err) {
           errorManager.capture(
             err,

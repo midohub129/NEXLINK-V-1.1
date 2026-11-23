@@ -1,0 +1,78 @@
+name: NEXLINK Web & Relay CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-web-and-relay:
+    name: Typecheck, Lint, Tests, Build & Security Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies (reproducible)
+        run: npm ci
+
+      - name: TypeScript typecheck
+        run: npm run typecheck
+
+      - name: ESLint check
+        run: npm run lint
+
+      - name: Prettier format check
+        run: npm run format:check
+
+      - name: Run Unit Tests
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p test-results
+          npm run test:unit | tee test-results/unit-tests.tap
+
+      - name: Run Integration Tests
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p test-results
+          npm run test:integration | tee test-results/integration-tests.tap
+
+      - name: Production Build
+        run: npm run build
+
+      - name: Dependency Vulnerability Audit
+        run: npm audit --audit-level=moderate
+
+      - name: Upload Test Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexlink-test-reports-${{ github.sha }}
+          path: test-results/
+          retention-days: 14
+
+      - name: Upload Production Build Artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexlink-dist-${{ github.sha }}
+          path: dist/
+          retention-days: 7

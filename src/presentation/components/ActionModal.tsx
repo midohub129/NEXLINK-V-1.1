@@ -270,8 +270,6 @@ export function ActionModal({
             {modal === 'privacy-auth' &&
               'مركز الأمان والإعدادات والصحة والنسخ الاحتياطي'}
             {modal === 'pair-device' && 'ربط الأجهزة عبر خادم المرحل'}
-            {modal === 'screen-share' && 'مشاركة الشاشة'}
-            {modal === 'files-media' && 'الملفات والوسائط'}
           </h2>
           <button
             type="button"
@@ -1179,22 +1177,6 @@ export function ActionModal({
                 </div>
               </div>
             )}
-          </div>
-        )}
-
-        {(modal === 'screen-share' || modal === 'files-media') && (
-          <div className="space-y-4">
-            <p className="text-sm text-[#A5B1C6] leading-relaxed">
-              {modal === 'screen-share'
-                ? 'ميزة مشاركة الشاشة الفورية تتطلب قناة WebRTC MediaStream وتبادل إشارات (Signaling + TURN/STUN) غير مكتمل في هذا الإصدار؛ تم الإبقاء على الواجهة لتوثيق الحالة دون محاكاة وهمية.'
-                : 'ميزة نقل الملفات والوسائط تتطلب قناة WebRTC DataChannel أو خدمة تخزين ثنائية مستقلة غير مفعّلة في هذا الإصدار.'}
-            </p>
-            <div className="bg-[#0D121E] rounded-lg p-4">
-              <p className="text-xs text-[#A5B1C6]">المعرّف العام للجهاز</p>
-              <p className="font-mono text-xs text-white mt-1 break-all">
-                {identity?.publicId ?? 'غير مهيأ'}
-              </p>
-            </div>
           </div>
         )}
       </div>

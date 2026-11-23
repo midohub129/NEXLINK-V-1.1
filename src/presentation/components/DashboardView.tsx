@@ -2,8 +2,7 @@ import {
   Activity,
   Bell,
   ChevronLeft,
-  FolderOpen,
-  MonitorSmartphone,
+  History,
   Plus,
   RefreshCw,
   Settings,
@@ -22,8 +21,10 @@ interface DashboardViewProps {
   serviceRunning: boolean;
   connectionState: ConnectionState;
   linkedDevices: LinkedDevice[];
+  pendingApprovalsCount: number;
   notificationAccess: boolean;
   usageAccess: boolean;
+  testFixtureModeEnabled: boolean;
   sessionValid: boolean;
   cryptoSupported: boolean;
   health: SystemHealthSnapshot;
@@ -43,8 +44,10 @@ export function DashboardView({
   serviceRunning,
   connectionState,
   linkedDevices,
+  pendingApprovalsCount,
   notificationAccess,
   usageAccess,
+  testFixtureModeEnabled,
   sessionValid,
   cryptoSupported,
   health,
@@ -297,9 +300,11 @@ export function DashboardView({
               <div>
                 <p className="text-base font-bold text-white">ربط الأجهزة والاقتران</p>
                 <p className="text-xs text-[#A5B1C6] mt-0.5 tabular-nums">
-                  {pairedDevices.length > 0
-                    ? `${pairedDevices.length} جهاز مقترن ومؤكد عبر المرحل`
-                    : 'إنشاء أو إدخال رمز اقتران عبر خادم المرحل'}
+                  {pendingApprovalsCount > 0
+                    ? `${pendingApprovalsCount} طلب اقتران بانتظار موافقتك · ${pairedDevices.length} مقترن`
+                    : pairedDevices.length > 0
+                      ? `${pairedDevices.length} جهاز مقترن ومؤكد عبر المرحل`
+                      : 'إنشاء أو إدخال رمز اقتران عبر خادم المرحل'}
                 </p>
               </div>
             </div>
@@ -316,11 +321,34 @@ export function DashboardView({
                 <Bell className="w-5 h-5" />
               </span>
               <div>
-                <p className="text-base font-bold text-white">الإشعارات</p>
+                <p className="text-base font-bold text-white">
+                  تطبيقات الإشعارات المسموحة
+                </p>
                 <p className="text-xs text-[#A5B1C6] mt-0.5 tabular-nums">
-                  {selectedAppsCount} تطبيق محدد ·{' '}
-                  {health.pendingCount + health.syncedCount + health.failedCount} حدث في
-                  القاعدة
+                  {selectedAppsCount} حزمة محددة ·{' '}
+                  {notificationAccess ? 'الوصول مفعّل' : 'الوصول غير مفعّل'}
+                </p>
+              </div>
+            </div>
+            <ChevronLeft className="w-5 h-5 text-[#A5B1C6] shrink-0" />
+          </button>
+
+          <button
+            type="button"
+            onClick={() => onNavigate('notification-history')}
+            className="bg-[#192131] hover:bg-[#1f293d] border border-white/5 rounded-xl p-4 sm:p-5 flex items-center justify-between gap-4 text-right transition-colors cursor-pointer min-h-[72px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4B91FF]"
+          >
+            <div className="flex items-center gap-4">
+              <span className="w-10 h-10 rounded-lg bg-[#0D121E] flex items-center justify-center text-[#4B91FF] shrink-0">
+                <History className="w-5 h-5" />
+              </span>
+              <div>
+                <p className="text-base font-bold text-white">
+                  سجل الإشعارات وطابور المزامنة
+                </p>
+                <p className="text-xs text-[#A5B1C6] mt-0.5 tabular-nums">
+                  {health.pendingCount} انتظار · {health.syncedCount} مُزامَن ·{' '}
+                  {health.failedCount} فشل
                 </p>
               </div>
             </div>
@@ -339,45 +367,11 @@ export function DashboardView({
               <div>
                 <p className="text-base font-bold text-white">نشاط التطبيقات</p>
                 <p className="text-xs text-[#A5B1C6] mt-0.5">
-                  مراقبة قدرات البيئة وبيانات الاستخدام
-                </p>
-              </div>
-            </div>
-            <ChevronLeft className="w-5 h-5 text-[#A5B1C6] shrink-0" />
-          </button>
-
-          <button
-            type="button"
-            onClick={() => onOpenModal('screen-share')}
-            className="bg-[#192131] hover:bg-[#1f293d] border border-white/5 rounded-xl p-4 sm:p-5 flex items-center justify-between gap-4 text-right transition-colors cursor-pointer min-h-[72px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4B91FF]"
-          >
-            <div className="flex items-center gap-4">
-              <span className="w-10 h-10 rounded-lg bg-[#0D121E] flex items-center justify-center text-[#4B91FF] shrink-0">
-                <MonitorSmartphone className="w-5 h-5" />
-              </span>
-              <div>
-                <p className="text-base font-bold text-white">مشاركة الشاشة</p>
-                <p className="text-xs text-[#A5B1C6] mt-0.5">
-                  تتطلب قناة WebRTC أو خدمة النظام الأصلي
-                </p>
-              </div>
-            </div>
-            <ChevronLeft className="w-5 h-5 text-[#A5B1C6] shrink-0" />
-          </button>
-
-          <button
-            type="button"
-            onClick={() => onOpenModal('files-media')}
-            className="bg-[#192131] hover:bg-[#1f293d] border border-white/5 rounded-xl p-4 sm:p-5 flex items-center justify-between gap-4 text-right transition-colors cursor-pointer min-h-[72px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4B91FF]"
-          >
-            <div className="flex items-center gap-4">
-              <span className="w-10 h-10 rounded-lg bg-[#0D121E] flex items-center justify-center text-[#4B91FF] shrink-0">
-                <FolderOpen className="w-5 h-5" />
-              </span>
-              <div>
-                <p className="text-base font-bold text-white">الملفات والوسائط</p>
-                <p className="text-xs text-[#A5B1C6] mt-0.5">
-                  تتطلب قناة نقل ثنائية مباشرة
+                  {!usageAccess
+                    ? 'صلاحية النشاط غير مفعّلة حالياً'
+                    : testFixtureModeEnabled
+                      ? 'وضع بيانات الاختبار التجريبية مفعّل'
+                      : 'قدرات المتصفح الإنتاجي (يتطلب وضع الاختبار للمعاينة)'}
                 </p>
               </div>
             </div>
