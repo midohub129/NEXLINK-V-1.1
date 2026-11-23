@@ -613,14 +613,41 @@ export class RelayTransportClient implements ITransportClient {
     eventIds: number[]
   ): Promise<void> {
     if (eventIds.length === 0) return;
-    await this.requestJson(
+    const requestedIds = Array.from(new Set(eventIds));
+    const response = await this.requestJson<{
+      acknowledged: number;
+      acknowledgedEventIds: number[];
+      serverTimestamp: number;
+    }>(
       '/sync/ack',
       {
         method: 'POST',
-        body: JSON.stringify({ deviceId, eventIds }),
+        body: JSON.stringify({ deviceId, eventIds: requestedIds }),
       },
       true
     );
+
+    const confirmedIds = response.acknowledgedEventIds;
+    const confirmedSet = new Set(
+      Array.isArray(confirmedIds) ? confirmedIds : []
+    );
+    const exactMatch =
+      Array.isArray(confirmedIds) &&
+      confirmedIds.every(
+        (id) => Number.isInteger(id) && requestedIds.includes(id)
+      ) &&
+      confirmedSet.size === requestedIds.length &&
+      requestedIds.every((id) => confirmedSet.has(id)) &&
+      response.acknowledged === requestedIds.length;
+
+    if (!exactMatch) {
+      throw new TransportError(
+        'RELAY_ACK_INCOMPLETE',
+        'لم يؤكد خادم المرحل استلام جميع الأحداث المطلوبة؛ ستبقى الأحداث قيد التأكيد.',
+        `Relay ACK mismatch: requested=${requestedIds.length}, acknowledged=${Array.isArray(confirmedIds) ? confirmedIds.length : 'invalid'}`,
+        true
+      );
+    }
   }
 
   async fetchSyncDeliveryStatus(

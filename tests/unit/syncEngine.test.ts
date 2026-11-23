@@ -1738,4 +1738,65 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
     assert.equal(calculateExponentialBackoffMs(3, 1000, 10000), 4000);
     assert.equal(calculateExponentialBackoffMs(6, 1000, 10000), 10000);
   });
+
+  it('refuses inbound ACK retry when the persisted local payload differs from the verified E2EE plaintext', async () => {
+    const { syncEngine, syncRepo, transport, devices, peerCrypto, peerDevice } =
+      await setupSyncHarness();
+    const myId = devices.getIdentity()!;
+    await transport.disconnect();
+
+    const plaintext = JSON.stringify({
+      packageName: 'com.whatsapp',
+      title: 'Payload binding',
+      text: 'The authenticated envelope content',
+      postedAt: Date.now(),
+    });
+    const idempotencyKey = 'idem-payload-binding-retry';
+    const envelope = await peerCrypto.encryptForPeer({
+      plaintext,
+      senderDeviceId: peerDevice.publicId,
+      recipientDeviceId: myId.publicId,
+      senderCryptoKeyId: peerDevice.cryptoKeyId,
+      recipientCryptoKeyId: myId.cryptoKeyId,
+      recipientEcdhPublicKeyJwk: myId.ecdhPublicKeyJwk!,
+      sessionId: 'sess-payload-binding-retry',
+      idempotencyKey,
+    });
+
+    assert.equal(
+      await syncEngine.ingestInboundEvent({
+        id: 1201,
+        type: 'notification',
+        payload: '[E2EE_CIPHERTEXT]',
+        e2eeEnvelope: envelope,
+        sourceDeviceId: peerDevice.publicId,
+        targetDeviceId: myId.publicId,
+        createdAt: Date.now(),
+        status: 'IN_PROGRESS',
+        retryCount: 0,
+        nextRetryAt: null,
+        idempotencyKey,
+        encrypted: true,
+        localEncrypted: false,
+        e2eeProtected: false,
+        e2eeVerified: false,
+      }),
+      true
+    );
+
+    const stored = await syncRepo.findByIdempotencyKey(idempotencyKey);
+    assert.ok(stored);
+    await syncRepo.updateEvent(stored.id, {
+      payload: JSON.stringify({ packageName: 'tampered.local.payload' }),
+    });
+
+    await transport.connect();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const afterRetry = await syncRepo.findById(stored.id);
+    assert.equal(afterRetry?.status, 'IN_PROGRESS');
+    assert.equal(afterRetry?.inboundAckConfirmed, false);
+    assert.equal(transport.ackedRelayEventIds.includes(1201), false);
+    await syncEngine.stop();
+  });
+
 });

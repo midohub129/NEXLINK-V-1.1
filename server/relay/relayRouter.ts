@@ -1211,7 +1211,11 @@ export function createRelayServer(db: SqliteRelayDatabase): RelayServerHandle {
         });
       }
 
-      res.json({ acknowledged: acked.length, serverTimestamp });
+      res.json({
+        acknowledged: acked.length,
+        acknowledgedEventIds: acked.map((item) => item.relayEventId),
+        serverTimestamp,
+      });
     }
   );
 

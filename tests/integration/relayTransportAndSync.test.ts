@@ -315,6 +315,20 @@ describe('End-to-End Authenticated Relay Transport, Mutual Pairing, E2EE & Peer 
           .payload.includes('Delivered once B reconnects')
       );
 
+      const relayAckRow = db.db
+        .prepare('SELECT id, delivered_at FROM relay_events WHERE idempotency_key = ?')
+        .get(deviceB.syncEngine.getEvents()[0].idempotencyKey) as {
+        id: number;
+        delivered_at: number | null;
+      };
+      assert.ok(relayAckRow.delivered_at !== null);
+      const repeatedAck = db.acknowledgeDelivery(deviceB.identity.publicId, [
+        relayAckRow.id,
+      ]);
+      assert.deepEqual(repeatedAck.map((item) => item.relayEventId), [
+        relayAckRow.id,
+      ]);
+
       // After B ACKs, /inbox no longer serves the delivered event
       const rawInboxAfterAck = await deviceB.transport.fetchInboundEvents(
         deviceB.identity.publicId
