@@ -1,7 +1,7 @@
 import type { ILogger, LogLevel, LogRecord } from '../../domain/interfaces/services';
 
 const SENSITIVE_KEY_PATTERN =
-  /secret|token|password|passwd|private|key|ciphertext|authorization|cookie|payload/i;
+  /secret|token|password|passwd|passphrase|private|key|ciphertext|authorization|cookie|payload|plaintext|salt|backup/i;
 
 function redactValue(value: unknown, depth = 0): unknown {
   if (depth > 4) return '[TRUNCATED]';

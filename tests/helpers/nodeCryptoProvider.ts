@@ -6,12 +6,32 @@ import {
   diffieHellman,
   generateKeyPairSync,
   hkdfSync,
+  pbkdf2Sync,
   randomBytes,
   sign,
   verify,
 } from 'node:crypto';
-import { SecurityError } from '../../src/domain/errors/appError';
+import { SecurityError, ValidationError } from '../../src/domain/errors/appError';
 import type { ICryptoProvider } from '../../src/domain/interfaces/services';
+import {
+  BACKUP_ENCRYPTION_ALGORITHM,
+  BACKUP_IV_BYTES,
+  BACKUP_KDF_ALGORITHM,
+  BACKUP_KDF_DEFAULT_ITERATIONS,
+  BACKUP_KDF_HASH,
+  BACKUP_KDF_KEY_LENGTH_BITS,
+  BACKUP_KDF_MAX_ITERATIONS,
+  BACKUP_KDF_MIN_ITERATIONS,
+  BACKUP_MAX_PASSPHRASE_LENGTH,
+  BACKUP_MAX_SALT_BYTES,
+  BACKUP_MIN_PASSPHRASE_LENGTH,
+  BACKUP_MIN_SALT_BYTES,
+  BACKUP_SALT_BYTES,
+  ENCRYPTED_BACKUP_FORMAT_ID,
+  ENCRYPTED_BACKUP_FORMAT_VERSION,
+  buildEncryptedBackupAad,
+  type EncryptedBackupArchiveV2,
+} from '../../src/domain/models/backup';
 import type { E2eeEnvelope, EncryptedEnvelope } from '../../src/domain/models/security';
 
 const HKDF_SALT = 'nexlink-e2ee-v1-salt';
@@ -307,6 +327,226 @@ export class NodeTestCryptoProvider implements ICryptoProvider {
         'E2EE_DECRYPT_FAILED',
         'فشل فك التشفير بسبب تلاعب بالمحتوى أو المفتاح.',
         err instanceof Error ? err.message : 'AES-GCM tag mismatch',
+        err
+      );
+    }
+  }
+
+  async encryptBackupPayload(params: {
+    plaintext: string;
+    passphrase: string;
+    schemaVersion: number;
+    exportedAt?: number;
+    iterations?: number;
+  }): Promise<EncryptedBackupArchiveV2> {
+    const passphrase = params.passphrase;
+    if (
+      typeof passphrase !== 'string' ||
+      passphrase.trim().length === 0 ||
+      passphrase.length < BACKUP_MIN_PASSPHRASE_LENGTH ||
+      passphrase.length > BACKUP_MAX_PASSPHRASE_LENGTH
+    ) {
+      throw new ValidationError(
+        'BACKUP_PASSPHRASE_INVALID',
+        `يجب أن تكون عبارة مرور النسخة الاحتياطية بين ${BACKUP_MIN_PASSPHRASE_LENGTH} و${BACKUP_MAX_PASSPHRASE_LENGTH} حرفاً.`,
+        'Backup passphrase invalid'
+      );
+    }
+
+    const iterations = params.iterations ?? BACKUP_KDF_DEFAULT_ITERATIONS;
+    if (
+      !Number.isInteger(iterations) ||
+      iterations < BACKUP_KDF_MIN_ITERATIONS ||
+      iterations > BACKUP_KDF_MAX_ITERATIONS
+    ) {
+      throw new ValidationError(
+        'INVALID_BACKUP_KDF_PARAMS',
+        'معاملات اشتقاق المفتاح خارج الحدود الآمنة.',
+        `Invalid PBKDF2 iterations: ${String(iterations)}`
+      );
+    }
+
+    const salt = randomBytes(BACKUP_SALT_BYTES);
+    const iv = randomBytes(BACKUP_IV_BYTES);
+    const exportedAt = params.exportedAt ?? Date.now();
+    const kdf = {
+      algorithm: BACKUP_KDF_ALGORITHM,
+      hash: BACKUP_KDF_HASH,
+      iterations,
+      salt: salt.toString('base64'),
+      keyLengthBits: BACKUP_KDF_KEY_LENGTH_BITS,
+    };
+    const encryption = {
+      algorithm: BACKUP_ENCRYPTION_ALGORITHM,
+      iv: iv.toString('base64'),
+    };
+    const aad = buildEncryptedBackupAad({
+      format: ENCRYPTED_BACKUP_FORMAT_ID,
+      formatVersion: ENCRYPTED_BACKUP_FORMAT_VERSION,
+      schemaVersion: params.schemaVersion,
+      exportedAt,
+      kdf,
+      encryption,
+    });
+
+    const key = pbkdf2Sync(
+      Buffer.from(passphrase, 'utf8'),
+      salt,
+      iterations,
+      32,
+      'sha256'
+    );
+    const cipher = createCipheriv('aes-256-gcm', key, iv);
+    cipher.setAAD(Buffer.from(aad, 'utf8'));
+    const encrypted = Buffer.concat([
+      cipher.update(params.plaintext, 'utf8'),
+      cipher.final(),
+    ]);
+    const tag = cipher.getAuthTag();
+
+    return {
+      format: ENCRYPTED_BACKUP_FORMAT_ID,
+      formatVersion: ENCRYPTED_BACKUP_FORMAT_VERSION,
+      schemaVersion: params.schemaVersion,
+      exportedAt,
+      kdf,
+      encryption,
+      aad,
+      ciphertext: Buffer.concat([encrypted, tag]).toString('base64'),
+    };
+  }
+
+  async decryptBackupPayload(params: {
+    archive: EncryptedBackupArchiveV2;
+    passphrase: string;
+  }): Promise<string> {
+    const { archive, passphrase } = params;
+    if (
+      typeof passphrase !== 'string' ||
+      passphrase.length === 0 ||
+      passphrase.length > BACKUP_MAX_PASSPHRASE_LENGTH
+    ) {
+      throw new ValidationError(
+        'BACKUP_PASSPHRASE_REQUIRED',
+        'يرجى إدخال عبارة مرور النسخة الاحتياطية.',
+        'Empty or oversized backup passphrase'
+      );
+    }
+
+    if (
+      !archive ||
+      archive.format !== ENCRYPTED_BACKUP_FORMAT_ID ||
+      archive.formatVersion !== ENCRYPTED_BACKUP_FORMAT_VERSION
+    ) {
+      throw new ValidationError(
+        'UNSUPPORTED_BACKUP_VERSION',
+        'إصدار النسخة الاحتياطية غير مدعوم.',
+        'Unsupported backup version'
+      );
+    }
+
+    if (
+      !archive.kdf ||
+      archive.kdf.algorithm !== BACKUP_KDF_ALGORITHM ||
+      archive.kdf.hash !== BACKUP_KDF_HASH ||
+      archive.kdf.keyLengthBits !== BACKUP_KDF_KEY_LENGTH_BITS ||
+      !Number.isInteger(archive.kdf.iterations) ||
+      archive.kdf.iterations < BACKUP_KDF_MIN_ITERATIONS ||
+      archive.kdf.iterations > BACKUP_KDF_MAX_ITERATIONS
+    ) {
+      throw new ValidationError(
+        'INVALID_BACKUP_KDF_PARAMS',
+        'معاملات KDF غير صالحة أو خارج الحدود الآمنة.',
+        'Backup KDF parameters invalid'
+      );
+    }
+
+    const strictDecode = (val: unknown): Buffer | null => {
+      if (typeof val !== 'string' || val.length === 0 || val.length % 4 !== 0) {
+        return null;
+      }
+      if (!/^[A-Za-z0-9+/]+={0,2}$/.test(val)) return null;
+      const buf = Buffer.from(val, 'base64');
+      return buf.toString('base64') === val ? buf : null;
+    };
+
+    const salt = strictDecode(archive.kdf.salt);
+    if (
+      !salt ||
+      salt.length < BACKUP_MIN_SALT_BYTES ||
+      salt.length > BACKUP_MAX_SALT_BYTES
+    ) {
+      throw new ValidationError(
+        'INVALID_BACKUP_CRYPTO_PARAMS',
+        'قيمة salt غير صالحة.',
+        'Invalid backup salt'
+      );
+    }
+
+    if (
+      !archive.encryption ||
+      archive.encryption.algorithm !== BACKUP_ENCRYPTION_ALGORITHM
+    ) {
+      throw new ValidationError(
+        'INVALID_BACKUP_CRYPTO_PARAMS',
+        'خوارزمية التشفير غير مدعومة.',
+        'Invalid backup encryption algorithm'
+      );
+    }
+
+    const iv = strictDecode(archive.encryption.iv);
+    if (!iv || iv.length !== BACKUP_IV_BYTES) {
+      throw new ValidationError(
+        'INVALID_BACKUP_CRYPTO_PARAMS',
+        'قيمة nonce/IV غير صالحة.',
+        'Invalid backup IV'
+      );
+    }
+
+    const rawCipher = strictDecode(archive.ciphertext);
+    if (!rawCipher || rawCipher.length < 16) {
+      throw new ValidationError(
+        'INVALID_BACKUP_FORMAT',
+        'محتوى التشفير غير صالح.',
+        'Malformed backup ciphertext'
+      );
+    }
+
+    const expectedAad = buildEncryptedBackupAad({
+      format: archive.format,
+      formatVersion: archive.formatVersion,
+      schemaVersion: archive.schemaVersion,
+      exportedAt: archive.exportedAt,
+      kdf: archive.kdf,
+      encryption: archive.encryption,
+    });
+    if (typeof archive.aad !== 'string' || archive.aad !== expectedAad) {
+      throw new SecurityError(
+        'BACKUP_AUTH_FAILED',
+        'فشل التحقق من سلامة النسخة أو عبارة المرور.',
+        'Backup AAD mismatch'
+      );
+    }
+
+    try {
+      const key = pbkdf2Sync(
+        Buffer.from(passphrase, 'utf8'),
+        salt,
+        archive.kdf.iterations,
+        32,
+        'sha256'
+      );
+      const data = rawCipher.subarray(0, rawCipher.length - 16);
+      const tag = rawCipher.subarray(rawCipher.length - 16);
+      const decipher = createDecipheriv('aes-256-gcm', key, iv);
+      decipher.setAAD(Buffer.from(expectedAad, 'utf8'));
+      decipher.setAuthTag(tag);
+      return Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8');
+    } catch (err) {
+      throw new SecurityError(
+        'BACKUP_AUTH_FAILED',
+        'فشل التحقق من عبارة المرور أو سلامة النسخة المشفرة.',
+        'Backup decryption or authentication failed',
         err
       );
     }

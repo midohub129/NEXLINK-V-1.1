@@ -1,3 +1,9 @@
+import type {
+  BackupExportSummary,
+  BackupRestoreResult,
+  DetectedBackupFormat,
+  EncryptedBackupArchiveV2,
+} from '../models/backup';
 import type { DeviceIdentityProfile, LinkedDevice } from '../models/device';
 import type { E2eeEnvelope, SecurityAuditEntry } from '../models/security';
 import type { AppSettings } from '../models/settings';
@@ -33,7 +39,7 @@ export interface ISyncEventRepository {
     windowMs: number,
     nowMs: number
   ): Promise<SyncEvent | null>;
-  getAll(): Promise<SyncEvent[]>;
+  getAll(options?: { throwOnDecryptError?: boolean }): Promise<SyncEvent[]>;
   getByStatus(status: SyncEventStatus): Promise<SyncEvent[]>;
   getDuePendingEvents(nowMs: number): Promise<SyncEvent[]>;
   updateEvent(
@@ -86,18 +92,16 @@ export interface ISettingsRepository {
   subscribe(listener: () => void): () => void;
 }
 
-export interface BackupArchive {
-  schemaVersion: number;
-  exportedAt: number;
-  checksumSha256: string;
-  settings: AppSettings;
-  identity: DeviceIdentityProfile | null;
-  linkedDevices: LinkedDevice[];
-  syncEvents: SyncEvent[];
-  auditEntries: SecurityAuditEntry[];
-}
-
 export interface IBackupProvider {
-  exportBackup(): Promise<BackupArchive>;
-  restoreBackup(archive: BackupArchive): Promise<void>;
+  inspectBackupJson(rawJson: string): DetectedBackupFormat;
+  exportBackup(passphrase: string): Promise<BackupExportSummary>;
+  restoreBackup(
+    rawInput: string | EncryptedBackupArchiveV2 | Record<string, unknown>,
+    passphrase: string
+  ): Promise<BackupRestoreResult>;
+  migrateLegacyBackup(
+    rawInput: string | Record<string, unknown>,
+    newPassphrase: string,
+    options: { userConfirmedLegacyImport: boolean }
+  ): Promise<BackupExportSummary>;
 }

@@ -310,8 +310,14 @@ export function App() {
           onRemoveLinkedDevice={(publicId) =>
             container.deviceManager.removeLinkedDevice(publicId)
           }
-          onExportBackupJson={() => container.exportBackupJson()}
-          onRestoreBackupJson={(raw) => container.restoreBackupJson(raw)}
+          onInspectBackupJson={(raw) => container.inspectBackupJson(raw)}
+          onExportBackupJson={(passphrase) => container.exportBackupJson(passphrase)}
+          onRestoreBackupJson={(raw, passphrase) =>
+            container.restoreBackupJson(raw, passphrase)
+          }
+          onMigrateLegacyBackupJson={(raw, newPassphrase, confirmed) =>
+            container.migrateLegacyBackupJson(raw, newPassphrase, confirmed)
+          }
         />
       )}
     </div>

@@ -4,6 +4,7 @@ import type {
   LinkedDevice,
   PairingRequest,
 } from '../models/device';
+import type { EncryptedBackupArchiveV2 } from '../models/backup';
 import type {
   E2eeEnvelope,
   EncryptedEnvelope,
@@ -88,6 +89,17 @@ export interface ICryptoProvider {
     expectedRecipientDeviceId: string;
     expectedRecipientCryptoKeyId: string;
     expectedIdempotencyKey?: string;
+  }): Promise<string>;
+  encryptBackupPayload(params: {
+    plaintext: string;
+    passphrase: string;
+    schemaVersion: number;
+    exportedAt?: number;
+    iterations?: number;
+  }): Promise<EncryptedBackupArchiveV2>;
+  decryptBackupPayload(params: {
+    archive: EncryptedBackupArchiveV2;
+    passphrase: string;
   }): Promise<string>;
   verifySelfIntegrity(): Promise<{ ok: boolean; algorithm: string }>;
 }

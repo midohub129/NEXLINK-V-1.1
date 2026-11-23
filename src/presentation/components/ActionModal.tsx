@@ -4,13 +4,21 @@ import {
   Download,
   KeyRound,
   Link2,
+  Lock,
   RefreshCw,
+  ShieldAlert,
   ShieldCheck,
   Trash2,
   Upload,
   X,
 } from 'lucide-react';
 import { AppError } from '../../domain/errors/appError';
+import {
+  BACKUP_MAX_RAW_JSON_BYTES,
+  BACKUP_MIN_PASSPHRASE_LENGTH,
+  type BackupRestoreResult,
+  type DetectedBackupFormat,
+} from '../../domain/models/backup';
 import type {
   DataSourceAppInfo,
   DataSourceAvailability,
@@ -78,8 +86,17 @@ interface ActionModalProps {
   onRefreshLinkedDevices: () => Promise<void>;
   onRevokeLinkedDevice: (publicId: string, revokeTrust?: boolean) => Promise<void>;
   onRemoveLinkedDevice: (publicId: string) => Promise<void>;
-  onExportBackupJson: () => Promise<string>;
-  onRestoreBackupJson: (raw: string) => Promise<void>;
+  onInspectBackupJson: (raw: string) => DetectedBackupFormat;
+  onExportBackupJson: (passphrase: string) => Promise<string>;
+  onRestoreBackupJson: (
+    raw: string,
+    passphrase: string
+  ) => Promise<BackupRestoreResult>;
+  onMigrateLegacyBackupJson: (
+    raw: string,
+    newPassphrase: string,
+    userConfirmedLegacyImport: boolean
+  ) => Promise<string>;
 }
 
 type PrivacyTab = 'security' | 'settings' | 'backup' | 'logs';
@@ -174,8 +191,10 @@ export function ActionModal({
   onRefreshLinkedDevices,
   onRevokeLinkedDevice,
   onRemoveLinkedDevice,
+  onInspectBackupJson,
   onExportBackupJson,
   onRestoreBackupJson,
+  onMigrateLegacyBackupJson,
 }: ActionModalProps) {
   const [privacyTab, setPrivacyTab] = useState<PrivacyTab>('security');
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
@@ -205,8 +224,17 @@ export function ActionModal({
     settings.targetDeviceId ?? ''
   );
 
-  // Backup state
-  const [backupPreview, setBackupPreview] = useState('');
+  // Backup state (passphrases held transiently in memory only)
+  const [exportPassphrase, setExportPassphrase] = useState('');
+  const [exportPassphraseConfirm, setExportPassphraseConfirm] = useState('');
+  const [backupEncryptedPreview, setBackupEncryptedPreview] = useState('');
+  const [restoreInput, setRestoreInput] = useState('');
+  const [restorePassphrase, setRestorePassphrase] = useState('');
+  const [restorePolicyConfirmed, setRestorePolicyConfirmed] = useState(false);
+  const [legacyMigrationConfirmed, setLegacyMigrationConfirmed] = useState(false);
+  const [legacyNewPassphrase, setLegacyNewPassphrase] = useState('');
+  const [legacyNewPassphraseConfirm, setLegacyNewPassphraseConfirm] = useState('');
+  const [backupBusy, setBackupBusy] = useState(false);
 
   useEffect(() => {
     setSessionTimeoutStr(String(settings.sessionTimeoutMinutes));
@@ -231,9 +259,51 @@ export function ActionModal({
   useEffect(() => {
     setStatusMessage(null);
     setErrorMessage(null);
+    // Clear sensitive backup passphrases when modal closes or switches tab
+    setExportPassphrase('');
+    setExportPassphraseConfirm('');
+    setRestorePassphrase('');
+    setLegacyNewPassphrase('');
+    setLegacyNewPassphraseConfirm('');
+    setRestorePolicyConfirmed(false);
+    setLegacyMigrationConfirmed(false);
   }, [modal, privacyTab]);
 
   if (!modal) return null;
+
+  const detectedRestoreFormat: DetectedBackupFormat | null = restoreInput.trim()
+    ? onInspectBackupJson(restoreInput)
+    : null;
+
+  const formatBackupError = (err: unknown): string => {
+    if (err instanceof AppError) {
+      switch (err.code) {
+        case 'BACKUP_CORRUPT_JSON':
+        case 'INVALID_BACKUP_FORMAT':
+          return 'ملف النسخة الاحتياطية تالف أو بنيته غير صالحة.';
+        case 'BACKUP_AUTH_FAILED':
+          return 'فشل التحقق من عبارة المرور أو سلامة النسخة المشفرة.';
+        case 'UNSUPPORTED_BACKUP_VERSION':
+        case 'UNSUPPORTED_SCHEMA_VERSION':
+          return `إصدار النسخة الاحتياطية غير مدعوم: ${err.userMessage}`;
+        case 'LEGACY_UNENCRYPTED_BACKUP':
+          return err.userMessage;
+        case 'INVALID_BACKUP_KDF_PARAMS':
+        case 'INVALID_BACKUP_CRYPTO_PARAMS':
+        case 'INVALID_BACKUP_SCHEMA':
+        case 'BACKUP_LIMIT_EXCEEDED':
+        case 'BACKUP_UNREADABLE_EVENT_PAYLOAD':
+        case 'BACKUP_PRIVATE_KEY_REJECTED':
+          return `فشل التحقق من النسخة الاحتياطية: ${err.userMessage}`;
+        default:
+          return err.userMessage;
+      }
+    }
+    if (err instanceof Error) {
+      return err.message;
+    }
+    return 'تعذّر إكمال عملية النسخ الاحتياطي.';
+  };
 
   const runAction = async (work: () => Promise<void>) => {
     setErrorMessage(null);
@@ -241,14 +311,21 @@ export function ActionModal({
     try {
       await work();
     } catch (err) {
-      if (err instanceof AppError) {
-        setErrorMessage(err.userMessage);
-      } else if (err instanceof Error) {
-        setErrorMessage(err.message);
-      } else {
-        setErrorMessage('تعذّر إكمال العملية المطلوبة.');
-      }
+      setErrorMessage(formatBackupError(err));
     }
+  };
+
+  const downloadEncryptedBackup = (jsonText: string) => {
+    const blob = new Blob([jsonText], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    const stamp = new Date().toISOString().slice(0, 10);
+    link.href = url;
+    link.download = `nexlink-backup-v2-${stamp}.json`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   };
 
   return (
@@ -1075,55 +1152,366 @@ export function ActionModal({
             )}
 
             {privacyTab === 'backup' && (
-              <div className="bg-[#0D121E] rounded-lg p-4 space-y-4">
-                <p className="text-xs text-[#A5B1C6] leading-relaxed">
-                  يتم تصدير النسخة الاحتياطية مع بصمة سلامة SHA-256، ويتم التحقق من
-                  التطابق قبل تنفيذ الاستعادة داخل معاملة ذرية في IndexedDB.
-                </p>
-
-                <div className="flex flex-wrap gap-2">
-                  <button
-                    type="button"
-                    disabled={!capabilities.exportBackups}
-                    onClick={() =>
-                      void runAction(async () => {
-                        const raw = await onExportBackupJson();
-                        setBackupPreview(raw);
-                        setStatusMessage('تم إنشاء نسخة احتياطية موقّعة ببصمة SHA-256.');
-                      })
-                    }
-                    className="min-h-[40px] px-4 py-2 bg-[#4B91FF] hover:bg-[#3a7ee8] disabled:opacity-50 text-white text-xs font-bold rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
-                  >
-                    <Download className="w-4 h-4" />
-                    تصدير نسخة احتياطية
-                  </button>
-
-                  <button
-                    type="button"
-                    disabled={!capabilities.exportBackups || !backupPreview.trim()}
-                    onClick={() =>
-                      void runAction(async () => {
-                        await onRestoreBackupJson(backupPreview);
-                        setStatusMessage(
-                          'تمت استعادة البيانات والتحقق من البصمة بنجاح.'
+              <div className="space-y-4">
+                {/* Export Section */}
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    void runAction(async () => {
+                      if (exportPassphrase.length < BACKUP_MIN_PASSPHRASE_LENGTH) {
+                        throw new Error(
+                          `يجب أن لا تقل عبارة المرور عن ${BACKUP_MIN_PASSPHRASE_LENGTH} حرفاً.`
                         );
-                      })
+                      }
+                      if (exportPassphrase !== exportPassphraseConfirm) {
+                        throw new Error('عبارة المرور وتأكيدها غير متطابقتين.');
+                      }
+                      setBackupBusy(true);
+                      try {
+                        const raw = await onExportBackupJson(exportPassphrase);
+                        setBackupEncryptedPreview(raw);
+                        setStatusMessage(
+                          'تم إنشاء نسخة احتياطية مشفرة v2 بنجاح (PBKDF2-HMAC-SHA-256 + AES-256-GCM).'
+                        );
+                      } finally {
+                        setExportPassphrase('');
+                        setExportPassphraseConfirm('');
+                        setBackupBusy(false);
+                      }
+                    });
+                  }}
+                  className="bg-[#0D121E] rounded-lg p-4 space-y-3"
+                >
+                  <div className="flex items-center gap-2">
+                    <Lock className="w-4 h-4 text-[#4B91FF]" />
+                    <p className="text-sm font-bold text-white">
+                      تصدير نسخة احتياطية مشفرة (Encrypted Backup v2)
+                    </p>
+                  </div>
+                  <p className="text-xs text-[#A5B1C6] leading-relaxed">
+                    يُشتق مفتاح مستقل من عبارة المرور عبر PBKDF2-HMAC-SHA-256 (600,000
+                    دورة) لتشفير الأرشيف كاملاً بـ AES-256-GCM مع AAD. لا تُحفظ عبارة
+                    المرور ولا المفاتيح الخاصة في الملف أو المتصفح.
+                  </p>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                    <label className="space-y-1 text-xs">
+                      <span className="text-[#A5B1C6] block">
+                        عبارة المرور (12 حرفاً على الأقل)
+                      </span>
+                      <input
+                        type="password"
+                        autoComplete="new-password"
+                        value={exportPassphrase}
+                        onChange={(e) => setExportPassphrase(e.target.value)}
+                        placeholder="أدخل عبارة مرور قوية..."
+                        aria-label="عبارة مرور التصدير"
+                        className="w-full min-h-[40px] px-3 py-2 bg-[#192131] border border-white/10 rounded-lg text-white"
+                      />
+                    </label>
+                    <label className="space-y-1 text-xs">
+                      <span className="text-[#A5B1C6] block">تأكيد عبارة المرور</span>
+                      <input
+                        type="password"
+                        autoComplete="new-password"
+                        value={exportPassphraseConfirm}
+                        onChange={(e) => setExportPassphraseConfirm(e.target.value)}
+                        placeholder="أعد إدخال عبارة المرور..."
+                        aria-label="تأكيد عبارة مرور التصدير"
+                        className="w-full min-h-[40px] px-3 py-2 bg-[#192131] border border-white/10 rounded-lg text-white"
+                      />
+                    </label>
+                  </div>
+
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="submit"
+                      disabled={!capabilities.exportBackups || backupBusy}
+                      className="min-h-[40px] px-4 py-2 bg-[#4B91FF] hover:bg-[#3a7ee8] disabled:opacity-50 text-white text-xs font-bold rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Download className="w-4 h-4" />
+                      {backupBusy ? 'جاري التشفير...' : 'إنشاء نسخة مشفرة v2'}
+                    </button>
+
+                    {backupEncryptedPreview && (
+                      <button
+                        type="button"
+                        onClick={() => downloadEncryptedBackup(backupEncryptedPreview)}
+                        className="min-h-[40px] px-4 py-2 bg-[#243047] hover:bg-[#2c3a56] text-white text-xs font-bold rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <Download className="w-4 h-4" />
+                        تنزيل ملف .json المشفر
+                      </button>
+                    )}
+                  </div>
+
+                  {backupEncryptedPreview && (
+                    <div className="space-y-1.5 pt-2 border-t border-white/10">
+                      <p className="text-[11px] text-[#A5B1C6]">
+                        معاينة الغلاف الخارجي المشفر فقط (خالٍ تماماً من الإشعارات
+                        والمفاتيح الخاصة وعبارة المرور):
+                      </p>
+                      <textarea
+                        readOnly
+                        rows={5}
+                        value={backupEncryptedPreview}
+                        aria-label="معاينة النسخة الاحتياطية المشفرة v2"
+                        className="w-full p-3 bg-[#192131] border border-white/10 rounded-lg text-xs font-mono text-[#A5B1C6]"
+                      />
+                    </div>
+                  )}
+                </form>
+
+                {/* Restore Section */}
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    void runAction(async () => {
+                      if (!restoreInput.trim()) {
+                        throw new Error('اختر ملف نسخة احتياطية أو الصق محتواه أولاً.');
+                      }
+                      if (!restorePassphrase) {
+                        throw new Error('أدخل عبارة مرور النسخة الاحتياطية للاستعادة.');
+                      }
+                      if (!restorePolicyConfirmed) {
+                        throw new Error(
+                          'يرجى تأكيد الموافقة على استبدال البيانات وفق سياسة الهوية والثقة.'
+                        );
+                      }
+                      setBackupBusy(true);
+                      try {
+                        const result = await onRestoreBackupJson(
+                          restoreInput,
+                          restorePassphrase
+                        );
+                        setRestorePolicyConfirmed(false);
+                        setStatusMessage(
+                          `تمت الاستعادة الآمنة (${result.restoredEvents} حدث، ${result.restoredLinkedDevices} جهاز بحالة غير موثوقة). تم الحفاظ على هوية هذا الجهاز ومفاتيحه.`
+                        );
+                      } finally {
+                        setRestorePassphrase('');
+                        setBackupBusy(false);
+                      }
+                    });
+                  }}
+                  className="bg-[#0D121E] rounded-lg p-4 space-y-3"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <Upload className="w-4 h-4 text-[#4B91FF]" />
+                      <p className="text-sm font-bold text-white">
+                        استعادة من نسخة احتياطية مشفرة v2
+                      </p>
+                    </div>
+                    <label className="min-h-[36px] px-3 py-1.5 bg-[#243047] hover:bg-[#2c3a56] text-white text-xs font-semibold rounded-lg inline-flex items-center gap-1.5 cursor-pointer">
+                      <Upload className="w-3.5 h-3.5" />
+                      اختيار ملف JSON
+                      <input
+                        type="file"
+                        accept=".json,application/json"
+                        className="hidden"
+                        onChange={(e) => {
+                          const inputEl = e.target;
+                          const file = inputEl.files?.[0];
+                          if (!file) return;
+                          if (file.size > BACKUP_MAX_RAW_JSON_BYTES) {
+                            setErrorMessage(
+                              'حجم الملف المحدد يتجاوز الحد الأقصى المسموح (10 MiB).'
+                            );
+                            inputEl.value = '';
+                            return;
+                          }
+                          void file
+                            .text()
+                            .then((text) => {
+                              setErrorMessage(null);
+                              setStatusMessage(null);
+                              setRestoreInput(text);
+                            })
+                            .catch(() => {
+                              setErrorMessage(
+                                'تعذّر قراءة ملف النسخة الاحتياطية المحدد.'
+                              );
+                            })
+                            .finally(() => {
+                              inputEl.value = '';
+                            });
+                        }}
+                      />
+                    </label>
+                  </div>
+
+                  <textarea
+                    rows={5}
+                    value={restoreInput}
+                    onChange={(e) => setRestoreInput(e.target.value)}
+                    placeholder="اختر ملف نسخة احتياطية مشفرة v2 أو الصق النص المشفر هنا..."
+                    aria-label="نص أو ملف النسخة الاحتياطية للاستعادة"
+                    className="w-full p-3 bg-[#192131] border border-white/10 rounded-lg text-xs font-mono text-white placeholder:font-sans placeholder:text-[#A5B1C6]/60"
+                  />
+
+                  {detectedRestoreFormat?.kind === 'LEGACY_UNENCRYPTED_V1' && (
+                    <div
+                      role="alert"
+                      className="bg-amber-950/40 border border-[#FFBE50]/50 rounded-lg p-3.5 space-y-3"
+                    >
+                      <div className="flex items-start gap-2">
+                        <ShieldAlert className="w-4 h-4 text-[#FFBE50] shrink-0 mt-0.5" />
+                        <div className="text-xs text-amber-100 space-y-1 leading-relaxed">
+                          <p className="font-bold text-[#FFBE50]">
+                            تم رصد نسخة احتياطية قديمة غير مشفرة (v1)
+                          </p>
+                          <p>
+                            هذه النسخة القديمة غير مشفرة وقد تحتوي على بيانات إشعارات
+                            مكشوفة، ولذلك تُرفض استعادتها تلقائياً. يمكنك ترحيلها بشكل
+                            صريح ومنفصل إلى نسخة v2 مشفرة دون المساس بالملف الأصلي أو
+                            قاعدة البيانات الحالية.
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                        <input
+                          type="password"
+                          autoComplete="new-password"
+                          value={legacyNewPassphrase}
+                          onChange={(e) => setLegacyNewPassphrase(e.target.value)}
+                          placeholder="عبارة مرور جديدة (12 حرفاً على الأقل)"
+                          aria-label="عبارة مرور ترحيل النسخة القديمة"
+                          className="min-h-[38px] px-3 py-1.5 bg-[#192131] border border-white/10 rounded-lg text-white"
+                        />
+                        <input
+                          type="password"
+                          autoComplete="new-password"
+                          value={legacyNewPassphraseConfirm}
+                          onChange={(e) =>
+                            setLegacyNewPassphraseConfirm(e.target.value)
+                          }
+                          placeholder="تأكيد عبارة المرور الجديدة"
+                          aria-label="تأكيد عبارة مرور ترحيل النسخة القديمة"
+                          className="min-h-[38px] px-3 py-1.5 bg-[#192131] border border-white/10 rounded-lg text-white"
+                        />
+                      </div>
+
+                      <label className="flex items-start gap-2 text-xs text-amber-100 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={legacyMigrationConfirmed}
+                          onChange={(e) =>
+                            setLegacyMigrationConfirmed(e.target.checked)
+                          }
+                          className="mt-1 accent-[#FFBE50]"
+                        />
+                        <span>
+                          أوافق صراحةً على التحقق من النسخة القديمة وترحيلها إلى نسخة v2
+                          مشفرة (مع نزع الثقة التلقائية للأجهزة المقترنة دون تغيير قاعدة
+                          البيانات الحالية).
+                        </span>
+                      </label>
+
+                      <button
+                        type="button"
+                        disabled={!capabilities.exportBackups || backupBusy}
+                        onClick={() =>
+                          void runAction(async () => {
+                            if (!legacyMigrationConfirmed) {
+                              throw new Error(
+                                'يجب تأكيد الموافقة الصريحة لترحيل النسخة القديمة.'
+                              );
+                            }
+                            if (
+                              legacyNewPassphrase.length < BACKUP_MIN_PASSPHRASE_LENGTH
+                            ) {
+                              throw new Error(
+                                `يجب أن لا تقل عبارة المرور الجديدة عن ${BACKUP_MIN_PASSPHRASE_LENGTH} حرفاً.`
+                              );
+                            }
+                            if (legacyNewPassphrase !== legacyNewPassphraseConfirm) {
+                              throw new Error(
+                                'عبارة المرور الجديدة وتأكيدها غير متطابقتين.'
+                              );
+                            }
+                            setBackupBusy(true);
+                            try {
+                              const migratedV2 = await onMigrateLegacyBackupJson(
+                                restoreInput,
+                                legacyNewPassphrase,
+                                true
+                              );
+                              setBackupEncryptedPreview(migratedV2);
+                              setRestoreInput(migratedV2);
+                              setLegacyMigrationConfirmed(false);
+                              setStatusMessage(
+                                'تم ترحيل النسخة القديمة وتحويلها إلى نسخة v2 مشفرة بنجاح. لم يتم حذف الملف القديم ولم تتغير قاعدة البيانات بعد.'
+                              );
+                            } finally {
+                              setLegacyNewPassphrase('');
+                              setLegacyNewPassphraseConfirm('');
+                              setBackupBusy(false);
+                            }
+                          })
+                        }
+                        className="min-h-[38px] px-3.5 py-1.5 bg-[#FFBE50] hover:bg-[#e5a83e] disabled:opacity-50 text-[#0D121E] text-xs font-bold rounded-lg cursor-pointer"
+                      >
+                        ترحيل النسخة القديمة إلى v2 مشفرة
+                      </button>
+                    </div>
+                  )}
+
+                  {detectedRestoreFormat?.kind === 'UNSUPPORTED_VERSION' && (
+                    <div
+                      role="alert"
+                      className="bg-red-950/40 border border-red-500/30 rounded-lg px-3 py-2 text-xs text-red-200"
+                    >
+                      تنسيق أو إصدار هذه النسخة الاحتياطية غير مدعوم في هذا الإصدار.
+                    </div>
+                  )}
+
+                  <label className="space-y-1 text-xs block">
+                    <span className="text-[#A5B1C6] block">
+                      عبارة المرور لفك تشفير النسخة v2
+                    </span>
+                    <input
+                      type="password"
+                      autoComplete="current-password"
+                      value={restorePassphrase}
+                      onChange={(e) => setRestorePassphrase(e.target.value)}
+                      placeholder="أدخل عبارة المرور المستخدمة عند التصدير..."
+                      aria-label="عبارة مرور الاستعادة"
+                      className="w-full min-h-[40px] px-3 py-2 bg-[#192131] border border-white/10 rounded-lg text-white"
+                    />
+                  </label>
+
+                  <label className="flex items-start gap-2 text-xs text-[#A5B1C6] cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={restorePolicyConfirmed}
+                      onChange={(e) => setRestorePolicyConfirmed(e.target.checked)}
+                      className="mt-1 accent-[#4B91FF]"
+                    />
+                    <span>
+                      أقرّ بأن الاستعادة ستستبدل الإعدادات وسجل الأحداث المحليين بعد نجاح
+                      التحقق بالكامل، مع الاحتفاظ بهوية هذا الجهاز ومفاتيحه وإبقاء
+                      الأجهزة المستعادة غير موثوقة حتى إعادة الاقتران عبر المرحل.
+                    </span>
+                  </label>
+
+                  <button
+                    type="submit"
+                    disabled={
+                      !capabilities.exportBackups ||
+                      backupBusy ||
+                      !restoreInput.trim() ||
+                      !restorePassphrase
                     }
                     className="min-h-[40px] px-4 py-2 bg-[#243047] hover:bg-[#2c3a56] disabled:opacity-50 text-white text-xs font-bold rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
                   >
                     <Upload className="w-4 h-4" />
-                    استعادة من النص أدناه
+                    {backupBusy
+                      ? 'جاري التحقق والاستعادة...'
+                      : 'التحقق والاستعادة الآمنة'}
                   </button>
-                </div>
-
-                <textarea
-                  rows={8}
-                  value={backupPreview}
-                  onChange={(e) => setBackupPreview(e.target.value)}
-                  placeholder="سيظهر هنا محتوى النسخة الاحتياطية بصيغة JSON، أو الصق نسخة سابقة للاستعادة..."
-                  aria-label="محتوى النسخة الاحتياطية JSON"
-                  className="w-full p-3 bg-[#192131] border border-white/10 rounded-lg text-xs font-mono text-white placeholder:font-sans placeholder:text-[#A5B1C6]/60"
-                />
+                </form>
               </div>
             )}
 

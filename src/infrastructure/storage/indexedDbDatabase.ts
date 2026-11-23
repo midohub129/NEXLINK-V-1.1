@@ -273,9 +273,18 @@ export class IndexedDbDatabase {
     if (mode === 'readwrite') {
       return this.enqueueWrite(async (db) => {
         const tx = db.transaction(stores, mode);
-        const result = await work(tx);
-        await txDone(tx);
-        return result;
+        try {
+          const result = await work(tx);
+          await txDone(tx);
+          return result;
+        } catch (err) {
+          try {
+            tx.abort();
+          } catch {
+            // Transaction may already be aborted or finished
+          }
+          throw err;
+        }
       });
     }
     const db = await this.initialize();

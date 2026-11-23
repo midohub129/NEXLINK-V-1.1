@@ -1,5 +1,9 @@
 import type { IBackupProvider } from '../domain/interfaces/repositories';
 import type { IDataSource, ILifecycleParticipant } from '../domain/interfaces/services';
+import type {
+  BackupRestoreResult,
+  DetectedBackupFormat,
+} from '../domain/models/backup';
 import type { DeviceRole } from '../domain/models/device';
 import type { SyncRunSummary } from '../domain/models/syncEvent';
 import {
@@ -52,8 +56,14 @@ export interface AppContainer {
   setUsageAccess(granted: boolean): Promise<void>;
   toggleSelectedApp(packageName: string, checked: boolean): Promise<void>;
   setTestFixtureMode(enabled: boolean): Promise<void>;
-  exportBackupJson(): Promise<string>;
-  restoreBackupJson(rawJson: string): Promise<void>;
+  inspectBackupJson(rawJson: string): DetectedBackupFormat;
+  exportBackupJson(passphrase: string): Promise<string>;
+  restoreBackupJson(rawJson: string, passphrase: string): Promise<BackupRestoreResult>;
+  migrateLegacyBackupJson(
+    rawJson: string,
+    newPassphrase: string,
+    userConfirmedLegacyImport: boolean
+  ): Promise<string>;
 }
 
 export function createAppContainer(): AppContainer {
@@ -420,48 +430,96 @@ export function createAppContainer(): AppContainer {
       );
     },
 
-    async exportBackupJson(): Promise<string> {
+    inspectBackupJson(rawJson: string): DetectedBackupFormat {
+      return backupProvider.inspectBackupJson(rawJson);
+    },
+
+    async exportBackupJson(passphrase: string): Promise<string> {
       const current = settingsService.getSnapshot();
       const identity = ensureIdentityReady();
       await securityManager.assertAuthorized(
         current.role,
         identity.publicId,
         'exportBackups',
-        'تصدير نسخة احتياطية كاملة'
+        'تصدير نسخة احتياطية مشفرة'
       );
-      const archive = await backupProvider.exportBackup();
+      const summary = await backupProvider.exportBackup(passphrase);
       await securityManager.recordAudit({
         action: 'BACKUP_EXPORTED',
         actorRole: current.role ?? 'none',
         deviceId: identity.publicId,
         outcome: 'ALLOWED',
-        details: `تم تصدير نسخة احتياطية (${archive.syncEvents.length} حدث، بصمة ${archive.checksumSha256.slice(0, 12)})`,
+        details: `تم تصدير نسخة احتياطية مشفرة v2 (${summary.eventCount} حدث، ${summary.linkedDeviceCount} جهاز)`,
       });
-      return JSON.stringify(archive, null, 2);
+      return JSON.stringify(summary.archive, null, 2);
     },
 
-    async restoreBackupJson(rawJson: string): Promise<void> {
+    async restoreBackupJson(
+      rawJson: string,
+      passphrase: string
+    ): Promise<BackupRestoreResult> {
       const current = settingsService.getSnapshot();
       const identity = ensureIdentityReady();
       await securityManager.assertAuthorized(
         current.role,
         identity.publicId,
         'exportBackups',
-        'استعادة نسخة احتياطية'
+        'استعادة نسخة احتياطية مشفرة'
       );
-      const parsed = JSON.parse(rawJson);
-      await backupProvider.restoreBackup(parsed);
-      await settingsService.initialize();
+      const result = await backupProvider.restoreBackup(rawJson, passphrase);
+      const restoredSettings = await settingsService.initialize();
+      transportClient.setBaseUrl(restoredSettings.relayEndpoint);
       await securityManager.initialize();
       await deviceManager.start();
       await syncEngine.start();
+
+      const currentIdentity = deviceManager.getIdentity() ?? identity;
+      if (restoredSettings.role) {
+        securityManager.issueSession(
+          currentIdentity.publicId,
+          currentIdentity.cryptoKeyId,
+          restoredSettings.sessionTimeoutMinutes
+        );
+      } else {
+        securityManager.clearSession();
+      }
+
       await securityManager.recordAudit({
         action: 'BACKUP_RESTORED',
+        actorRole: restoredSettings.role ?? 'none',
+        deviceId: currentIdentity.publicId,
+        outcome: 'ALLOWED',
+        details: result.crossDeviceRestore
+          ? `تمت استعادة نسخة v2 من جهاز آخر مع الحفاظ على هوية الجهاز الحالي (${result.restoredEvents} حدث، ${result.restoredLinkedDevices} جهاز بحالة غير موثوقة)`
+          : `تمت استعادة نسخة v2 والتحقق من سلامتها (${result.restoredEvents} حدث، ${result.restoredLinkedDevices} جهاز)`,
+      });
+      return result;
+    },
+
+    async migrateLegacyBackupJson(
+      rawJson: string,
+      newPassphrase: string,
+      userConfirmedLegacyImport: boolean
+    ): Promise<string> {
+      const current = settingsService.getSnapshot();
+      const identity = ensureIdentityReady();
+      await securityManager.assertAuthorized(
+        current.role,
+        identity.publicId,
+        'exportBackups',
+        'ترحيل نسخة احتياطية قديمة إلى صيغة v2 مشفرة'
+      );
+      const summary = await backupProvider.migrateLegacyBackup(rawJson, newPassphrase, {
+        userConfirmedLegacyImport,
+      });
+      await securityManager.recordAudit({
+        action: 'BACKUP_EXPORTED',
         actorRole: current.role ?? 'none',
         deviceId: identity.publicId,
         outcome: 'ALLOWED',
-        details: 'تم التحقق من البصمة واستعادة قاعدة البيانات بنجاح',
+        details: `تم ترحيل نسخة قديمة v1 إلى تنسيق v2 المشفر دون تعديل قاعدة البيانات (${summary.eventCount} حدث)`,
       });
+      return JSON.stringify(summary.archive, null, 2);
     },
   };
 }
