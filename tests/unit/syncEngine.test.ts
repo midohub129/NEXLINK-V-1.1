@@ -145,6 +145,16 @@ async function createPeerPairFixture() {
   return { peerCrypto, peerKeys, peerDevice };
 }
 
+class TestSyncEventRepository extends InMemorySyncEventRepository {
+  async tamperPayloadInStorageForTest(id: number, newPayload: string): Promise<void> {
+    const events = (this as unknown as { events: SyncEvent[] }).events;
+    const row = events.find((e) => e.id === id);
+    if (row) {
+      row.payload = newPayload;
+    }
+  }
+}
+
 async function setupSyncHarness(
   maxSyncRetries = 3,
   syncDeliveryPolicy: 'PEER_CONFIRMED' | 'RELAY_QUEUED' = 'PEER_CONFIRMED',
@@ -188,7 +198,7 @@ async function setupSyncHarness(
   const id = devices.getIdentity()!;
   security.issueSession(id.publicId, id.cryptoKeyId, 30);
 
-  const syncRepo = new InMemorySyncEventRepository();
+  const syncRepo = new TestSyncEventRepository();
   const syncEngine = new SyncEngine({
     repo: syncRepo,
     transport,
@@ -1737,5 +1747,261 @@ describe('SyncEngine E2EE, Delivery Policy, Duplicate & Partial Recovery Tests',
     assert.equal(calculateExponentialBackoffMs(2, 1000, 10000), 2000);
     assert.equal(calculateExponentialBackoffMs(3, 1000, 10000), 4000);
     assert.equal(calculateExponentialBackoffMs(6, 1000, 10000), 10000);
+  });
+
+  it('binds inbound ACK strictly to decrypted envelope plaintext across retry, re-delivery, and restart without leaking secrets or overwriting altered data', async () => {
+    const {
+      syncEngine,
+      syncRepo,
+      transport,
+      security,
+      settings,
+      devices,
+      crypto,
+      logger,
+      peerCrypto,
+      peerDevice,
+    } = await setupSyncHarness();
+    const myId = devices.getIdentity()!;
+
+    // 1. Matching local payload with verified envelope -> ACK succeeds and transitions to SYNCED
+    await transport.connect();
+    const secretMatched = 'MatchedSecretPayload-101';
+    const matchedPlaintext = JSON.stringify({
+      packageName: 'com.whatsapp',
+      title: 'Matched Inbound',
+      text: secretMatched,
+      postedAt: 7001,
+    });
+    const matchedEnv = await peerCrypto.encryptForPeer({
+      plaintext: matchedPlaintext,
+      senderDeviceId: peerDevice.publicId,
+      recipientDeviceId: myId.publicId,
+      senderCryptoKeyId: peerDevice.cryptoKeyId,
+      recipientCryptoKeyId: myId.cryptoKeyId,
+      recipientEcdhPublicKeyJwk: myId.ecdhPublicKeyJwk!,
+      sessionId: 'sess-bind-match',
+      idempotencyKey: 'idem-bind-match-1200',
+    });
+    const matchedOk = await syncEngine.ingestInboundEvent({
+      id: 1200,
+      type: 'notification',
+      payload: '[E2EE_CIPHERTEXT]',
+      e2eeEnvelope: matchedEnv,
+      sourceDeviceId: peerDevice.publicId,
+      targetDeviceId: myId.publicId,
+      createdAt: 7001,
+      status: 'IN_PROGRESS',
+      retryCount: 0,
+      nextRetryAt: null,
+      idempotencyKey: 'idem-bind-match-1200',
+      encrypted: true,
+      localEncrypted: false,
+      e2eeProtected: false,
+      e2eeVerified: false,
+    });
+    assert.equal(matchedOk, true);
+    const matchedStored = await syncRepo.findByIdempotencyKey('idem-bind-match-1200');
+    assert.equal(matchedStored?.status, 'SYNCED');
+    assert.equal(matchedStored?.inboundAckConfirmed, true);
+    assert.equal(matchedStored?.payload, matchedPlaintext);
+    assert.deepEqual([...transport.ackedRelayEventIds], [1200]);
+
+    // 2. Offline ingest -> local payload altered after save -> retry, re-delivery (seenE2eeNonces & existingByKey), and restart all refuse ACK without overwriting
+    await transport.disconnect();
+    const secretTamperedOrig = 'SensitivePlaintextMustNeverLeakInAudit';
+    const origPlaintext = JSON.stringify({
+      packageName: 'com.whatsapp',
+      title: 'Original Protected',
+      text: secretTamperedOrig,
+      postedAt: 7002,
+    });
+    const tamperedLocalPayload = JSON.stringify({
+      packageName: 'com.whatsapp',
+      title: 'Altered Local Copy',
+      text: 'TamperedAfterLocalSave',
+      postedAt: 7002,
+    });
+    const env1201 = await peerCrypto.encryptForPeer({
+      plaintext: origPlaintext,
+      senderDeviceId: peerDevice.publicId,
+      recipientDeviceId: myId.publicId,
+      senderCryptoKeyId: peerDevice.cryptoKeyId,
+      recipientCryptoKeyId: myId.cryptoKeyId,
+      recipientEcdhPublicKeyJwk: myId.ecdhPublicKeyJwk!,
+      sessionId: 'sess-bind-tamper',
+      idempotencyKey: 'idem-bind-tamper-1201',
+    });
+    const wire1201: SyncEvent = {
+      id: 1201,
+      type: 'notification',
+      payload: '[E2EE_CIPHERTEXT]',
+      e2eeEnvelope: env1201,
+      sourceDeviceId: peerDevice.publicId,
+      targetDeviceId: myId.publicId,
+      createdAt: 7002,
+      status: 'IN_PROGRESS',
+      retryCount: 0,
+      nextRetryAt: null,
+      idempotencyKey: 'idem-bind-tamper-1201',
+      encrypted: true,
+      localEncrypted: false,
+      e2eeProtected: false,
+      e2eeVerified: false,
+    };
+
+    assert.equal(await syncEngine.ingestInboundEvent(wire1201), true);
+    const saved1201 = await syncRepo.findByIdempotencyKey('idem-bind-tamper-1201');
+    assert.ok(saved1201);
+    assert.equal(saved1201.status, 'IN_PROGRESS');
+    assert.equal(saved1201.inboundAckConfirmed, false);
+
+    // Simulate local storage alteration/corruption after save
+    await syncRepo.tamperPayloadInStorageForTest(saved1201.id, tamperedLocalPayload);
+
+    // 2a. Reconnect triggers retryPendingInboundAcks() -> MUST refuse ACK and keep altered local row untouched
+    await transport.connect();
+    assert.equal(await syncEngine.retryPendingInboundAcks(), 0);
+    const afterRetry1 = await syncRepo.findById(saved1201.id);
+    assert.equal(afterRetry1?.status, 'IN_PROGRESS');
+    assert.equal(afterRetry1?.inboundAckConfirmed, false);
+    assert.equal(afterRetry1?.payload, tamperedLocalPayload);
+    assert.equal(transport.ackedRelayEventIds.includes(1201), false);
+
+    // 2b. Re-delivery of the same relay event while seenE2eeNonces already has nonce -> MUST refuse ACK & keep altered payload
+    assert.equal(await syncEngine.ingestInboundEvent(wire1201), false);
+    const afterRedelivery = await syncRepo.findById(saved1201.id);
+    assert.equal(afterRedelivery?.status, 'IN_PROGRESS');
+    assert.equal(afterRedelivery?.inboundAckConfirmed, false);
+    assert.equal(afterRedelivery?.payload, tamperedLocalPayload);
+    assert.equal(transport.ackedRelayEventIds.includes(1201), false);
+
+    // 2c. Repeated manual retry after tampering -> still refuses ACK
+    assert.equal(await syncEngine.retryPendingInboundAcks(), 0);
+    assert.equal(transport.ackedRelayEventIds.includes(1201), false);
+
+    // Verify audit log recorded ACCESS_DENIED without leaking plaintext or secret strings
+    const denyAudits = security
+      .getAuditLog()
+      .filter(
+        (entry) => entry.action === 'ACCESS_DENIED' && entry.outcome === 'DENIED'
+      );
+    assert.ok(denyAudits.length >= 2);
+    for (const entry of denyAudits) {
+      assert.equal(entry.details.includes(secretTamperedOrig), false);
+      assert.equal(entry.details.includes('TamperedAfterLocalSave'), false);
+    }
+
+    // 3. App restart with unconfirmed ACK:
+    //    - #1201 (tampered local payload) MUST remain IN_PROGRESS across restart
+    //    - #1202 (untampered offline event saved before restart) MUST recover & ACK to SYNCED after restart!
+    await transport.disconnect();
+    const env1202 = await peerCrypto.encryptForPeer({
+      plaintext: JSON.stringify({
+        packageName: 'com.whatsapp',
+        title: 'Clean Across Restart',
+        text: 'CleanUnackedEvent1202',
+        postedAt: 7003,
+      }),
+      senderDeviceId: peerDevice.publicId,
+      recipientDeviceId: myId.publicId,
+      senderCryptoKeyId: peerDevice.cryptoKeyId,
+      recipientCryptoKeyId: myId.cryptoKeyId,
+      recipientEcdhPublicKeyJwk: myId.ecdhPublicKeyJwk!,
+      sessionId: 'sess-bind-restart-clean',
+      idempotencyKey: 'idem-bind-restart-1202',
+    });
+    assert.equal(
+      await syncEngine.ingestInboundEvent({
+        id: 1202,
+        type: 'notification',
+        payload: '[E2EE_CIPHERTEXT]',
+        e2eeEnvelope: env1202,
+        sourceDeviceId: peerDevice.publicId,
+        targetDeviceId: myId.publicId,
+        createdAt: 7003,
+        status: 'IN_PROGRESS',
+        retryCount: 0,
+        nextRetryAt: null,
+        idempotencyKey: 'idem-bind-restart-1202',
+        encrypted: true,
+        localEncrypted: false,
+        e2eeProtected: false,
+        e2eeVerified: false,
+      }),
+      true
+    );
+
+    await syncEngine.stop();
+    const restartedEngine = new SyncEngine({
+      repo: syncRepo,
+      transport,
+      crypto,
+      security,
+      settings,
+      devices,
+      logger,
+    });
+    await restartedEngine.start();
+
+    // Also test existingByKey path when seenE2eeNonces isn't hit (different nonce or bypassed cache) on a tampered row:
+    await transport.connect();
+    const ackedOnRestart = await restartedEngine.retryPendingInboundAcks();
+    // Wait briefly if handleTransportConnected already raced and acked 1202; verify final state deterministically
+    for (let i = 0; i < 20; i += 1) {
+      const c1202 = await syncRepo.findByIdempotencyKey('idem-bind-restart-1202');
+      if (c1202?.status === 'SYNCED') break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.ok(ackedOnRestart >= 0);
+
+    const final1201AfterRestart = await syncRepo.findById(saved1201.id);
+    assert.equal(final1201AfterRestart?.status, 'IN_PROGRESS');
+    assert.equal(final1201AfterRestart?.inboundAckConfirmed, false);
+    assert.equal(final1201AfterRestart?.payload, tamperedLocalPayload);
+    assert.equal(transport.ackedRelayEventIds.includes(1201), false);
+
+    const final1202AfterRestart = await syncRepo.findByIdempotencyKey(
+      'idem-bind-restart-1202'
+    );
+    assert.equal(final1202AfterRestart?.status, 'SYNCED');
+    assert.equal(final1202AfterRestart?.inboundAckConfirmed, true);
+    assert.ok(transport.ackedRelayEventIds.includes(1202));
+
+    // Also verify existingByKey re-delivery path (when seenE2eeNonces cache does not yet hold the row) rejects tampered local payload
+    const coldRepo = new TestSyncEventRepository();
+    const coldEngine = new SyncEngine({
+      repo: coldRepo,
+      transport,
+      crypto,
+      security,
+      settings,
+      devices,
+      logger,
+    });
+    await coldEngine.start();
+    const insertedDirect = await coldRepo.insert({
+      type: 'notification',
+      payload: tamperedLocalPayload,
+      idempotencyKey: 'idem-bind-tamper-1201',
+      sourceDeviceId: peerDevice.publicId,
+      targetDeviceId: myId.publicId,
+      e2eeProtected: true,
+      e2eeVerified: true,
+      e2eeNonce: env1201.messageNonce,
+      e2eeEnvelope: env1201,
+      relayEventId: 1201,
+      inboundAckConfirmed: false,
+    });
+    await coldRepo.updateEvent(insertedDirect.id, { status: 'IN_PROGRESS' });
+    assert.equal(await coldEngine.ingestInboundEvent(wire1201), false);
+    assert.equal(transport.ackedRelayEventIds.includes(1201), false);
+    const afterExistingByKey = await coldRepo.findById(insertedDirect.id);
+    assert.equal(afterExistingByKey?.status, 'IN_PROGRESS');
+    assert.equal(afterExistingByKey?.inboundAckConfirmed, false);
+    assert.equal(afterExistingByKey?.payload, tamperedLocalPayload);
+
+    await coldEngine.stop();
+    await restartedEngine.stop();
   });
 });

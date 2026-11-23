@@ -613,14 +613,60 @@ export class RelayTransportClient implements ITransportClient {
     eventIds: number[]
   ): Promise<void> {
     if (eventIds.length === 0) return;
-    await this.requestJson(
+    if (
+      !eventIds.every((id) => typeof id === 'number' && Number.isInteger(id) && id > 0)
+    ) {
+      throw new TransportError(
+        'RELAY_ACK_INVALID_REQUEST',
+        'معرّفات الأحداث المطلوب تأكيدها غير صالحة.',
+        'Invalid non-positive or non-integer event ID passed to acknowledgeInboundDelivery',
+        false
+      );
+    }
+
+    const requestedIds = Array.from(new Set(eventIds));
+    const response = await this.requestJson<{
+      acknowledged?: unknown;
+      acknowledgedEventIds?: unknown;
+      serverTimestamp?: unknown;
+    }>(
       '/sync/ack',
       {
         method: 'POST',
-        body: JSON.stringify({ deviceId, eventIds }),
+        body: JSON.stringify({ deviceId, eventIds: requestedIds }),
       },
       true
     );
+
+    const confirmedIds =
+      response && typeof response === 'object'
+        ? response.acknowledgedEventIds
+        : undefined;
+    const confirmedSet = new Set(Array.isArray(confirmedIds) ? confirmedIds : []);
+    const exactMatch =
+      response !== null &&
+      typeof response === 'object' &&
+      Array.isArray(confirmedIds) &&
+      confirmedIds.length === requestedIds.length &&
+      confirmedIds.every(
+        (id): id is number =>
+          typeof id === 'number' &&
+          Number.isInteger(id) &&
+          id > 0 &&
+          requestedIds.includes(id)
+      ) &&
+      confirmedSet.size === requestedIds.length &&
+      requestedIds.every((id) => confirmedSet.has(id)) &&
+      response.acknowledged === requestedIds.length;
+
+    if (!exactMatch) {
+      throw new TransportError(
+        'RELAY_ACK_INCOMPLETE',
+        'لم يؤكد خادم المرحل استلام جميع الأحداث المطلوبة؛ ستبقى الأحداث قيد التأكيد.',
+        `Relay ACK mismatch: requested=${requestedIds.length}, acknowledged=${Array.isArray(confirmedIds) ? confirmedIds.length : 'invalid'}`,
+        true
+      );
+    }
   }
 
   async fetchSyncDeliveryStatus(

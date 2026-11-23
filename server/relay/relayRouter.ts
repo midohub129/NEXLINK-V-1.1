@@ -1189,8 +1189,13 @@ export function createRelayServer(db: SqliteRelayDatabase): RelayServerHandle {
         return;
       }
 
-      const cleanIds = eventIds.filter(
-        (id) => typeof id === 'number' && Number.isInteger(id)
+      const cleanIds = Array.from(
+        new Set(
+          eventIds.filter(
+            (id): id is number =>
+              typeof id === 'number' && Number.isInteger(id) && id > 0
+          )
+        )
       );
       const acked = db.acknowledgeDelivery(auth.publicId, cleanIds);
       const serverTimestamp = Date.now();
@@ -1211,7 +1216,11 @@ export function createRelayServer(db: SqliteRelayDatabase): RelayServerHandle {
         });
       }
 
-      res.json({ acknowledged: acked.length, serverTimestamp });
+      res.json({
+        acknowledged: acked.length,
+        acknowledgedEventIds: acked.map((item) => item.relayEventId),
+        serverTimestamp,
+      });
     }
   );
 

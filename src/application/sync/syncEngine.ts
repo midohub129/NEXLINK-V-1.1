@@ -25,6 +25,7 @@ interface InboundDeliveryContext {
   senderPeer: LinkedDevice;
   devicePublicId: string;
   deviceCryptoKeyId: string;
+  decryptedPlaintext: string;
 }
 
 interface InboundConfirmResult {
@@ -494,7 +495,7 @@ export class SyncEngine implements ILifecycleParticipant {
     }
 
     try {
-      await this.crypto.decryptFromPeer({
+      const decryptedPlaintext = await this.crypto.decryptFromPeer({
         envelope: storedEnvelope,
         senderEcdsaPublicKeyJwk: senderPeer.publicKeyJwk,
         senderEcdhPublicKeyJwk: senderPeer.ecdhPublicKeyJwk,
@@ -502,6 +503,13 @@ export class SyncEngine implements ILifecycleParticipant {
         expectedRecipientCryptoKeyId: identity.cryptoKeyId,
         expectedIdempotencyKey: evt.idempotencyKey,
       });
+      if (decryptedPlaintext !== evt.payload) {
+        return {
+          eligible: false,
+          shouldAuditDeny: true,
+          reason: 'persisted local payload does not match verified E2EE plaintext',
+        };
+      }
     } catch (err) {
       return {
         eligible: false,
@@ -569,7 +577,30 @@ export class SyncEngine implements ILifecycleParticipant {
     if (stillPaired.length === 0) return 0;
 
     const relayIds = Array.from(new Set(stillPaired.map((e) => e.relayEventId)));
-    await this.transport.acknowledgeInboundDelivery(identity.publicId, relayIds);
+    try {
+      await this.transport.acknowledgeInboundDelivery(identity.publicId, relayIds);
+    } catch (ackErr) {
+      const reason = ackErr instanceof Error ? ackErr.message : 'ack error';
+      for (const evt of stillPaired) {
+        if (evt.inboundAckConfirmed !== true) {
+          await this.repo.updateEvent(evt.id, {
+            status: 'IN_PROGRESS',
+            inboundAckConfirmed: false,
+            deliveredAt: null,
+            syncedAt: null,
+            lastError: `تعذّر إتمام تأكيد ACK على المرحل وسيُعاد المحاولة (${reason})`,
+          });
+        }
+      }
+      this.eventsCache = await this.repo.getAll();
+      this.notify();
+      this.logger.warn(
+        'SYNC',
+        'فشل تأكيد استلام الأحداث الواردة أثناء إعادة محاولة ACK وستبقى قيد المزامنة',
+        { relayIds, reason }
+      );
+      return 0;
+    }
 
     const ackedAt = Date.now();
     let confirmed = 0;
@@ -701,8 +732,9 @@ export class SyncEngine implements ILifecycleParticipant {
         (existingUnacked.inboundAckConfirmed === false ||
           existingUnacked.status !== 'SYNCED')
       ) {
+        let retryPlaintext: string;
         try {
-          await this.crypto.decryptFromPeer({
+          retryPlaintext = await this.crypto.decryptFromPeer({
             envelope,
             senderEcdsaPublicKeyJwk: trustedSender.publicKeyJwk,
             senderEcdhPublicKeyJwk: trustedSender.ecdhPublicKeyJwk,
@@ -710,6 +742,16 @@ export class SyncEngine implements ILifecycleParticipant {
             expectedRecipientCryptoKeyId: identity.cryptoKeyId,
             expectedIdempotencyKey: remoteEvent.idempotencyKey,
           });
+          if (retryPlaintext !== existingUnacked.payload) {
+            await this.security.recordAudit({
+              action: 'ACCESS_DENIED',
+              actorRole: role,
+              deviceId: identity.publicId,
+              outcome: 'DENIED',
+              details: `رفض ACK لإعادة التسليم #${remoteEvent.id}: المحتوى المحلي لا يطابق النص المفكوك من المغلف`,
+            });
+            return false;
+          }
         } catch (err) {
           const msg =
             err instanceof SecurityError ? err.message : 'فشل التحقق وفك التشفير E2EE';
@@ -730,6 +772,7 @@ export class SyncEngine implements ILifecycleParticipant {
           senderPeer: trustedSender,
           devicePublicId: identity.publicId,
           deviceCryptoKeyId: identity.cryptoKeyId,
+          decryptedPlaintext: retryPlaintext,
         });
         return confirmOutcome.bindingValid;
       }
@@ -796,6 +839,7 @@ export class SyncEngine implements ILifecycleParticipant {
         senderPeer,
         devicePublicId: identity.publicId,
         deviceCryptoKeyId: identity.cryptoKeyId,
+        decryptedPlaintext,
       });
       if (!confirmOutcome.bindingValid) {
         return false;
@@ -898,14 +942,18 @@ export class SyncEngine implements ILifecycleParticipant {
     this.eventsCache = await this.repo.getAll();
     this.notify();
 
-    await this.confirmInboundDeliveryOrKeepInProgress({
+    const confirmResult = await this.confirmInboundDeliveryOrKeepInProgress({
       localEvent: persistedEvent,
       remoteEvent,
       envelope,
       senderPeer,
       devicePublicId: identity.publicId,
       deviceCryptoKeyId: identity.cryptoKeyId,
+      decryptedPlaintext,
     });
+    if (!confirmResult.bindingValid) {
+      return false;
+    }
 
     await this.security.recordAudit({
       action: 'E2EE_VERIFIED',
@@ -928,7 +976,19 @@ export class SyncEngine implements ILifecycleParticipant {
       senderPeer,
       devicePublicId,
       deviceCryptoKeyId,
+      decryptedPlaintext,
     } = ctx;
+    if (localEvent.payload !== decryptedPlaintext) {
+      const role = this.settings.getSnapshot().role ?? 'none';
+      await this.security.recordAudit({
+        action: 'ACCESS_DENIED',
+        actorRole: role,
+        deviceId: devicePublicId,
+        outcome: 'DENIED',
+        details: `رفض ACK للحدث #${localEvent.id}: المحتوى المحلي لا يطابق النص المفكوك من المغلف`,
+      });
+      return { bindingValid: false, ackConfirmed: false };
+    }
     const pairedSenders = this.getTrustedPairedPeersMap();
     const liveTrustedSender = pairedSenders.get(senderPeer.publicId);
 

@@ -1118,10 +1118,25 @@ export class SqliteRelayDatabase {
   acknowledgeDelivery(
     recipientDeviceId: string,
     relayEventIds: number[]
-  ): Array<{ senderDeviceId: string; clientEventId: number }> {
+  ): Array<{
+    relayEventId: number;
+    senderDeviceId: string;
+    clientEventId: number;
+  }> {
+    const uniqueIds = Array.from(
+      new Set(
+        relayEventIds.filter(
+          (id) => typeof id === 'number' && Number.isInteger(id) && id > 0
+        )
+      )
+    );
     const now = Date.now();
     return this.withTransaction(() => {
-      const acked: Array<{ senderDeviceId: string; clientEventId: number }> = [];
+      const acked: Array<{
+        relayEventId: number;
+        senderDeviceId: string;
+        clientEventId: number;
+      }> = [];
       const selectStmt = this.db.prepare(
         `SELECT id, source_device_id, target_device_id, client_event_id, delivered_at
          FROM relay_events WHERE id = ?`
@@ -1130,7 +1145,7 @@ export class SqliteRelayDatabase {
         'UPDATE relay_events SET delivered_at = ? WHERE id = ?'
       );
 
-      for (const eventId of relayEventIds) {
+      for (const eventId of uniqueIds) {
         const row = selectStmt.get(eventId) as
           | {
               id: number;
@@ -1147,6 +1162,7 @@ export class SqliteRelayDatabase {
           updateStmt.run(now, row.id);
         }
         acked.push({
+          relayEventId: row.id,
           senderDeviceId: row.source_device_id,
           clientEventId: row.client_event_id,
         });

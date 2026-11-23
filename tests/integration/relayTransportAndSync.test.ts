@@ -532,4 +532,258 @@ describe('End-to-End Authenticated Relay Transport, Mutual Pairing, E2EE & Peer 
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('rejects partial, empty, unrequested, duplicate, and disconnected ACK responses while confirming full and repeated valid ACKs end-to-end', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'nexlink-strict-ack-'));
+    const db = new SqliteRelayDatabase(path.join(dir, 'relay.sqlite'));
+    const relay = createRelayServer(db);
+    const app = express();
+    app.use('/api/relay', relay.router);
+
+    const server = http.createServer(app);
+    attachRelayUpgrade(server, relay);
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', () => resolve());
+    });
+    const addr = server.address();
+    assert.ok(addr && typeof addr !== 'string');
+    const baseUrl = `http://127.0.0.1:${addr.port}/api/relay`;
+
+    const deviceA = await buildDeviceStack(baseUrl, 'admin');
+    const loggerB = new RotatingLogger();
+    const cryptoB = new NodeTestCryptoProvider();
+    const settingsB = new SettingsService(new InMemorySettingsRepository(), loggerB);
+    await settingsB.initialize();
+    await settingsB.update({
+      role: 'basic',
+      notificationAccessGranted: true,
+      selectedNotificationApps: ['com.whatsapp'],
+      relayEndpoint: baseUrl,
+      syncDeliveryPolicy: 'PEER_CONFIRMED',
+    });
+    const securityB = new SecurityManager(
+      cryptoB,
+      new InMemoryAuditRepository(),
+      loggerB
+    );
+    await securityB.initialize();
+
+    // Intercept /sync/ack responses at fetch layer to test real RelayTransportClient + SyncEngine together
+    let ackOverrideHandler:
+      ((url: string, init?: RequestInit) => Promise<Response>) | null = null;
+    const customFetchB: typeof fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/sync/ack') && ackOverrideHandler) {
+        return ackOverrideHandler(url, init);
+      }
+      return globalThis.fetch(input, init);
+    };
+
+    const transportB = new RelayTransportClient({
+      baseUrl,
+      requestTimeoutMs: 4000,
+      logger: loggerB,
+      crypto: cryptoB,
+      fetchImpl: customFetchB,
+      webSocketFactory: (url) => new WebSocket(url) as unknown as globalThis.WebSocket,
+    });
+    const devicesB = new DeviceManager({
+      deviceRepo: new InMemoryDeviceRepository(),
+      crypto: cryptoB,
+      transport: transportB,
+      security: securityB,
+      settings: settingsB,
+      logger: loggerB,
+    });
+    await devicesB.start();
+    const idB = devicesB.getIdentity()!;
+    securityB.issueSession(idB.publicId, idB.cryptoKeyId, 30);
+
+    const repoB = new InMemorySyncEventRepository();
+    const syncEngineB = new SyncEngine({
+      repo: repoB,
+      transport: transportB,
+      crypto: cryptoB,
+      security: securityB,
+      settings: settingsB,
+      devices: devicesB,
+      logger: loggerB,
+    });
+    await syncEngineB.start();
+
+    try {
+      await deviceA.devices.connectRelay('admin', 'Sender');
+      await devicesB.connectRelay('basic', 'Receiver');
+
+      const req = await deviceA.devices.createPairingRequest();
+      const pending = await devicesB.acceptPairingCode(
+        req.pairingCode,
+        'basic',
+        'Receiver'
+      );
+      await deviceA.devices.confirmPairingApproval(
+        pending.pairingId,
+        true,
+        idB.cryptoKeyId
+      );
+      await new Promise((r) => setTimeout(r, 60));
+      await devicesB.refreshLinkedDevicesFromRelay();
+
+      // Disconnect B so A sends 2 real events into relay_events, then test ACK failure modes on B
+      await devicesB.disconnectRelay();
+
+      await deviceA.syncEngine.enqueueNotification({
+        packageName: 'com.whatsapp',
+        title: 'Strict ACK #1',
+        text: 'Event One',
+        notificationKey: 'strict-1',
+        postedAt: 10001,
+      });
+      await deviceA.syncEngine.enqueueNotification({
+        packageName: 'com.whatsapp',
+        title: 'Strict ACK #2',
+        text: 'Event Two',
+        notificationKey: 'strict-2',
+        postedAt: 10002,
+      });
+      const dispatchSummary = await deviceA.syncEngine.runSyncCycle();
+      assert.equal(dispatchSummary.awaitingPeerAck, 2);
+
+      // Reconnect B with ACK initially returning HTTP 200 EMPTY ACK -> must keep both IN_PROGRESS!
+      ackOverrideHandler = async () =>
+        new Response(
+          JSON.stringify({
+            acknowledged: 0,
+            acknowledgedEventIds: [],
+            serverTimestamp: Date.now(),
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      await devicesB.connectRelay('basic', 'Receiver');
+      await new Promise((r) => setTimeout(r, 150));
+
+      const afterEmpty = await repoB.getAll();
+      assert.equal(afterEmpty.length, 2);
+      assert.ok(afterEmpty.every((e) => e.status === 'IN_PROGRESS'));
+      assert.ok(afterEmpty.every((e) => e.inboundAckConfirmed === false));
+      const relayIds = afterEmpty.map((e) => e.relayEventId!).sort((a, b) => a - b);
+
+      // Missing acknowledgedEventIds field (legacy count-only 200) -> rejected
+      ackOverrideHandler = async () =>
+        new Response(JSON.stringify({ acknowledged: 2, serverTimestamp: Date.now() }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      assert.equal(await syncEngineB.retryPendingInboundAcks(), 0);
+      assert.ok((await repoB.getAll()).every((e) => e.status === 'IN_PROGRESS'));
+
+      // Partial ACK (only 1 of 2 IDs confirmed in HTTP 200) -> rejected, BOTH remain IN_PROGRESS
+      ackOverrideHandler = async () =>
+        new Response(
+          JSON.stringify({
+            acknowledged: 1,
+            acknowledgedEventIds: [relayIds[0]],
+            serverTimestamp: Date.now(),
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      assert.equal(await syncEngineB.retryPendingInboundAcks(), 0);
+      assert.ok((await repoB.getAll()).every((e) => e.status === 'IN_PROGRESS'));
+
+      // Unrequested IDs in HTTP 200 response -> rejected
+      ackOverrideHandler = async () =>
+        new Response(
+          JSON.stringify({
+            acknowledged: 2,
+            acknowledgedEventIds: [relayIds[0], 999999],
+            serverTimestamp: Date.now(),
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      assert.equal(await syncEngineB.retryPendingInboundAcks(), 0);
+      assert.ok((await repoB.getAll()).every((e) => e.status === 'IN_PROGRESS'));
+
+      // Duplicate IDs returned in server HTTP 200 response ([id1, id1]) -> rejected
+      ackOverrideHandler = async () =>
+        new Response(
+          JSON.stringify({
+            acknowledged: 2,
+            acknowledgedEventIds: [relayIds[0], relayIds[0]],
+            serverTimestamp: Date.now(),
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      assert.equal(await syncEngineB.retryPendingInboundAcks(), 0);
+      assert.ok((await repoB.getAll()).every((e) => e.status === 'IN_PROGRESS'));
+
+      // Also verify duplicate single-ID response [id1, id1] with acknowledged: 1 is rejected directly by client
+      ackOverrideHandler = async () =>
+        new Response(
+          JSON.stringify({
+            acknowledged: 1,
+            acknowledgedEventIds: [relayIds[0], relayIds[0]],
+            serverTimestamp: Date.now(),
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      await assert.rejects(
+        () => transportB.acknowledgeInboundDelivery(idB.publicId, [relayIds[0]]),
+        (err: unknown) =>
+          err instanceof TransportError &&
+          err.code === 'RELAY_ACK_INCOMPLETE' &&
+          err.retryable === true
+      );
+
+      // Network disconnect / abort mid-/sync/ack -> retryable TransportError & keeps IN_PROGRESS
+      ackOverrideHandler = async () => {
+        throw new Error('Simulated TCP reset during /sync/ack');
+      };
+      assert.equal(await syncEngineB.retryPendingInboundAcks(), 0);
+      assert.ok((await repoB.getAll()).every((e) => e.status === 'IN_PROGRESS'));
+
+      // Restore live Relay server /sync/ack -> Full ACK succeeds & BOTH transition to SYNCED
+      ackOverrideHandler = null;
+      assert.equal(await syncEngineB.retryPendingInboundAcks(), 2);
+      const afterFullAck = await repoB.getAll();
+      assert.ok(afterFullAck.every((e) => e.status === 'SYNCED'));
+      assert.ok(afterFullAck.every((e) => e.inboundAckConfirmed === true));
+      assert.ok(afterFullAck.every((e) => e.deliveredAt !== null));
+
+      // Re-sending ACK for an already-confirmed event & duplicate IDs from client -> server deduplicates and returns exact unique ID
+      await transportB.acknowledgeInboundDelivery(idB.publicId, [
+        relayIds[0],
+        relayIds[0],
+      ]);
+
+      // Invalid non-positive ID passed to client -> rejected immediately as invalid request
+      await assert.rejects(
+        () => transportB.acknowledgeInboundDelivery(idB.publicId, [relayIds[0], 0]),
+        (err: unknown) =>
+          err instanceof TransportError &&
+          err.code === 'RELAY_ACK_INVALID_REQUEST' &&
+          err.retryable === false
+      );
+
+      // Direct HTTP check against real server: requesting [validId, missingId] fails client check (partial server ACK)
+      await assert.rejects(
+        () =>
+          transportB.acknowledgeInboundDelivery(idB.publicId, [relayIds[0], 999999]),
+        (err: unknown) =>
+          err instanceof TransportError && err.code === 'RELAY_ACK_INCOMPLETE'
+      );
+
+      // Sender A reconciles delivery status and becomes SYNCED
+      await deviceA.syncEngine.runSyncCycle();
+      assert.ok(deviceA.syncEngine.getEvents().every((e) => e.status === 'SYNCED'));
+    } finally {
+      await deviceA.syncEngine.stop();
+      await deviceA.devices.stop();
+      await syncEngineB.stop();
+      await devicesB.stop();
+      await relay.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
