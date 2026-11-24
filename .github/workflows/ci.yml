@@ -55,6 +55,12 @@ jobs:
           mkdir -p test-results
           npm run test:integration | tee test-results/integration-tests.tap
 
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright E2E Tests (Chromium + Real IndexedDB)
+        run: npm run test:e2e
+
       - name: Production Build
         run: npm run build
 
@@ -66,7 +72,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nexlink-test-reports-${{ github.sha }}
-          path: test-results/
+          path: |
+            test-results/
+            playwright-report/
           retention-days: 14
 
       - name: Upload Production Build Artifacts

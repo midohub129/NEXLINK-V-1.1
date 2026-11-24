@@ -356,4 +356,275 @@ describe('Encrypted Backup v2 Unit & Cryptographic Verification (Real WebCrypto 
     const settingsAfter = await stack.settingsRepo.get();
     assert.equal(settingsAfter.role, 'admin');
   });
+
+  it('preserves target device role across restore in both directions while restoring allowed settings and preserving role on failure', async () => {
+    const harness = new InMemoryIndexedDbHarness();
+
+    // Source device A is admin with custom allowed settings
+    const sourceAdmin = await createRealWebCryptoStack('db-role-src-admin', harness);
+    await sourceAdmin.settingsRepo.save({
+      ...DEFAULT_APP_SETTINGS,
+      role: 'admin',
+      sessionTimeoutMinutes: 45,
+      syncIntervalMs: 15000,
+      maxSyncRetries: 8,
+      selectedNotificationApps: ['com.whatsapp', 'com.signal'],
+      syncDeliveryPolicy: 'RELAY_QUEUED',
+    });
+    const adminBackup = await sourceAdmin.backup.exportBackup(STRONG_PASSPHRASE);
+
+    // 1. Target device B is 'basic' restoring backup from 'admin' -> MUST remain 'basic'
+    const targetBasic = await createRealWebCryptoStack('db-role-tgt-basic', harness);
+    await targetBasic.settingsRepo.save({
+      ...DEFAULT_APP_SETTINGS,
+      role: 'basic',
+      sessionTimeoutMinutes: 10,
+      syncIntervalMs: 5000,
+    });
+    const resBasic = await targetBasic.backup.restoreBackup(
+      adminBackup.archive,
+      STRONG_PASSPHRASE
+    );
+    assert.equal(resBasic.restoredRole, 'basic');
+    const basicSettingsAfter = await targetBasic.settingsRepo.get();
+    assert.equal(basicSettingsAfter.role, 'basic');
+    // Allowed settings ARE restored
+    assert.equal(basicSettingsAfter.sessionTimeoutMinutes, 45);
+    assert.equal(basicSettingsAfter.syncIntervalMs, 15000);
+    assert.equal(basicSettingsAfter.maxSyncRetries, 8);
+    assert.deepEqual(basicSettingsAfter.selectedNotificationApps, [
+      'com.whatsapp',
+      'com.signal',
+    ]);
+    assert.equal(basicSettingsAfter.syncDeliveryPolicy, 'RELAY_QUEUED');
+
+    // Failure during restore leaves target role & settings untouched
+    await assert.rejects(() =>
+      targetBasic.backup.restoreBackup(adminBackup.archive, WRONG_PASSPHRASE)
+    );
+    assert.equal((await targetBasic.settingsRepo.get()).role, 'basic');
+
+    // 2. Target device C is 'admin' restoring backup from 'basic' -> MUST remain 'admin'
+    const sourceBasic = await createRealWebCryptoStack('db-role-src-basic', harness);
+    await sourceBasic.settingsRepo.save({
+      ...DEFAULT_APP_SETTINGS,
+      role: 'basic',
+      sessionTimeoutMinutes: 90,
+      maxSyncRetries: 12,
+    });
+    const basicBackup = await sourceBasic.backup.exportBackup(STRONG_PASSPHRASE);
+
+    const targetAdmin = await createRealWebCryptoStack('db-role-tgt-admin', harness);
+    await targetAdmin.settingsRepo.save({
+      ...DEFAULT_APP_SETTINGS,
+      role: 'admin',
+      sessionTimeoutMinutes: 20,
+    });
+    const resAdmin = await targetAdmin.backup.restoreBackup(
+      basicBackup.archive,
+      STRONG_PASSPHRASE
+    );
+    assert.equal(resAdmin.restoredRole, 'admin');
+    const adminSettingsAfter = await targetAdmin.settingsRepo.get();
+    assert.equal(adminSettingsAfter.role, 'admin');
+    assert.equal(adminSettingsAfter.sessionTimeoutMinutes, 90);
+    assert.equal(adminSettingsAfter.maxSyncRetries, 12);
+  });
+
+  it('preserves local audit entries (including REVOKED), avoids ID collisions, ignores spoofed archive provenance, and rolls back atomically on failure', async () => {
+    const harness = new InMemoryIndexedDbHarness();
+    const stack = await createRealWebCryptoStack('db-audit-provenance', harness);
+
+    // Local device records local audit entries with IDs 1 and 2 (including DEVICE_REVOKED)
+    const localRevoked = await stack.auditRepo.append({
+      timestamp: 1700000001000,
+      action: 'DEVICE_REVOKED',
+      actorRole: 'admin',
+      deviceId: 'local-device-1',
+      outcome: 'ALLOWED',
+      details: 'سحب ثقة جهاز محلي مهم يجب عدم حذفه',
+    });
+    const localRole = await stack.auditRepo.append({
+      timestamp: 1700000002000,
+      action: 'ROLE_ASSIGNED',
+      actorRole: 'admin',
+      deviceId: 'local-device-1',
+      outcome: 'ALLOWED',
+      details: 'تعيين دور محلي أصلي',
+    });
+    assert.equal(localRevoked.origin, 'LOCAL');
+    assert.equal(localRole.origin, 'LOCAL');
+
+    // Craft an archive from another device claiming colliding IDs (1, 2) and spoofed origin='LOCAL'
+    const craftedInner = {
+      payloadVersion: 2,
+      schemaVersion: APP_DB_VERSION,
+      exportedAt: 1700000010000,
+      sourceDevice: {
+        publicId: 'archive-source-dev-99',
+        cryptoKeyId: 'ecdsa-source-99',
+      },
+      settings: { ...DEFAULT_APP_SETTINGS, role: 'basic' },
+      linkedDevices: [],
+      syncEvents: [
+        {
+          id: 1,
+          type: 'notification',
+          payload: 'restored-event-1',
+          createdAt: 1700000005000,
+          status: 'SYNCED',
+          retryCount: 0,
+          nextRetryAt: null,
+          idempotencyKey: 'idem-audit-evt-1',
+          encrypted: true,
+        },
+      ],
+      auditEntries: [
+        {
+          id: localRevoked.id, // Collides with local ID 1
+          timestamp: 1700000003000,
+          action: 'ROLE_CHANGED',
+          actorRole: 'admin',
+          deviceId: 'archive-source-dev-99',
+          outcome: 'ALLOWED',
+          details: 'سجل مستورد يحاول تزوير provenance المحلي',
+          origin: 'LOCAL', // Spoofed provenance!
+          importedAt: null,
+          importedFromDeviceId: 'spoofed-local',
+        },
+        {
+          id: localRole.id, // Collides with local ID 2
+          timestamp: 1700000004000,
+          action: 'VAULT_VERIFIED',
+          actorRole: 'admin',
+          deviceId: 'archive-source-dev-99',
+          outcome: 'ALLOWED',
+          details: 'سجل مستورد ثانٍ بمعرّف متصادم',
+          origin: 'LOCAL',
+        },
+      ],
+    };
+
+    const archive = await stack.crypto.encryptBackupPayload({
+      plaintext: JSON.stringify(craftedInner),
+      passphrase: STRONG_PASSPHRASE,
+      schemaVersion: APP_DB_VERSION,
+      exportedAt: craftedInner.exportedAt,
+    });
+
+    // 1. Rollback test: fail mid-restore inside SYNC_EVENTS -> local audits untouched, zero imported added
+    harness.failOnPutStore = STORES.SYNC_EVENTS;
+    await assert.rejects(() => stack.backup.restoreBackup(archive, STRONG_PASSPHRASE));
+    harness.failOnPutStore = null;
+
+    const auditsAfterFail = await stack.auditRepo.getAll();
+    assert.equal(auditsAfterFail.length, 2);
+    assert.ok(auditsAfterFail.every((a) => a.origin === 'LOCAL'));
+
+    // 2. Successful restore -> local entries preserved, imported entries appended with new IDs & BACKUP_IMPORT
+    await stack.backup.restoreBackup(archive, STRONG_PASSPHRASE);
+    const auditsAfterRestore = await stack.auditRepo.getAll();
+    assert.equal(auditsAfterRestore.length, 4);
+
+    const preservedRevoked = auditsAfterRestore.find((a) => a.id === localRevoked.id)!;
+    const preservedRole = auditsAfterRestore.find((a) => a.id === localRole.id)!;
+    assert.equal(preservedRevoked.origin, 'LOCAL');
+    assert.equal(preservedRevoked.action, 'DEVICE_REVOKED');
+    assert.equal(preservedRevoked.importedAt, null);
+    assert.equal(preservedRole.origin, 'LOCAL');
+    assert.equal(preservedRole.action, 'ROLE_ASSIGNED');
+
+    const importedEntries = auditsAfterRestore.filter(
+      (a) => a.origin === 'BACKUP_IMPORT'
+    );
+    assert.equal(importedEntries.length, 2);
+    for (const imp of importedEntries) {
+      assert.ok(imp.id !== localRevoked.id && imp.id !== localRole.id);
+      assert.equal(imp.origin, 'BACKUP_IMPORT');
+      assert.equal(imp.importedFromDeviceId, 'archive-source-dev-99');
+      assert.equal(typeof imp.importedAt, 'number');
+    }
+
+    // Re-exporting after restore retains explicit provenance on both local and imported rows
+    const reExported = await stack.backup.exportBackup(STRONG_PASSPHRASE);
+    const reDecrypted = JSON.parse(
+      await stack.crypto.decryptBackupPayload({
+        archive: reExported.archive,
+        passphrase: STRONG_PASSPHRASE,
+      })
+    );
+    assert.equal(reDecrypted.auditEntries.length, 4);
+    assert.equal(
+      reDecrypted.auditEntries.filter((a: { origin: string }) => a.origin === 'LOCAL')
+        .length,
+      2
+    );
+    assert.equal(
+      reDecrypted.auditEntries.filter(
+        (a: { origin: string }) => a.origin === 'BACKUP_IMPORT'
+      ).length,
+      2
+    );
+  });
+
+  it('migrates existing IndexedDB v3 security_audit records to v4 with origin=LOCAL and zero data loss', async () => {
+    const harness = new InMemoryIndexedDbHarness();
+    const factory = harness.createFactory();
+    (globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = factory;
+
+    // Seed an existing v3 IndexedDB database with legacy audit entries lacking `origin`
+    const dbName = 'db-v3-to-v4-migration';
+    await new Promise<void>((resolve, reject) => {
+      const openReq = factory.open(dbName, 3);
+      openReq.onupgradeneeded = () => {
+        const db = openReq.result;
+        db.createObjectStore(STORES.MIGRATIONS, { keyPath: 'version' });
+        db.createObjectStore(STORES.SETTINGS, { keyPath: 'id' });
+        db.createObjectStore(STORES.IDENTITY, { keyPath: 'id' });
+        db.createObjectStore(STORES.LINKED_DEVICES, { keyPath: 'publicId' });
+        const syncStore = db.createObjectStore(STORES.SYNC_EVENTS, {
+          keyPath: 'id',
+          autoIncrement: true,
+        });
+        syncStore.createIndex('by_status', 'status', { unique: false });
+        syncStore.createIndex('by_createdAt', 'createdAt', { unique: false });
+        syncStore.createIndex('by_idempotencyKey', 'idempotencyKey', { unique: true });
+        syncStore.createIndex('by_notificationKey', 'notificationKey', { unique: false });
+
+        const auditStore = db.createObjectStore(STORES.SECURITY_AUDIT, {
+          keyPath: 'id',
+          autoIncrement: true,
+        });
+        auditStore.createIndex('by_timestamp', 'timestamp', { unique: false });
+        auditStore.put({
+          id: 10,
+          timestamp: 1700000000100,
+          action: 'DEVICE_REVOKED',
+          actorRole: 'admin',
+          deviceId: 'v3-device',
+          outcome: 'ALLOWED',
+          details: 'Legacy v3 revocation record without origin field',
+        });
+      };
+      openReq.onsuccess = () => {
+        openReq.result.close();
+        resolve();
+      };
+      openReq.onerror = () => reject(openReq.error);
+    });
+
+    // Initialize IndexedDbDatabase (upgrades v3 -> v4)
+    const db = new IndexedDbDatabase(dbName);
+    await db.initialize();
+    const migrations = await db.getMigrations();
+    assert.ok(migrations.some((m) => m.version === 4 && m.name === 'v4_audit_origin_provenance'));
+
+    const auditRepo = new IndexedDbAuditRepository(db);
+    const migratedRows = await auditRepo.getAll();
+    assert.equal(migratedRows.length, 1);
+    assert.equal(migratedRows[0].id, 10);
+    assert.equal(migratedRows[0].action, 'DEVICE_REVOKED');
+    assert.equal(migratedRows[0].origin, 'LOCAL');
+    assert.equal(migratedRows[0].importedAt, null);
+  });
 });

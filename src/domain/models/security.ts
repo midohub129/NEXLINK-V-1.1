@@ -74,6 +74,8 @@ export type SecurityAuditAction =
   | 'REPLAY_BLOCKED'
   | 'SECURE_WIPE';
 
+export type SecurityAuditOrigin = 'LOCAL' | 'BACKUP_IMPORT';
+
 export interface SecurityAuditEntry {
   id: number;
   timestamp: number;
@@ -82,4 +84,7 @@ export interface SecurityAuditEntry {
   deviceId: string;
   outcome: 'ALLOWED' | 'DENIED' | 'INFO';
   details: string;
+  origin?: SecurityAuditOrigin;
+  importedAt?: number | null;
+  importedFromDeviceId?: string | null;
 }

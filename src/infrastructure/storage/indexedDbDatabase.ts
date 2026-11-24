@@ -1,7 +1,7 @@
 import { StorageError } from '../../domain/errors/appError';
 
 export const APP_DB_NAME = 'nexlink_app_db';
-export const APP_DB_VERSION = 3;
+export const APP_DB_VERSION = 4;
 
 export const STORES = {
   MIGRATIONS: 'schema_migrations',
@@ -79,6 +79,30 @@ const MIGRATION_DEFINITIONS: Array<{
           unique: false,
         });
       }
+    },
+  },
+  {
+    version: 4,
+    name: 'v4_audit_origin_provenance',
+    apply: (_db, tx) => {
+      const auditStore = tx.objectStore(STORES.SECURITY_AUDIT);
+      if (!auditStore.indexNames.contains('by_origin')) {
+        auditStore.createIndex('by_origin', 'origin', { unique: false });
+      }
+      const existingReq = auditStore.getAll();
+      existingReq.onsuccess = () => {
+        const rows = (existingReq.result ?? []) as Array<Record<string, unknown>>;
+        for (const row of rows) {
+          if (row.origin !== 'LOCAL' && row.origin !== 'BACKUP_IMPORT') {
+            auditStore.put({
+              ...row,
+              origin: 'LOCAL',
+              importedAt: null,
+              importedFromDeviceId: null,
+            });
+          }
+        }
+      };
     },
   },
 ];

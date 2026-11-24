@@ -1286,7 +1286,7 @@ export function ActionModal({
                         );
                         setRestorePolicyConfirmed(false);
                         setStatusMessage(
-                          `تمت الاستعادة الآمنة (${result.restoredEvents} حدث، ${result.restoredLinkedDevices} جهاز بحالة غير موثوقة). تم الحفاظ على هوية هذا الجهاز ومفاتيحه.`
+                          `تمت الاستعادة الآمنة (${result.restoredEvents} حدث، ${result.restoredLinkedDevices} جهاز بحالة غير موثوقة، ${result.restoredAuditEntries} سجل مستورد). تم الحفاظ على هوية هذا الجهاز ومفاتيحه ودوره المحلي.`
                         );
                       } finally {
                         setRestorePassphrase('');
@@ -1521,26 +1521,55 @@ export function ActionModal({
                   <p className="text-sm font-bold text-white">
                     سجل الأمان ({auditEntries.length})
                   </p>
-                  <div className="divide-y divide-white/10 max-h-44 overflow-y-auto">
-                    {auditEntries.slice(0, 15).map((entry) => (
-                      <div key={entry.id} className="py-2 text-xs">
-                        <div className="flex justify-between gap-2">
-                          <span className="font-semibold text-white">
-                            {getAuditActionLabel(entry.action)} ({entry.actorRole})
-                          </span>
-                          <span
-                            className={
-                              entry.outcome === 'DENIED'
-                                ? 'text-red-400'
-                                : 'text-emerald-400'
-                            }
-                          >
-                            {entry.outcome}
-                          </span>
+                  <div className="divide-y divide-white/10 max-h-64 overflow-y-auto">
+                    {auditEntries.map((entry) => {
+                      const isImported = entry.origin === 'BACKUP_IMPORT';
+                      return (
+                        <div
+                          key={entry.id}
+                          data-testid={`audit-entry-${entry.id}`}
+                          data-audit-origin={isImported ? 'BACKUP_IMPORT' : 'LOCAL'}
+                          className="py-2 text-xs"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="font-semibold text-white">
+                                {getAuditActionLabel(entry.action)} ({entry.actorRole})
+                              </span>
+                              <span
+                                data-testid="audit-origin-badge"
+                                className={
+                                  isImported
+                                    ? 'px-2 py-0.5 rounded bg-amber-950/60 border border-[#FFBE50]/40 text-[#FFBE50] text-[10px] font-bold'
+                                    : 'px-2 py-0.5 rounded bg-[#192131] border border-[#4B91FF]/40 text-[#4B91FF] text-[10px] font-bold'
+                                }
+                              >
+                                {isImported
+                                  ? 'مستورد من نسخة احتياطية · غير موثق محلياً'
+                                  : 'حدث محلي موثق'}
+                              </span>
+                            </div>
+                            <span
+                              className={
+                                entry.outcome === 'DENIED'
+                                  ? 'text-red-400'
+                                  : 'text-emerald-400'
+                              }
+                            >
+                              {entry.outcome}
+                            </span>
+                          </div>
+                          <p className="text-[#A5B1C6] mt-0.5">{entry.details}</p>
+                          {isImported && (
+                            <p className="text-[11px] text-[#FFBE50]/90 mt-0.5">
+                              المصدر في الأرشيف:{' '}
+                              {entry.importedFromDeviceId ?? 'غير محدد'} · لا يُعد دليلاً
+                              مستقلاً على حدوث الحدث محلياً
+                            </p>
+                          )}
                         </div>
-                        <p className="text-[#A5B1C6] mt-0.5">{entry.details}</p>
-                      </div>
-                    ))}
+                      );
+                    })}
                     {auditEntries.length === 0 && (
                       <p className="text-xs text-[#A5B1C6] py-2">
                         لا توجد أحداث أمنية مسجلة بعد.

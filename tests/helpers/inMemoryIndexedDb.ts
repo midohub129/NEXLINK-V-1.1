@@ -396,18 +396,39 @@ export class InMemoryIndexedDbHarness {
 
         if (version > oldVersion) {
           entry.version = version;
+          let upgradePending = 0;
+          const finishUpgrade = () => {
+            if (upgradePending > 0) return;
+            req.transaction = null;
+            if (typeof req.onsuccess === 'function') {
+              (req.onsuccess as (ev: unknown) => void)({});
+            }
+          };
           const upgradeTx = {
             objectStore(storeName: string) {
               const cfg = entry!.stores.get(storeName);
               if (!cfg) throw new Error(`Store ${storeName} not found in upgrade`);
-              return makeObjectStoreFacade(storeName, cfg, null);
+              return makeObjectStoreFacade(
+                storeName,
+                cfg,
+                () => {
+                  upgradePending = Math.max(0, upgradePending - 1);
+                  queueMicrotask(finishUpgrade);
+                },
+                () => {
+                  upgradePending += 1;
+                }
+              );
             },
           } as unknown as IDBTransaction;
           req.transaction = upgradeTx;
           if (typeof req.onupgradeneeded === 'function') {
             (req.onupgradeneeded as (ev: unknown) => void)({ oldVersion });
           }
-          req.transaction = null;
+          if (upgradePending === 0) {
+            finishUpgrade();
+          }
+          return;
         }
 
         if (typeof req.onsuccess === 'function') {

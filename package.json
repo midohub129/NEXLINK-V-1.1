@@ -15,7 +15,8 @@
     "format:check": "prettier --check \"src/**/*.{ts,tsx}\" \"server/**/*.ts\" server.ts",
     "test": "tsx --test tests/**/*.test.ts",
     "test:unit": "tsx --test tests/unit/*.test.ts",
-    "test:integration": "tsx --test tests/integration/*.test.ts"
+    "test:integration": "tsx --test tests/integration/*.test.ts",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "express": "^5.1.0",
@@ -26,6 +27,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.25.0",
+    "@playwright/test": "^1.65.1",
     "@tailwindcss/vite": "^4.1.7",
     "@types/express": "^5.0.2",
     "@types/node": "^22.15.3",

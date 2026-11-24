@@ -185,6 +185,9 @@ export class SecurityManager {
       deviceId: entry.deviceId,
       outcome: entry.outcome,
       details: entry.details,
+      origin: 'LOCAL',
+      importedAt: null,
+      importedFromDeviceId: null,
     });
     this.auditCache = await this.auditRepo.getAll();
     this.notify();

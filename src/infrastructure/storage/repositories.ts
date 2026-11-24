@@ -41,6 +41,7 @@ import type {
   EncryptedEnvelope,
   SecurityAuditAction,
   SecurityAuditEntry,
+  SecurityAuditOrigin,
 } from '../../domain/models/security';
 import { type AppSettings, DEFAULT_APP_SETTINGS } from '../../domain/models/settings';
 import type { SyncEvent, SyncEventStatus } from '../../domain/models/syncEvent';
@@ -615,6 +616,18 @@ function validateSyncEventsFromBackup(raw: unknown): SyncEvent[] {
   });
 }
 
+function normalizeAuditEntry(entry: SecurityAuditEntry): SecurityAuditEntry {
+  const origin: SecurityAuditOrigin =
+    entry.origin === 'BACKUP_IMPORT' ? 'BACKUP_IMPORT' : 'LOCAL';
+  return {
+    ...entry,
+    origin,
+    importedAt: origin === 'BACKUP_IMPORT' ? (entry.importedAt ?? null) : null,
+    importedFromDeviceId:
+      origin === 'BACKUP_IMPORT' ? (entry.importedFromDeviceId ?? null) : null,
+  };
+}
+
 function validateAuditEntriesFromBackup(raw: unknown): SecurityAuditEntry[] {
   if (!Array.isArray(raw)) {
     throw new ValidationError(
@@ -681,6 +694,8 @@ function validateAuditEntriesFromBackup(raw: unknown): SecurityAuditEntry[] {
       );
     }
 
+    // Security policy: ignore any archive-supplied provenance fields (origin, importedAt,
+    // importedFromDeviceId). Restore pipeline strictly assigns BACKUP_IMPORT provenance.
     return {
       id: item.id,
       timestamp: item.timestamp,
@@ -1126,9 +1141,20 @@ export class IndexedDbAuditRepository implements ISecurityAuditRepository {
   }
 
   async append(entry: Omit<SecurityAuditEntry, 'id'>): Promise<SecurityAuditEntry> {
-    const generatedId = await this.db.add(STORES.SECURITY_AUDIT, entry);
+    const localRecord: Omit<SecurityAuditEntry, 'id'> = {
+      timestamp: entry.timestamp,
+      action: entry.action,
+      actorRole: entry.actorRole,
+      deviceId: entry.deviceId,
+      outcome: entry.outcome,
+      details: entry.details,
+      origin: 'LOCAL',
+      importedAt: null,
+      importedFromDeviceId: null,
+    };
+    const generatedId = await this.db.add(STORES.SECURITY_AUDIT, localRecord);
     const saved: SecurityAuditEntry = {
-      ...entry,
+      ...localRecord,
       id: Number(generatedId),
     };
     this.notify();
@@ -1137,7 +1163,9 @@ export class IndexedDbAuditRepository implements ISecurityAuditRepository {
 
   async getAll(): Promise<SecurityAuditEntry[]> {
     const rows = await this.db.readAll<SecurityAuditEntry>(STORES.SECURITY_AUDIT);
-    return rows.sort((a, b) => b.timestamp - a.timestamp || b.id - a.id).slice(0, 150);
+    return rows
+      .map(normalizeAuditEntry)
+      .sort((a, b) => b.timestamp - a.timestamp || b.id - a.id);
   }
 
   async clear(): Promise<void> {
@@ -1398,6 +1426,11 @@ export class IndexedDbBackupProvider implements IBackupProvider {
       }
     }
 
+    const boundedAudits =
+      auditEntries.length > BACKUP_MAX_AUDIT_ENTRIES
+        ? auditEntries.slice(0, BACKUP_MAX_AUDIT_ENTRIES)
+        : auditEntries;
+
     const exportedAt = Date.now();
     const innerPayload: BackupInnerPayloadV2 = {
       payloadVersion: 2,
@@ -1412,7 +1445,7 @@ export class IndexedDbBackupProvider implements IBackupProvider {
       settings: validateAppSettings({ ...DEFAULT_APP_SETTINGS, ...settings }),
       linkedDevices,
       syncEvents,
-      auditEntries,
+      auditEntries: boundedAudits.map(normalizeAuditEntry),
     };
 
     const archive = await this.crypto.encryptBackupPayload({
@@ -1426,7 +1459,7 @@ export class IndexedDbBackupProvider implements IBackupProvider {
       archive,
       eventCount: syncEvents.length,
       linkedDeviceCount: linkedDevices.length,
-      auditCount: auditEntries.length,
+      auditCount: boundedAudits.length,
     };
   }
 
@@ -1630,7 +1663,14 @@ export class IndexedDbBackupProvider implements IBackupProvider {
     }
 
     // Steps 12-13: Atomic IndexedDB transaction AFTER all checks & crypto prep succeed.
-    // STORES.IDENTITY is intentionally excluded so device identity & keys NEVER change.
+    // - STORES.IDENTITY is intentionally excluded so device identity & keys NEVER change.
+    // - Target device role is preserved strictly from current local settings (backup role is ignored).
+    // - STORES.SECURITY_AUDIT is NEVER cleared; imported audits are appended with new autoIncrement IDs
+    //   and authoritative origin='BACKUP_IMPORT' provenance assigned by this restore pipeline.
+    const restoreTimestamp = Date.now();
+    const importedFromDeviceId = sourceDevice?.publicId ?? null;
+    let preservedRole: DeviceRole | null = DEFAULT_APP_SETTINGS.role;
+
     await this.db.runTransaction(
       [
         STORES.SETTINGS,
@@ -1645,15 +1685,25 @@ export class IndexedDbBackupProvider implements IBackupProvider {
         const syncStore = tx.objectStore(STORES.SYNC_EVENTS);
         const auditStore = tx.objectStore(STORES.SECURITY_AUDIT);
 
+        const currentSettingsRecord = (await reqToPromise(
+          settingsStore.get('app_settings')
+        )) as StoredSettingsRecord | undefined;
+        preservedRole =
+          currentSettingsRecord?.settings?.role ?? DEFAULT_APP_SETTINGS.role;
+
+        const settingsToPersist = validateAppSettings({
+          ...validatedSettings,
+          role: preservedRole,
+        });
+
         await reqToPromise(settingsStore.clear());
         await reqToPromise(devicesStore.clear());
         await reqToPromise(syncStore.clear());
-        await reqToPromise(auditStore.clear());
 
         await reqToPromise(
           settingsStore.put({
             id: 'app_settings',
-            settings: validatedSettings,
+            settings: settingsToPersist,
           } satisfies StoredSettingsRecord)
         );
         for (const device of sanitizedDevices) {
@@ -1663,7 +1713,18 @@ export class IndexedDbBackupProvider implements IBackupProvider {
           await reqToPromise(syncStore.put(evt));
         }
         for (const entry of validatedAudits) {
-          await reqToPromise(auditStore.put(entry));
+          const importedRecord: Omit<SecurityAuditEntry, 'id'> = {
+            timestamp: entry.timestamp,
+            action: entry.action,
+            actorRole: entry.actorRole,
+            deviceId: entry.deviceId,
+            outcome: entry.outcome,
+            details: entry.details,
+            origin: 'BACKUP_IMPORT',
+            importedAt: restoreTimestamp,
+            importedFromDeviceId,
+          };
+          await reqToPromise(auditStore.add(importedRecord));
         }
       }
     );
@@ -1673,7 +1734,7 @@ export class IndexedDbBackupProvider implements IBackupProvider {
       restoredLinkedDevices: sanitizedDevices.length,
       restoredAuditEntries: validatedAudits.length,
       crossDeviceRestore,
-      restoredRole: validatedSettings.role,
+      restoredRole: preservedRole,
     };
   }
 
@@ -2035,14 +2096,25 @@ export class InMemoryAuditRepository implements ISecurityAuditRepository {
   async initialize(): Promise<void> {}
 
   async append(entry: Omit<SecurityAuditEntry, 'id'>): Promise<SecurityAuditEntry> {
-    const created: SecurityAuditEntry = { ...entry, id: this.nextId++ };
+    const created: SecurityAuditEntry = {
+      timestamp: entry.timestamp,
+      action: entry.action,
+      actorRole: entry.actorRole,
+      deviceId: entry.deviceId,
+      outcome: entry.outcome,
+      details: entry.details,
+      origin: 'LOCAL',
+      importedAt: null,
+      importedFromDeviceId: null,
+      id: this.nextId++,
+    };
     this.entries = [created, ...this.entries];
     this.listeners.forEach((l) => l());
     return created;
   }
 
   async getAll(): Promise<SecurityAuditEntry[]> {
-    return [...this.entries];
+    return this.entries.map(normalizeAuditEntry);
   }
 
   async clear(): Promise<void> {
