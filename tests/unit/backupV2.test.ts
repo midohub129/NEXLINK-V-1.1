@@ -1,7 +1,24 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { executeRestoreWithPostCommitRecovery } from '../../src/application/container';
-import { SecurityError, StorageError, ValidationError } from '../../src/domain/errors/appError';
+import {
+  executeRestoreWithPostCommitRecovery,
+  type RestoreRecoveryDeps,
+} from '../../src/application/container';
+import { DeviceManager } from '../../src/application/devices/deviceManager';
+import { ErrorManager } from '../../src/application/errors/errorManager';
+import { HealthMonitor } from '../../src/application/health/healthMonitor';
+import { RotatingLogger } from '../../src/application/logging/loggerService';
+import { SecurityManager } from '../../src/application/security/securityManager';
+import { SettingsService } from '../../src/application/settings/settingsService';
+import { SyncEngine } from '../../src/application/sync/syncEngine';
+import {
+  AppError,
+  type ErrorSource,
+  SecurityError,
+  StorageError,
+  ValidationError,
+} from '../../src/domain/errors/appError';
+import type { ITransportClient } from '../../src/domain/interfaces/services';
 import {
   BACKUP_KDF_MAX_ITERATIONS,
   BACKUP_KDF_MIN_ITERATIONS,
@@ -14,15 +31,24 @@ import {
   type EncryptedBackupArchiveV2,
   type LegacyBackupArchiveV1,
 } from '../../src/domain/models/backup';
+import type { ConnectionState, PairingRequest } from '../../src/domain/models/device';
 import { DEFAULT_APP_SETTINGS } from '../../src/domain/models/settings';
 import { WebCryptoProvider } from '../../src/infrastructure/security/webCryptoProvider';
-import { APP_DB_VERSION, IndexedDbDatabase, STORES } from '../../src/infrastructure/storage/indexedDbDatabase';
+import {
+  APP_DB_VERSION,
+  IndexedDbDatabase,
+  STORES,
+} from '../../src/infrastructure/storage/indexedDbDatabase';
 import {
   IndexedDbAuditRepository,
   IndexedDbBackupProvider,
   IndexedDbDeviceRepository,
   IndexedDbSettingsRepository,
   IndexedDbSyncEventRepository,
+  InMemoryAuditRepository,
+  InMemoryDeviceRepository,
+  InMemorySettingsRepository,
+  InMemorySyncEventRepository,
 } from '../../src/infrastructure/storage/repositories';
 import { InMemoryIndexedDbHarness } from '../helpers/inMemoryIndexedDb';
 import { NodeTestCryptoProvider } from '../helpers/nodeCryptoProvider';
@@ -30,8 +56,12 @@ import { NodeTestCryptoProvider } from '../helpers/nodeCryptoProvider';
 const STRONG_PASSPHRASE = 'Correct-Backup-Passphrase-2026!';
 const WRONG_PASSPHRASE = 'Wrong-Backup-Passphrase-9999!';
 
-async function createRealWebCryptoStack(dbName: string, harness: InMemoryIndexedDbHarness) {
-  (globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = harness.createFactory();
+async function createRealWebCryptoStack(
+  dbName: string,
+  harness: InMemoryIndexedDbHarness
+) {
+  (globalThis as unknown as { indexedDB: IDBFactory }).indexedDB =
+    harness.createFactory();
   const crypto = new WebCryptoProvider();
   const db = new IndexedDbDatabase(dbName);
   await db.initialize();
@@ -204,8 +234,10 @@ describe('Encrypted Backup v2 Unit & Cryptographic Verification (Real WebCrypto 
 
     // 8. Wrong passphrase
     await assert.rejects(
-      () => stack.backup.restoreBackup(JSON.stringify(exported.archive), WRONG_PASSPHRASE),
-      (err: unknown) => err instanceof SecurityError && err.code === 'BACKUP_AUTH_FAILED'
+      () =>
+        stack.backup.restoreBackup(JSON.stringify(exported.archive), WRONG_PASSPHRASE),
+      (err: unknown) =>
+        err instanceof SecurityError && err.code === 'BACKUP_AUTH_FAILED'
     );
     await verifyDbUntouched();
 
@@ -216,7 +248,8 @@ describe('Encrypted Backup v2 Unit & Cryptographic Verification (Real WebCrypto 
     tamperedCipher.ciphertext = cipherBytes.toString('base64');
     await assert.rejects(
       () => stack.backup.restoreBackup(tamperedCipher, STRONG_PASSPHRASE),
-      (err: unknown) => err instanceof SecurityError && err.code === 'BACKUP_AUTH_FAILED'
+      (err: unknown) =>
+        err instanceof SecurityError && err.code === 'BACKUP_AUTH_FAILED'
     );
     await verifyDbUntouched();
 
@@ -225,7 +258,8 @@ describe('Encrypted Backup v2 Unit & Cryptographic Verification (Real WebCrypto 
     tamperedHeader.exportedAt += 1;
     await assert.rejects(
       () => stack.backup.restoreBackup(tamperedHeader, STRONG_PASSPHRASE),
-      (err: unknown) => err instanceof SecurityError && err.code === 'BACKUP_AUTH_FAILED'
+      (err: unknown) =>
+        err instanceof SecurityError && err.code === 'BACKUP_AUTH_FAILED'
     );
 
     // 10. Invalid IV length & invalid salt length
@@ -269,10 +303,7 @@ describe('Encrypted Backup v2 Unit & Cryptographic Verification (Real WebCrypto 
     };
     await assert.rejects(
       () =>
-        stack.backup.restoreBackup(
-          JSON.stringify(badFormatVersion),
-          STRONG_PASSPHRASE
-        ),
+        stack.backup.restoreBackup(JSON.stringify(badFormatVersion), STRONG_PASSPHRASE),
       (err: unknown) =>
         err instanceof ValidationError && err.code === 'UNSUPPORTED_BACKUP_VERSION'
     );
@@ -594,7 +625,9 @@ describe('Encrypted Backup v2 Unit & Cryptographic Verification (Real WebCrypto 
         syncStore.createIndex('by_status', 'status', { unique: false });
         syncStore.createIndex('by_createdAt', 'createdAt', { unique: false });
         syncStore.createIndex('by_idempotencyKey', 'idempotencyKey', { unique: true });
-        syncStore.createIndex('by_notificationKey', 'notificationKey', { unique: false });
+        syncStore.createIndex('by_notificationKey', 'notificationKey', {
+          unique: false,
+        });
 
         const auditStore = db.createObjectStore(STORES.SECURITY_AUDIT, {
           keyPath: 'id',
@@ -622,7 +655,9 @@ describe('Encrypted Backup v2 Unit & Cryptographic Verification (Real WebCrypto 
     const db = new IndexedDbDatabase(dbName);
     await db.initialize();
     const migrations = await db.getMigrations();
-    assert.ok(migrations.some((m) => m.version === 4 && m.name === 'v4_audit_origin_provenance'));
+    assert.ok(
+      migrations.some((m) => m.version === 4 && m.name === 'v4_audit_origin_provenance')
+    );
 
     const auditRepo = new IndexedDbAuditRepository(db);
     const migratedRows = await auditRepo.getAll();
@@ -635,7 +670,10 @@ describe('Encrypted Backup v2 Unit & Cryptographic Verification (Real WebCrypto 
 
   it('isolates legacy v1 migration from migrating device state, freezes pending events, and blocks forged identity replay', async () => {
     const harness = new InMemoryIndexedDbHarness();
-    const migratingStack = await createRealWebCryptoStack('db-v1-migrating-host', harness);
+    const migratingStack = await createRealWebCryptoStack(
+      'db-v1-migrating-host',
+      harness
+    );
     await migratingStack.deviceRepo.saveIdentity({
       publicId: 'host-migrator-id',
       cryptoKeyId: 'host-migrator-key',
@@ -810,9 +848,7 @@ describe('Encrypted Backup v2 Unit & Cryptographic Verification (Real WebCrypto 
       ).pairingState,
       'REVOKED'
     );
-    assert.ok(
-      inner.syncEvents.every((e: { status: string }) => e.status === 'FAILED')
-    );
+    assert.ok(inner.syncEvents.every((e: { status: string }) => e.status === 'FAILED'));
     assert.equal(inner.auditEntries[0].origin, undefined);
 
     // Restoring migrated v2 onto forged-target device MUST still treat as cross-device & preserve target role
@@ -911,7 +947,10 @@ describe('Encrypted Backup v2 Unit & Cryptographic Verification (Real WebCrypto 
     );
 
     // 4. Restore rejects atomically when existing local audits + archive audits > BACKUP_MAX_AUDIT_ENTRIES
-    const targetStack = await createRealWebCryptoStack('db-audit-limit-restore', harness);
+    const targetStack = await createRealWebCryptoStack(
+      'db-audit-limit-restore',
+      harness
+    );
     await targetStack.auditRepo.append({
       timestamp: 1700000000001,
       action: 'DEVICE_REVOKED',
@@ -934,7 +973,7 @@ describe('Encrypted Backup v2 Unit & Cryptographic Verification (Real WebCrypto 
     );
   });
 
-  it('isolates post-commit restore refresh/audit failures from pre-commit rollback errors and runs all independent recovery steps', async () => {
+  function createRecoveryHarness() {
     const baseIdentity = {
       publicId: 'rec-dev-1',
       cryptoKeyId: 'rec-key-1',
@@ -942,79 +981,41 @@ describe('Encrypted Backup v2 Unit & Cryptographic Verification (Real WebCrypto 
       ecdhPublicKeyJwk: null,
       createdAt: 1700000000000,
     };
-
-    // 1. Pre-commit failure restarts syncEngine and rethrows without post-commit warnings
-    let syncStopped = 0;
-    let syncStarted = 0;
-    let reloadCalled = 0;
-    await assert.rejects(
-      () =>
-        executeRestoreWithPostCommitRecovery({
-          restoreBackup: async () => {
-            throw new ValidationError(
-              'BACKUP_AUTH_FAILED',
-              'فشل التحقق من عبارة المرور.',
-              'wrong passphrase'
-            );
-          },
-          stopSyncEngine: async () => {
-            syncStopped += 1;
-          },
-          startSyncEngine: async () => {
-            syncStarted += 1;
-          },
-          reloadSettings: async () => {
-            reloadCalled += 1;
-            return { ...DEFAULT_APP_SETTINGS, role: 'admin' };
-          },
-          getSettingsSnapshot: () => ({ ...DEFAULT_APP_SETTINGS, role: 'admin' }),
-          setRelayBaseUrl: () => {},
-          initializeSecurity: async () => {},
-          startDeviceManager: async () => {},
-          getIdentity: () => baseIdentity,
-          fallbackIdentity: baseIdentity,
-          issueSession: () => {},
-          clearSession: () => {},
-          recordAudit: async () => {
-            throw new Error('should not run on pre-commit failure');
-          },
-          captureError: () => {},
-        }),
-      (err: unknown) =>
-        err instanceof ValidationError && err.code === 'BACKUP_AUTH_FAILED'
-    );
-    assert.equal(syncStopped, 1);
-    assert.equal(syncStarted, 1);
-    assert.equal(reloadCalled, 0);
-
-    // 2. Post-commit failures in settings/security/devices/sync/audit do NOT throw false rollback errors
-    // and all independent steps still execute
     const stepsExecuted: string[] = [];
-    const capturedMessages: string[] = [];
-    const result = await executeRestoreWithPostCommitRecovery({
-      restoreBackup: async () => ({
-        restoredEvents: 3,
-        restoredLinkedDevices: 1,
-        restoredAuditEntries: 2,
-        crossDeviceRestore: true,
-        restoredRole: 'admin',
-      }),
+    const capturedErrors: Array<{ err: unknown; scope: ErrorSource; message: string }> =
+      [];
+
+    const deps: RestoreRecoveryDeps = {
+      restoreBackup: async () => {
+        stepsExecuted.push('restoreBackup');
+        return {
+          restoredEvents: 3,
+          restoredLinkedDevices: 1,
+          restoredAuditEntries: 2,
+          crossDeviceRestore: true,
+          restoredRole: 'admin',
+        };
+      },
       stopSyncEngine: async () => {
         stepsExecuted.push('stopSync');
       },
       startSyncEngine: async () => {
         stepsExecuted.push('startSync');
-        throw new Error('sync start transient failure');
       },
       reloadSettings: async () => {
         stepsExecuted.push('reloadSettings');
-        throw new Error('settings cache reload failure');
+        return {
+          ...DEFAULT_APP_SETTINGS,
+          role: 'admin',
+          relayEndpoint: 'https://relay.example.test',
+        };
       },
       getSettingsSnapshot: () => ({ ...DEFAULT_APP_SETTINGS, role: 'admin' }),
-      setRelayBaseUrl: () => {},
+      setRelayBaseUrl: (url) => {
+        stepsExecuted.push(`setRelayBaseUrl:${url}`);
+      },
       initializeSecurity: async () => {
         stepsExecuted.push('initSecurity');
-        throw new Error('security init failure');
       },
       startDeviceManager: async () => {
         stepsExecuted.push('startDevices');
@@ -1029,25 +1030,308 @@ describe('Encrypted Backup v2 Unit & Cryptographic Verification (Real WebCrypto 
       },
       recordAudit: async () => {
         stepsExecuted.push('recordAudit');
-        throw new Error('audit write failure');
+        return {
+          id: 1,
+          timestamp: Date.now(),
+          action: 'BACKUP_RESTORED',
+          actorRole: 'admin',
+          deviceId: baseIdentity.publicId,
+          outcome: 'ALLOWED',
+          details: 'restored',
+        };
       },
-      captureError: (_err, _scope, msg) => {
-        capturedMessages.push(msg);
+      captureError: (err, scope, message) => {
+        capturedErrors.push({ err, scope, message });
       },
-    });
+    };
+
+    return { deps, stepsExecuted, capturedErrors };
+  }
+
+  it('aborts before restoreBackup when stopSyncEngine fails, attempts operational restart, logs error, and returns no success', async () => {
+    // 1A. stopSyncEngine fails, operational restart succeeds
+    const h1 = createRecoveryHarness();
+    let restoreCalled = 0;
+    h1.deps.stopSyncEngine = async () => {
+      h1.stepsExecuted.push('stopSync:fail');
+      throw new Error('partial stop failure');
+    };
+    h1.deps.restoreBackup = async () => {
+      restoreCalled += 1;
+      throw new Error('restoreBackup must not be called');
+    };
+
+    await assert.rejects(
+      () => executeRestoreWithPostCommitRecovery(h1.deps),
+      (err: unknown) => err instanceof Error && err.message === 'partial stop failure'
+    );
+    assert.equal(restoreCalled, 0);
+    assert.deepEqual(h1.stepsExecuted, ['stopSync:fail', 'startSync']);
+    assert.equal(h1.capturedErrors.length, 1);
+    assert.equal(h1.capturedErrors[0].scope, 'SYNC');
+    assert.match(h1.capturedErrors[0].message, /لم تبدأ عملية الاستعادة/);
+
+    // 1B. stopSyncEngine fails AND operational restart ALSO fails
+    const h2 = createRecoveryHarness();
+    h2.deps.stopSyncEngine = async () => {
+      h2.stepsExecuted.push('stopSync:fail');
+      throw new Error('stop timeout');
+    };
+    h2.deps.startSyncEngine = async () => {
+      h2.stepsExecuted.push('startSync:fail');
+      throw new Error('restart rejected');
+    };
+    h2.deps.restoreBackup = async () => {
+      restoreCalled += 1;
+      throw new Error('restoreBackup must not be called');
+    };
+
+    await assert.rejects(
+      () => executeRestoreWithPostCommitRecovery(h2.deps),
+      (err: unknown) =>
+        err instanceof AppError &&
+        err.code === 'BACKUP_RESTORE_SYNC_STOP_AND_RESTART_FAILED' &&
+        err.source === 'SYNC' &&
+        err.cause instanceof Error &&
+        err.cause.message === 'stop timeout' &&
+        err.userMessage.includes('لم تُنفّذ عملية الاستعادة')
+    );
+    assert.equal(restoreCalled, 0);
+    assert.deepEqual(h2.stepsExecuted, ['stopSync:fail', 'startSync:fail']);
+    assert.equal(h2.capturedErrors.length, 2);
+    assert.equal(h2.capturedErrors[0].scope, 'SYNC');
+    assert.equal(h2.capturedErrors[1].scope, 'SYNC');
+  });
+
+  it('rethrows exact original error and skips post-commit steps when restoreBackup fails and startSyncEngine recovers', async () => {
+    const h = createRecoveryHarness();
+    const originalErr = new ValidationError(
+      'BACKUP_AUTH_FAILED',
+      'فشل التحقق من عبارة المرور.',
+      'wrong passphrase'
+    );
+    h.deps.restoreBackup = async () => {
+      h.stepsExecuted.push('restoreBackup:fail');
+      throw originalErr;
+    };
+
+    await assert.rejects(
+      () => executeRestoreWithPostCommitRecovery(h.deps),
+      (err: unknown) => err === originalErr
+    );
+    assert.deepEqual(h.stepsExecuted, ['stopSync', 'restoreBackup:fail', 'startSync']);
+    assert.equal(h.capturedErrors.length, 0);
+  });
+
+  it('records restart failure under SYNC without swallowing either error and preserves original restore error when both restoreBackup and startSyncEngine fail', async () => {
+    const h = createRecoveryHarness();
+    const originalErr = new ValidationError(
+      'BACKUP_AUTH_FAILED',
+      'فشل التحقق من عبارة المرور أو سلامة النسخة.',
+      'gcm tag mismatch'
+    );
+    const restartErr = new Error('indexeddb closed during restart');
+    h.deps.restoreBackup = async () => {
+      h.stepsExecuted.push('restoreBackup:fail');
+      throw originalErr;
+    };
+    h.deps.startSyncEngine = async () => {
+      h.stepsExecuted.push('startSync:fail');
+      throw restartErr;
+    };
+
+    await assert.rejects(
+      () => executeRestoreWithPostCommitRecovery(h.deps),
+      (err: unknown) => {
+        if (!(err instanceof AppError)) return false;
+        return (
+          err.code === 'BACKUP_AUTH_FAILED' &&
+          err.source === 'VALIDATION' &&
+          err.cause === originalErr &&
+          err.context?.originalError === originalErr &&
+          err.context?.syncRestartError === restartErr &&
+          err.context?.syncEngineRestartFailed === true &&
+          err.userMessage.includes('فشل التحقق من عبارة المرور') &&
+          err.userMessage.includes('تعذّر إعادة تشغيل محرك المزامنة') &&
+          err.message.includes('gcm tag mismatch') &&
+          err.message.includes('indexeddb closed during restart')
+        );
+      }
+    );
+
+    assert.deepEqual(h.stepsExecuted, [
+      'stopSync',
+      'restoreBackup:fail',
+      'startSync:fail',
+    ]);
+    assert.equal(h.capturedErrors.length, 1);
+    assert.equal(h.capturedErrors[0].scope, 'SYNC');
+    assert.equal(h.capturedErrors[0].err, restartErr);
+    assert.match(h.capturedErrors[0].message, /فشلت استعادة النسخة الاحتياطية/);
+    assert.match(h.capturedErrors[0].message, /تعذّر إعادة تشغيل محرك المزامنة/);
+  });
+
+  it('completes normal stop -> restore -> service refreshes -> startSyncEngine flow in exact order', async () => {
+    const h = createRecoveryHarness();
+
+    const result = await executeRestoreWithPostCommitRecovery(h.deps);
 
     assert.equal(result.restoredEvents, 3);
     assert.equal(result.restoredRole, 'admin');
-    assert.deepEqual(stepsExecuted, [
+    assert.equal(result.syncEngineRunning, true);
+    assert.equal(result.postRestoreWarnings, undefined);
+    assert.equal(h.capturedErrors.length, 0);
+    assert.deepEqual(h.stepsExecuted, [
       'stopSync',
+      'restoreBackup',
       'reloadSettings',
+      'setRelayBaseUrl:https://relay.example.test',
       'initSecurity',
       'startDevices',
       'startSync',
       'issueSession',
       'recordAudit',
     ]);
+  });
+
+  it('keeps committed restore result on post-commit failures, emits real warnings, and never claims SyncEngine is healthy/running when restart fails', async () => {
+    const h = createRecoveryHarness();
+    h.deps.startSyncEngine = async () => {
+      h.stepsExecuted.push('startSync:fail');
+      throw new Error('sync start transient failure');
+    };
+    h.deps.reloadSettings = async () => {
+      h.stepsExecuted.push('reloadSettings:fail');
+      throw new Error('settings cache reload failure');
+    };
+    h.deps.initializeSecurity = async () => {
+      h.stepsExecuted.push('initSecurity:fail');
+      throw new Error('security init failure');
+    };
+    h.deps.recordAudit = async () => {
+      h.stepsExecuted.push('recordAudit:fail');
+      throw new Error('audit write failure');
+    };
+
+    const result = await executeRestoreWithPostCommitRecovery(h.deps);
+
+    assert.equal(result.restoredEvents, 3);
+    assert.equal(result.restoredRole, 'admin');
+    assert.equal(result.syncEngineRunning, false);
+    assert.deepEqual(h.stepsExecuted, [
+      'stopSync',
+      'restoreBackup',
+      'reloadSettings:fail',
+      'initSecurity:fail',
+      'startDevices',
+      'startSync:fail',
+      'issueSession',
+      'recordAudit:fail',
+    ]);
     assert.equal(result.postRestoreWarnings?.length, 4);
-    assert.equal(capturedMessages.length, 4);
+    assert.ok(
+      result.postRestoreWarnings?.some(
+        (w) => w.includes('محرك المزامنة') && w.includes('متوقف')
+      )
+    );
+    assert.equal(h.capturedErrors.length, 4);
+    assert.ok(h.capturedErrors.some((c) => c.scope === 'SYNC'));
+
+    // Also verify real SyncEngine + HealthMonitor never report HEALTHY when start() fails
+    // even if SYNCED events already exist in local repository
+    const logger = new RotatingLogger();
+    const errorManager = new ErrorManager(logger);
+    const crypto = new NodeTestCryptoProvider();
+    const settings = new SettingsService(new InMemorySettingsRepository(), logger);
+    await settings.initialize();
+    const security = new SecurityManager(crypto, new InMemoryAuditRepository(), logger);
+    const transport: ITransportClient = {
+      getState: (): ConnectionState => 'CONNECTED',
+      getServerSession: () => null,
+      getLastSuccessfulConnectionAt: () => Date.now(),
+      connect: async () => {},
+      disconnect: async () => {},
+      revokeServerSession: async () => {},
+      createPairingRequest: async (): Promise<PairingRequest> => {
+        throw new Error('unused');
+      },
+      acceptPairingRequest: async (): Promise<PairingRequest> => {
+        throw new Error('unused');
+      },
+      confirmPairingRequest: async () => null,
+      fetchPendingPairingApprovals: async () => [],
+      fetchLinkedDevices: async () => [],
+      revokeDeviceLink: async () => {},
+      sendSyncBatch: async () => ({
+        acknowledged: true,
+        acceptedIds: [],
+        duplicateIds: [],
+        serverTimestamp: Date.now(),
+      }),
+      fetchInboundEvents: async () => [],
+      acknowledgeInboundDelivery: async () => {},
+      fetchSyncDeliveryStatus: async () => [],
+      subscribe: () => () => {},
+      subscribeEvents: () => () => {},
+      subscribeDeliveryAcks: () => () => {},
+      subscribePairingUpdates: () => () => {},
+    };
+    const devices = new DeviceManager({
+      deviceRepo: new InMemoryDeviceRepository(),
+      crypto,
+      transport,
+      security,
+      settings,
+      logger,
+    });
+    let failStart = false;
+    class FailingStartSyncRepo extends InMemorySyncEventRepository {
+      override async initialize(): Promise<void> {
+        if (failStart) {
+          throw new Error('sync repo initialize failed');
+        }
+        await super.initialize();
+      }
+    }
+    const flakyRepo = new FailingStartSyncRepo();
+    const created = await flakyRepo.insert({
+      type: 'NOTIFICATION',
+      payload: 'cipher',
+      idempotencyKey: 'evt-synced-1',
+      notificationKey: 'notif-1',
+      payloadHash: 'hash-1',
+      e2eeProtected: true,
+      e2eeVerified: true,
+      e2eeNonce: 'nonce-1',
+    });
+    await flakyRepo.updateEvent(created.id, { status: 'SYNCED', syncedAt: Date.now() });
+
+    const syncEngine = new SyncEngine({
+      repo: flakyRepo,
+      transport,
+      crypto,
+      security,
+      settings,
+      devices,
+      logger,
+    });
+    const healthMonitor = new HealthMonitor({
+      syncEngine,
+      transport,
+      errorManager,
+    });
+
+    await syncEngine.start();
+    assert.equal(syncEngine.getLifecycleState(), 'RUNNING');
+    assert.equal(healthMonitor.getSnapshot().syncStatus, 'HEALTHY');
+
+    await syncEngine.stop();
+    assert.equal(syncEngine.getLifecycleState(), 'STOPPED');
+    assert.notEqual(healthMonitor.getSnapshot().syncStatus, 'HEALTHY');
+
+    failStart = true;
+    await assert.rejects(() => syncEngine.start(), /sync repo initialize failed/);
+    assert.equal(syncEngine.getLifecycleState(), 'ERROR');
+    assert.equal(healthMonitor.getSnapshot().syncStatus, 'UNAVAILABLE');
   });
 });

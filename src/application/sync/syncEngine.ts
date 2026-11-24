@@ -88,6 +88,7 @@ export class SyncEngine implements ILifecycleParticipant {
   private unsubTransportState: (() => void) | null = null;
   private lastTransportState = 'DISCONNECTED';
   private pullInFlight: Promise<number> | null = null;
+  private lifecycleState: 'IDLE' | 'RUNNING' | 'STOPPED' | 'ERROR' = 'IDLE';
 
   constructor(deps: {
     repo: ISyncEventRepository;
@@ -108,52 +109,59 @@ export class SyncEngine implements ILifecycleParticipant {
   }
 
   async start(): Promise<void> {
-    await this.repo.initialize();
-    const recoveredCount = await this.repo.resetInProgressToPending();
-    if (recoveredCount > 0) {
-      this.logger.warn(
-        'SYNC',
-        'تمت استعادة أحداث غير مؤكدة إلى PENDING بعد إعادة التشغيل لضمان عدم الفقدان',
-        { recoveredCount }
-      );
-    }
-
-    this.eventsCache = await this.repo.getAll();
-    this.seenE2eeNonces.clear();
-    for (const evt of this.eventsCache) {
-      if (evt.e2eeNonce) {
-        this.seenE2eeNonces.add(evt.e2eeNonce);
+    try {
+      await this.repo.initialize();
+      const recoveredCount = await this.repo.resetInProgressToPending();
+      if (recoveredCount > 0) {
+        this.logger.warn(
+          'SYNC',
+          'تمت استعادة أحداث غير مؤكدة إلى PENDING بعد إعادة التشغيل لضمان عدم الفقدان',
+          { recoveredCount }
+        );
       }
-    }
-    this.lastTransportState = this.transport.getState();
 
-    if (!this.unsubInbound) {
-      this.unsubInbound = this.transport.subscribeEvents((remoteEvent) => {
-        void this.ingestInboundEvent(remoteEvent);
-      });
-    }
-
-    if (!this.unsubDeliveryAcks) {
-      this.unsubDeliveryAcks = this.transport.subscribeDeliveryAcks(
-        (clientEventIds, serverTimestamp) => {
-          void this.handleDeliveryAcks(clientEventIds, serverTimestamp);
+      this.eventsCache = await this.repo.getAll();
+      this.seenE2eeNonces.clear();
+      for (const evt of this.eventsCache) {
+        if (evt.e2eeNonce) {
+          this.seenE2eeNonces.add(evt.e2eeNonce);
         }
-      );
-    }
+      }
+      this.lastTransportState = this.transport.getState();
 
-    if (!this.unsubTransportState) {
-      this.unsubTransportState = this.transport.subscribe(() => {
-        const nextState = this.transport.getState();
-        const prevState = this.lastTransportState;
-        this.lastTransportState = nextState;
-        if (nextState === 'CONNECTED' && prevState !== 'CONNECTED') {
-          const isReconnect = prevState === 'RECONNECTING' || prevState === 'ERROR';
-          void this.handleTransportConnected(isReconnect);
-        }
-      });
-    }
+      if (!this.unsubInbound) {
+        this.unsubInbound = this.transport.subscribeEvents((remoteEvent) => {
+          void this.ingestInboundEvent(remoteEvent);
+        });
+      }
 
-    this.notify();
+      if (!this.unsubDeliveryAcks) {
+        this.unsubDeliveryAcks = this.transport.subscribeDeliveryAcks(
+          (clientEventIds, serverTimestamp) => {
+            void this.handleDeliveryAcks(clientEventIds, serverTimestamp);
+          }
+        );
+      }
+
+      if (!this.unsubTransportState) {
+        this.unsubTransportState = this.transport.subscribe(() => {
+          const nextState = this.transport.getState();
+          const prevState = this.lastTransportState;
+          this.lastTransportState = nextState;
+          if (nextState === 'CONNECTED' && prevState !== 'CONNECTED') {
+            const isReconnect = prevState === 'RECONNECTING' || prevState === 'ERROR';
+            void this.handleTransportConnected(isReconnect);
+          }
+        });
+      }
+
+      this.lifecycleState = 'RUNNING';
+      this.notify();
+    } catch (err) {
+      this.lifecycleState = 'ERROR';
+      this.notify();
+      throw err;
+    }
   }
 
   private async handleTransportConnected(isReconnect: boolean): Promise<void> {
@@ -165,21 +173,30 @@ export class SyncEngine implements ILifecycleParticipant {
   }
 
   async stop(): Promise<void> {
-    if (this.unsubInbound) {
-      this.unsubInbound();
-      this.unsubInbound = null;
+    try {
+      if (this.unsubInbound) {
+        this.unsubInbound();
+        this.unsubInbound = null;
+      }
+      if (this.unsubDeliveryAcks) {
+        this.unsubDeliveryAcks();
+        this.unsubDeliveryAcks = null;
+      }
+      if (this.unsubTransportState) {
+        this.unsubTransportState();
+        this.unsubTransportState = null;
+      }
+      this.isProcessing = false;
+      this.pullInFlight = null;
+      this.lifecycleState = 'STOPPED';
+      this.notify();
+    } catch (err) {
+      this.isProcessing = false;
+      this.pullInFlight = null;
+      this.lifecycleState = 'ERROR';
+      this.notify();
+      throw err;
     }
-    if (this.unsubDeliveryAcks) {
-      this.unsubDeliveryAcks();
-      this.unsubDeliveryAcks = null;
-    }
-    if (this.unsubTransportState) {
-      this.unsubTransportState();
-      this.unsubTransportState = null;
-    }
-    this.isProcessing = false;
-    this.pullInFlight = null;
-    this.notify();
   }
 
   getEvents(): SyncEvent[] {
@@ -196,6 +213,10 @@ export class SyncEngine implements ILifecycleParticipant {
 
   isSyncRunning(): boolean {
     return this.isProcessing;
+  }
+
+  getLifecycleState(): 'IDLE' | 'RUNNING' | 'STOPPED' | 'ERROR' {
+    return this.lifecycleState;
   }
 
   private resolveTargetPeer(): LinkedDevice | null {

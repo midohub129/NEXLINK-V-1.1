@@ -1,4 +1,4 @@
-import type { ErrorSource } from '../domain/errors/appError';
+import { AppError, type ErrorSource } from '../domain/errors/appError';
 import type { IBackupProvider } from '../domain/interfaces/repositories';
 import type { IDataSource, ILifecycleParticipant } from '../domain/interfaces/services';
 import type {
@@ -88,32 +88,141 @@ export interface RestoreRecoveryDeps {
   captureError: (err: unknown, scope: ErrorSource, userMessage: string) => void;
 }
 
+function describeRestoreError(err: unknown): string {
+  if (err instanceof AppError) {
+    return err.userMessage || err.message || err.code;
+  }
+  if (err instanceof Error) {
+    return err.message || err.name;
+  }
+  return String(err ?? 'Unknown error');
+}
+
 /**
  * Executes backup restore with strict separation between:
  * 1) Pre-commit validation/decryption + atomic IndexedDB commit.
  * 2) Post-commit in-memory service refreshes & audit logging.
  *
- * Once restoreBackup() commits, subsequent refresh failures NEVER masquerade as a
- * failed/rolled-back restore and never short-circuit remaining service refreshes.
+ * Pre-commit invariants:
+ * - If stopSyncEngine() fails, restoreBackup() NEVER starts; operational
+ *   startSyncEngine() recovery is attempted cleanly without swallowing errors.
+ * - If restoreBackup() fails, startSyncEngine() failure is NEVER swallowed;
+ *   it is captured under 'SYNC' and surfaced alongside the preserved original
+ *   restore failure.
+ *
+ * Post-commit invariants:
+ * - Once restoreBackup() commits, subsequent refresh failures NEVER masquerade
+ *   as a failed/rolled-back restore and never short-circuit remaining refreshes.
+ * - SyncEngine is never reported as running if startSyncEngine() fails.
  */
 export async function executeRestoreWithPostCommitRecovery(
   deps: RestoreRecoveryDeps
 ): Promise<BackupRestoreResult> {
-  let result: BackupRestoreResult;
   try {
     await deps.stopSyncEngine();
   } catch (stopErr) {
-    deps.captureError(stopErr, 'SYNC', 'تعذّر إيقاف محرك المزامنة مؤقتاً قبل الاستعادة.');
+    deps.captureError(
+      stopErr,
+      'SYNC',
+      'تعذّر إيقاف محرك المزامنة مؤقتاً قبل الاستعادة، لذلك لم تبدأ عملية الاستعادة.'
+    );
+
+    let restartErr: unknown = null;
+    try {
+      await deps.startSyncEngine();
+    } catch (recoverErr) {
+      restartErr = recoverErr;
+      deps.captureError(
+        recoverErr,
+        'SYNC',
+        `تعذّر إيقاف محرك المزامنة قبل الاستعادة، كما فشلت محاولة استعادة تشغيله (${describeRestoreError(recoverErr)}).`
+      );
+    }
+
+    if (restartErr !== null) {
+      throw new AppError({
+        code: 'BACKUP_RESTORE_SYNC_STOP_AND_RESTART_FAILED',
+        source: 'SYNC',
+        userMessage: `تعذّر إيقاف محرك المزامنة قبل بدء الاستعادة (${describeRestoreError(stopErr)})، كما تعذّرت إعادة تشغيله (${describeRestoreError(restartErr)}). لم تُنفّذ عملية الاستعادة.`,
+        technicalMessage: `Restore aborted before execution because stopSyncEngine failed (${describeRestoreError(stopErr)}); operational startSyncEngine recovery also failed (${describeRestoreError(restartErr)})`,
+        retryable: false,
+        cause: stopErr,
+        context: {
+          stopError: stopErr,
+          syncRestartError: restartErr,
+          syncEngineRestartFailed: true,
+        },
+      });
+    }
+
+    if (stopErr instanceof Error) {
+      throw stopErr;
+    }
+
+    throw new AppError({
+      code: 'BACKUP_RESTORE_SYNC_STOP_FAILED',
+      source: 'SYNC',
+      userMessage: `تعذّر إيقاف محرك المزامنة مؤقتاً (${describeRestoreError(stopErr)})، لذلك لم تبدأ عملية الاستعادة.`,
+      technicalMessage: `Restore aborted before execution because stopSyncEngine failed: ${describeRestoreError(stopErr)}`,
+      retryable: false,
+      cause: stopErr,
+    });
   }
 
+  let result: BackupRestoreResult;
   try {
     result = await deps.restoreBackup();
   } catch (preCommitErr) {
-    await deps.startSyncEngine().catch(() => {});
+    let restartErr: unknown = null;
+    try {
+      await deps.startSyncEngine();
+    } catch (syncRestartErr) {
+      restartErr = syncRestartErr;
+      deps.captureError(
+        syncRestartErr,
+        'SYNC',
+        `فشلت استعادة النسخة الاحتياطية (${describeRestoreError(preCommitErr)})، كما تعذّر إعادة تشغيل محرك المزامنة (${describeRestoreError(syncRestartErr)}).`
+      );
+    }
+
+    if (restartErr !== null) {
+      if (preCommitErr instanceof AppError) {
+        throw new AppError({
+          code: preCommitErr.code,
+          source: preCommitErr.source,
+          userMessage: `${preCommitErr.userMessage} بالإضافة إلى ذلك، تعذّر إعادة تشغيل محرك المزامنة (${describeRestoreError(restartErr)}).`,
+          technicalMessage: `${preCommitErr.message} | SyncEngine restart failed: ${describeRestoreError(restartErr)}`,
+          retryable: preCommitErr.retryable,
+          cause: preCommitErr,
+          context: {
+            ...(preCommitErr.context ?? {}),
+            originalError: preCommitErr,
+            syncRestartError: restartErr,
+            syncEngineRestartFailed: true,
+          },
+        });
+      }
+
+      throw new AppError({
+        code: 'BACKUP_RESTORE_AND_SYNC_RESTART_FAILED',
+        source: 'STORAGE',
+        userMessage: `فشلت استعادة النسخة الاحتياطية (${describeRestoreError(preCommitErr)})، كما تعذّر إعادة تشغيل محرك المزامنة (${describeRestoreError(restartErr)}).`,
+        technicalMessage: `Restore failed (${describeRestoreError(preCommitErr)}) | SyncEngine restart failed (${describeRestoreError(restartErr)})`,
+        retryable: false,
+        cause: preCommitErr,
+        context: {
+          originalError: preCommitErr,
+          syncRestartError: restartErr,
+          syncEngineRestartFailed: true,
+        },
+      });
+    }
+
     throw preCommitErr;
   }
 
   const postRestoreWarnings: string[] = [];
+  let syncEngineRunning = false;
   let restoredSettings = deps.getSettingsSnapshot();
 
   try {
@@ -152,13 +261,14 @@ export async function executeRestoreWithPostCommitRecovery(
 
   try {
     await deps.startSyncEngine();
+    syncEngineRunning = true;
   } catch (err) {
     deps.captureError(
       err,
       'SYNC',
       'تمت استعادة البيانات في قاعدة البيانات، لكن تعذّر إعادة تشغيل محرك المزامنة.'
     );
-    postRestoreWarnings.push('تعذّر إعادة تشغيل محرك المزامنة.');
+    postRestoreWarnings.push('تعذّر إعادة تشغيل محرك المزامنة (المحرك متوقف حالياً).');
   }
 
   const currentIdentity = deps.getIdentity() ?? deps.fallbackIdentity;
@@ -201,7 +311,11 @@ export async function executeRestoreWithPostCommitRecovery(
     postRestoreWarnings.push('تعذّر تسجيل حدث BACKUP_RESTORED في سجل التدقيق.');
   }
 
-  return postRestoreWarnings.length > 0 ? { ...result, postRestoreWarnings } : result;
+  return {
+    ...result,
+    syncEngineRunning,
+    ...(postRestoreWarnings.length > 0 ? { postRestoreWarnings } : {}),
+  };
 }
 
 export function createAppContainer(): AppContainer {

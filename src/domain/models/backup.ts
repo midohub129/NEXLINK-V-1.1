@@ -129,6 +129,7 @@ export interface BackupRestoreResult {
   crossDeviceRestore: boolean;
   restoredRole: DeviceRole | null;
   postRestoreWarnings?: string[];
+  syncEngineRunning?: boolean;
 }
 
 export function buildEncryptedBackupAad(header: {

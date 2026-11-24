@@ -276,6 +276,12 @@ export function ActionModal({
     : null;
 
   const formatBackupError = (err: unknown): string => {
+    if (err instanceof AppError && err.context?.syncEngineRestartFailed === true) {
+      const baseCause = err.cause;
+      const baseMessage =
+        baseCause instanceof AppError ? formatBackupError(baseCause) : err.userMessage;
+      return `${baseMessage} بالإضافة إلى ذلك، تعذّر إعادة تشغيل محرك المزامنة (المحرك متوقف حالياً).`;
+    }
     if (err instanceof AppError) {
       switch (err.code) {
         case 'BACKUP_CORRUPT_JSON':
@@ -1286,14 +1292,20 @@ export function ActionModal({
                         );
                         setRestorePolicyConfirmed(false);
                         setStatusMessage(
-                          `تمت الاستعادة الآمنة (${result.restoredEvents} حدث، ${result.restoredLinkedDevices} جهاز بحالة غير موثوقة، ${result.restoredAuditEntries} سجل مستورد). تم الحفاظ على هوية هذا الجهاز ومفاتيحه ودوره المحلي.`
+                          result.syncEngineRunning === false
+                            ? `تم حفظ البيانات المستعادة في قاعدة البيانات (${result.restoredEvents} حدث، ${result.restoredLinkedDevices} جهاز بحالة غير موثوقة، ${result.restoredAuditEntries} سجل مستورد)، لكن محرك المزامنة متوقف حالياً.`
+                            : `تمت الاستعادة الآمنة (${result.restoredEvents} حدث، ${result.restoredLinkedDevices} جهاز بحالة غير موثوقة، ${result.restoredAuditEntries} سجل مستورد). تم الحفاظ على هوية هذا الجهاز ومفاتيحه ودوره المحلي.`
                         );
                         if (
-                          result.postRestoreWarnings &&
-                          result.postRestoreWarnings.length > 0
+                          (result.postRestoreWarnings &&
+                            result.postRestoreWarnings.length > 0) ||
+                          result.syncEngineRunning === false
                         ) {
+                          const warnings = result.postRestoreWarnings ?? [
+                            'تعذّر إعادة تشغيل محرك المزامنة (المحرك متوقف حالياً).',
+                          ];
                           setErrorMessage(
-                            `تم حفظ البيانات المستعادة في قاعدة البيانات بنجاح، لكن تعذّر تحديث بعض الخدمات في الذاكرة (${result.postRestoreWarnings.join(' ')}). يُنصح بإعادة تحميل التطبيق.`
+                            `تم حفظ البيانات المستعادة في قاعدة البيانات بنجاح، لكن تعذّر تحديث بعض الخدمات في الذاكرة (${warnings.join(' ')}). يُنصح بإعادة تحميل التطبيق.`
                           );
                         }
                       } finally {

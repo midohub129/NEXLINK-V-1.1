@@ -41,12 +41,17 @@ export class HealthMonitor {
       ? 'HEALTHY'
       : 'UNAVAILABLE';
 
+    const syncLifecycle = this.syncEngine.getLifecycleState();
     let syncStatus: SubsystemStatus = 'IDLE';
-    if (failedCount > 0 && pendingCount === 0) {
+    if (syncLifecycle === 'ERROR') {
+      syncStatus = 'UNAVAILABLE';
+    } else if (syncLifecycle === 'STOPPED') {
+      syncStatus = failedCount > 0 ? 'DEGRADED' : 'IDLE';
+    } else if (failedCount > 0 && pendingCount === 0) {
       syncStatus = 'DEGRADED';
     } else if (this.syncEngine.isSyncRunning() || pendingCount > 0) {
       syncStatus = transportStatus === 'CONNECTED' ? 'HEALTHY' : 'DEGRADED';
-    } else if (syncedCount > 0) {
+    } else if (syncedCount > 0 && syncLifecycle === 'RUNNING') {
       syncStatus = 'HEALTHY';
     }
 

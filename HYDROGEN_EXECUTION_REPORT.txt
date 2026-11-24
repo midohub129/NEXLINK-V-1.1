@@ -252,3 +252,117 @@
    - تأكيد صريح: لم يتم تنفيذ أي git commit أو git push أو merge أو PR أو تشغيل
      يدوي لـ CI، والتنفيذ للمهام 1–4 انتهى محلياً بانتظار موافقتك التالية.
 ================================================================================
+
+================================================================================
+التقرير 5: مهمة تصحيح مركزة — مراجعة وإصلاح دورة حياة SyncEngine أثناء استعادة النسخ الاحتياطية
+================================================================================
+
+1. فحص الحالة قبل التنفيذ:
+   - فحص مستودع Git داخل بيئة الحاوية (/app/applet):
+     أمر: `git status --short && git branch --show-current && git rev-parse HEAD`
+     النتيجة الفعلية: `fatal: not a git repository (or any of the parent directories): .git`
+     (بيئة حاوية AI Studio لا تتضمن مجلد `.git`؛ لذلك تعذر التحقق التشفيري لـ
+     `HEAD` والفرع مقارنةً بالمرجع `0d2aeff90a7371aff49634ff4bc82a025468ae72`).
+   - التحقق الفعلي من حالة الملفات المحلية:
+     بفحص `src/application/container.ts` (الأسطر 99–205) و`tests/unit/backupV2.test.ts`
+     (الأسطر 937–1053) و`HYDROGEN_EXECUTION_REPORT.txt` قبل التعديل، ثبت أن
+     الشيفرة المحلية تطابق تماماً حالة ما بعد إغلاق المهام 1–4 وأن الخللين
+     المرصودين في المراجعة المستقلة كانا موجودين حرفياً دون تعديلات متعارضة من
+     المستخدم.
+
+2. سبب الخلل (السببان الجذريان):
+   أ) المشكلة الأولى — الاستمرار في الاستعادة بعد فشل `stopSyncEngine`:
+      في `src/application/container.ts` داخل `executeRestoreWithPostCommitRecovery`
+      (سابقاً الأسطر 103–107)، كانت الدالة تلتقط خطأ `await deps.stopSyncEngine()`
+      وتسجّله عبر `captureError` فقط ثم تتابع تنفيذ `await deps.restoreBackup()`
+      رغم عدم ضمان توقف محرك المزامنة، مما يفتح نافذة لتداخل المزامنة مع
+      استبدال قاعدة البيانات.
+   ب) المشكلة الثانية — ابتلاع فشل إعادة تشغيل `SyncEngine` وحالته الصحية:
+      - في مسار ما قبل الالتزام (`catch (preCommitErr)` سابقاً السطر 112)، كان
+        الكود ينفذ `await deps.startSyncEngine().catch(() => {});` مما يبتلع
+        فشل إعادة تشغيل المحرك تماماً دون تسجيل في `ErrorManager` ودون إبلاغ
+        المستخدم.
+      - في مسار عرض الحالة، لم يكن `SyncEngine` يتتبع حالة دورة حياته
+        (`IDLE | RUNNING | STOPPED | ERROR`)، فكان `HealthMonitor.getSnapshot()`
+        يمكن أن يعيد `syncStatus = 'HEALTHY'` عند وجود أحداث `SYNCED` سابقة حتى
+        لو فشل `syncEngine.start()` أو كان متوقفاً؛ كما كان `formatBackupError`
+        في `ActionModal.tsx` يحول خطأ `BACKUP_AUTH_FAILED` إلى نص ثابت يطمس أي
+        تفصيل مرفق عن فشل إعادة تشغيل `SyncEngine`.
+
+3. الملفات والأسطر المعدلة (وسبب كل ملف):
+   - `src/application/container.ts` (نطاق المهمة الأساسي — الأسطر 1، 91–321):
+     * استيراد `AppError` وإضافة `describeRestoreError` (الأسطر 91–99).
+     * تحديث `executeRestoreWithPostCommitRecovery` (الأسطر 118–321):
+       1) عند فشل `stopSyncEngine()` (الأسطر 121–170): تسجيل الخطأ بمصدر `'SYNC'`
+          مع رسالة صريحة بأن الاستعادة لم تبدأ، وعدم استدعاء `restoreBackup()` أو
+          أي خطوة Post-commit إطلاقاً، ومحاولة إعادة تشغيل المحرك (`startSyncEngine`)
+          لمعالجة التوقف الجزئي. إذا نجحت إعادة التشغيل يُعاد رمي خطأ الإيقاف
+          الأصلي؛ وإذا فشلت أيضاً يُسجّل فشل إعادة التشغيل بمصدر `'SYNC'` ويُرمى
+          `AppError` برمز `BACKUP_RESTORE_SYNC_STOP_AND_RESTART_FAILED` يحمل
+          `cause: stopErr` وتفاصيل الفشلين معاً دون أي إيحاء بحدوث استعادة.
+       2) عند فشل `restoreBackup()` (الأسطر 173–222): إزالة `.catch(() => {})`
+          نهائياً واستبدالها بمحاولة `startSyncEngine()` داخل `try/catch`. إذا
+          نجحت إعادة التشغيل يُعاد رمي `preCommitErr` الأصلي كما هو دون تعديل.
+          وإذا فشلت إعادة التشغيل تُسجّل بمصدر `'SYNC'` عبر `captureError` ويُرمى
+          `AppError` يحافظ على `code` و`source` الخاصين بـ `preCommitErr` ويثبت
+          `cause: preCommitErr` و`context: { originalError, syncRestartError, syncEngineRestartFailed: true }`
+          مع نص تشخيصي يذكر فشل الاستعادة وفشل إعادة تشغيل المحرك معاً.
+       3) في مسار Post-commit (الأسطر 225، 262–272، 315–320): تتبع
+          `syncEngineRunning` بحيث تكون `false` إذا فشل `startSyncEngine()`
+          و`true` فقط عند نجاحه، وإعادتها ضمن نتيجة الاستعادة مع
+          `postRestoreWarnings`.
+   - `src/domain/models/backup.ts` (ضرورة مباشرة لنقل حالة المحرك — السطر 132):
+     * إضافة الحقل الاختياري `syncEngineRunning?: boolean;` إلى واجهة
+       `BackupRestoreResult`.
+   - `src/application/sync/syncEngine.ts` (ضرورة مباشرة لمنع عرض المحرك كسليم عند فشل التشغيل — الأسطر 91، 111–165، 175–200، 218–220):
+     * إضافة `lifecycleState: 'IDLE' | 'RUNNING' | 'STOPPED' | 'ERROR'` والدالة
+       `getLifecycleState()`، وتحديثها إلى `'RUNNING'` أو `'STOPPED'` عند النجاح
+       و`'ERROR'` في مسار `catch` مع `notify()`.
+   - `src/application/health/healthMonitor.ts` (ضرورة مباشرة لمنع عرض `HEALTHY` عند فشل التشغيل — الأسطر 44–56):
+     * فحص `this.syncEngine.getLifecycleState()` داخل `getSnapshot()` بحيث يصبح
+       `syncStatus` يساوي `'UNAVAILABLE'` عند `'ERROR'` ولا يصبح `'HEALTHY'` أبداً
+       عند `'STOPPED'`.
+   - `src/presentation/components/ActionModal.tsx` (ضرورة مباشرة لعدم إخفاء التحذير المزدوج في الواجهة — الأسطر 279–284، 1287–1304):
+     * تحديث `formatBackupError` لعرض فشل الاستعادة الأصلي متبوعاً بتحذير تعذّر
+       إعادة تشغيل محرك المزامنة عندما يكون `context.syncEngineRestartFailed === true`.
+     * تحديث معالج الاستعادة للتحقق من `result.syncEngineRunning === false` أيضاً
+       وعدم عرض صياغة توحي بعمل المحرك إذا كانت إعادة تشغيله فاشلة.
+   - `tests/unit/backupV2.test.ts` (نطاق الاختبارات — الأسطر 3–36، 1051–1337):
+     * إضافة 5 اختبارات وحدة مستقلة تغطي جميع السيناريوهات المطلوبة.
+
+4. الاختبارات الجديدة المضافة في `tests/unit/backupV2.test.ts`:
+   1) `aborts before restoreBackup when stopSyncEngine fails, attempts operational restart, logs error, and returns no success` (الأسطر 1051–1104)
+   2) `rethrows exact original error and skips post-commit steps when restoreBackup fails and startSyncEngine recovers` (الأسطر 1106–1124)
+   3) `records restart failure under SYNC without swallowing either error and preserves original restore error when both restoreBackup and startSyncEngine fail` (الأسطر 1126–1172)
+   4) `completes normal stop -> restore -> service refreshes -> startSyncEngine flow in exact order` (الأسطر 1174–1195)
+   5) `keeps committed restore result on post-commit failures, emits real warnings, and never claims SyncEngine is healthy/running when restart fails` (الأسطر 1197–1336)
+
+5. الأوامر التي شُغِّلت فعلياً بعد آخر تعديل ونتائجها:
+   +-----------------------------------+-----------+-------------------------------------------------------+
+   | الأمر الحرفي المنفّذ             | رمز الخروج | النتيجة الفعلية                                       |
+   +-----------------------------------+-----------+-------------------------------------------------------+
+   | npm run format:check              | 0         | All matched files use Prettier code style!            |
+   | npm run typecheck                 | 0         | tsc -b --noEmit دون أخطاء                             |
+   | npm run lint                      | 0         | eslint . دون أخطاء                                    |
+   | npm run test:unit                 | 0         | 31 passed / 0 failed (5 suites, 6507.08ms)            |
+   | npm run test:integration          | 0         | 13 passed / 0 failed (4 suites, 2573.53ms)            |
+   | npm run test:e2e                  | 0         | 4 passed / 0 failed (Chromium + IndexedDB حقيقي,16.3s)|
+   | npm run build                     | 0         | tsc -b && vite build (1653 modules, dist/ جاهز)      |
+   +-----------------------------------+-----------+-------------------------------------------------------+
+
+6. الاختبارات التي تعذّر تشغيلها والسبب:
+   - فحص Git (`git status` / `git rev-parse HEAD` مقارنة بالمرجع `0d2aeff90a7371aff49634ff4bc82a025468ae72`):
+     تعذّر بسبب عدم وجود مجلد `.git` في بيئة حاوية التنفيذ (`NO_GIT_REPO`).
+   - بناء/اختبارات Android (`./gradlew :app:testDebugUnitTest` و`:app:assembleDebug`):
+     تعذّر محلياً لعدم توفر Java وAndroid SDK في حاوية التنفيذ
+     (`which java` فارغ، `ANDROID_HOME=EMPTY`)، علماً أن التعديل الحالي لم يمس
+     ملفات `app/` أو طبقة Android.
+   - GitHub Actions CI: لم يُشغّل لعدم تنفيذ Push أو تشغيل يدوي التزاماً بحدود الصلاحية.
+
+7. المخاطر المتبقية والنقاط للمراجعة المستقلة:
+   - التعديلات محفوظة محلياً فقط داخل بيئة العمل دون Commit أو Push.
+   - التحقق من توافق التعديل مع آخر `HEAD` فعلي على GitHub (`0d2aeff90a7371aff49634ff4bc82a025468ae72`)
+     وتشغيل CI يتطلبان موافقة مستقلة صريحة من المستخدم على الخطوة التالية.
+   - بانتظار المراجعة المستقلة والموافقة التالية قبل أي إجراء Git أو CI.
+================================================================================
+
