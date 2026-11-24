@@ -1,10 +1,13 @@
+import type { ErrorSource } from '../domain/errors/appError';
 import type { IBackupProvider } from '../domain/interfaces/repositories';
 import type { IDataSource, ILifecycleParticipant } from '../domain/interfaces/services';
 import type {
   BackupRestoreResult,
   DetectedBackupFormat,
 } from '../domain/models/backup';
-import type { DeviceRole } from '../domain/models/device';
+import type { DeviceIdentityProfile, DeviceRole } from '../domain/models/device';
+import type { SecurityAuditEntry } from '../domain/models/security';
+import type { AppSettings } from '../domain/models/settings';
 import type { SyncRunSummary } from '../domain/models/syncEvent';
 import {
   BrowserDeviceDataSource,
@@ -64,6 +67,141 @@ export interface AppContainer {
     newPassphrase: string,
     userConfirmedLegacyImport: boolean
   ): Promise<string>;
+}
+
+export interface RestoreRecoveryDeps {
+  restoreBackup: () => Promise<BackupRestoreResult>;
+  stopSyncEngine: () => Promise<void>;
+  startSyncEngine: () => Promise<void>;
+  reloadSettings: () => Promise<AppSettings>;
+  getSettingsSnapshot: () => AppSettings;
+  setRelayBaseUrl: (url: string) => void;
+  initializeSecurity: () => Promise<void>;
+  startDeviceManager: () => Promise<void>;
+  getIdentity: () => DeviceIdentityProfile | null;
+  fallbackIdentity: DeviceIdentityProfile;
+  issueSession: (deviceId: string, cryptoKeyId: string, timeoutMinutes: number) => void;
+  clearSession: () => void;
+  recordAudit: (
+    entry: Omit<SecurityAuditEntry, 'id' | 'timestamp'>
+  ) => Promise<SecurityAuditEntry>;
+  captureError: (err: unknown, scope: ErrorSource, userMessage: string) => void;
+}
+
+/**
+ * Executes backup restore with strict separation between:
+ * 1) Pre-commit validation/decryption + atomic IndexedDB commit.
+ * 2) Post-commit in-memory service refreshes & audit logging.
+ *
+ * Once restoreBackup() commits, subsequent refresh failures NEVER masquerade as a
+ * failed/rolled-back restore and never short-circuit remaining service refreshes.
+ */
+export async function executeRestoreWithPostCommitRecovery(
+  deps: RestoreRecoveryDeps
+): Promise<BackupRestoreResult> {
+  let result: BackupRestoreResult;
+  try {
+    await deps.stopSyncEngine();
+  } catch (stopErr) {
+    deps.captureError(stopErr, 'SYNC', 'تعذّر إيقاف محرك المزامنة مؤقتاً قبل الاستعادة.');
+  }
+
+  try {
+    result = await deps.restoreBackup();
+  } catch (preCommitErr) {
+    await deps.startSyncEngine().catch(() => {});
+    throw preCommitErr;
+  }
+
+  const postRestoreWarnings: string[] = [];
+  let restoredSettings = deps.getSettingsSnapshot();
+
+  try {
+    restoredSettings = await deps.reloadSettings();
+    deps.setRelayBaseUrl(restoredSettings.relayEndpoint);
+  } catch (err) {
+    deps.captureError(
+      err,
+      'STORAGE',
+      'تمت استعادة البيانات في قاعدة البيانات، لكن تعذّر إعادة تحميل الإعدادات في الذاكرة.'
+    );
+    postRestoreWarnings.push('تعذّر إعادة تحميل الإعدادات في الذاكرة.');
+  }
+
+  try {
+    await deps.initializeSecurity();
+  } catch (err) {
+    deps.captureError(
+      err,
+      'SECURITY',
+      'تمت استعادة البيانات في قاعدة البيانات، لكن تعذّر إعادة تهيئة مدير الأمان.'
+    );
+    postRestoreWarnings.push('تعذّر إعادة تهيئة سجل الأمان في الذاكرة.');
+  }
+
+  try {
+    await deps.startDeviceManager();
+  } catch (err) {
+    deps.captureError(
+      err,
+      'LIFECYCLE',
+      'تمت استعادة البيانات في قاعدة البيانات، لكن تعذّر تحديث الأجهزة المرتبطة في الذاكرة.'
+    );
+    postRestoreWarnings.push('تعذّر تحديث قائمة الأجهزة المرتبطة في الذاكرة.');
+  }
+
+  try {
+    await deps.startSyncEngine();
+  } catch (err) {
+    deps.captureError(
+      err,
+      'SYNC',
+      'تمت استعادة البيانات في قاعدة البيانات، لكن تعذّر إعادة تشغيل محرك المزامنة.'
+    );
+    postRestoreWarnings.push('تعذّر إعادة تشغيل محرك المزامنة.');
+  }
+
+  const currentIdentity = deps.getIdentity() ?? deps.fallbackIdentity;
+  const effectiveRole = restoredSettings.role ?? result.restoredRole;
+  try {
+    if (effectiveRole) {
+      deps.issueSession(
+        currentIdentity.publicId,
+        currentIdentity.cryptoKeyId,
+        restoredSettings.sessionTimeoutMinutes
+      );
+    } else {
+      deps.clearSession();
+    }
+  } catch (err) {
+    deps.captureError(
+      err,
+      'SECURITY',
+      'تمت استعادة البيانات في قاعدة البيانات، لكن تعذّر تحديث جلسة الواجهة المحلية.'
+    );
+    postRestoreWarnings.push('تعذّر تحديث جلسة الواجهة المحلية.');
+  }
+
+  try {
+    await deps.recordAudit({
+      action: 'BACKUP_RESTORED',
+      actorRole: effectiveRole ?? 'none',
+      deviceId: currentIdentity.publicId,
+      outcome: 'ALLOWED',
+      details: result.crossDeviceRestore
+        ? `تمت استعادة نسخة v2 من جهاز آخر مع الحفاظ على هوية الجهاز الحالي (${result.restoredEvents} حدث، ${result.restoredLinkedDevices} جهاز بحالة غير موثوقة)`
+        : `تمت استعادة نسخة v2 والتحقق من سلامتها (${result.restoredEvents} حدث، ${result.restoredLinkedDevices} جهاز)`,
+    });
+  } catch (err) {
+    deps.captureError(
+      err,
+      'STORAGE',
+      'تمت استعادة البيانات في قاعدة البيانات، لكن تعذّر تسجيل حدث BACKUP_RESTORED في سجل التدقيق.'
+    );
+    postRestoreWarnings.push('تعذّر تسجيل حدث BACKUP_RESTORED في سجل التدقيق.');
+  }
+
+  return postRestoreWarnings.length > 0 ? { ...result, postRestoreWarnings } : result;
 }
 
 export function createAppContainer(): AppContainer {
@@ -466,34 +604,24 @@ export function createAppContainer(): AppContainer {
         'exportBackups',
         'استعادة نسخة احتياطية مشفرة'
       );
-      const result = await backupProvider.restoreBackup(rawJson, passphrase);
-      const restoredSettings = await settingsService.initialize();
-      transportClient.setBaseUrl(restoredSettings.relayEndpoint);
-      await securityManager.initialize();
-      await deviceManager.start();
-      await syncEngine.start();
 
-      const currentIdentity = deviceManager.getIdentity() ?? identity;
-      if (restoredSettings.role) {
-        securityManager.issueSession(
-          currentIdentity.publicId,
-          currentIdentity.cryptoKeyId,
-          restoredSettings.sessionTimeoutMinutes
-        );
-      } else {
-        securityManager.clearSession();
-      }
-
-      await securityManager.recordAudit({
-        action: 'BACKUP_RESTORED',
-        actorRole: restoredSettings.role ?? 'none',
-        deviceId: currentIdentity.publicId,
-        outcome: 'ALLOWED',
-        details: result.crossDeviceRestore
-          ? `تمت استعادة نسخة v2 من جهاز آخر مع الحفاظ على هوية الجهاز الحالي (${result.restoredEvents} حدث، ${result.restoredLinkedDevices} جهاز بحالة غير موثوقة)`
-          : `تمت استعادة نسخة v2 والتحقق من سلامتها (${result.restoredEvents} حدث، ${result.restoredLinkedDevices} جهاز)`,
+      return executeRestoreWithPostCommitRecovery({
+        restoreBackup: () => backupProvider.restoreBackup(rawJson, passphrase),
+        stopSyncEngine: () => syncEngine.stop(),
+        startSyncEngine: () => syncEngine.start(),
+        reloadSettings: () => settingsService.initialize(),
+        getSettingsSnapshot: () => settingsService.getSnapshot(),
+        setRelayBaseUrl: (url) => transportClient.setBaseUrl(url),
+        initializeSecurity: () => securityManager.initialize(),
+        startDeviceManager: () => deviceManager.start(),
+        getIdentity: () => deviceManager.getIdentity(),
+        fallbackIdentity: identity,
+        issueSession: (deviceId, cryptoKeyId, timeoutMinutes) =>
+          securityManager.issueSession(deviceId, cryptoKeyId, timeoutMinutes),
+        clearSession: () => securityManager.clearSession(),
+        recordAudit: (entry) => securityManager.recordAudit(entry),
+        captureError: (err, scope, msg) => errorManager.capture(err, scope, msg),
       });
-      return result;
     },
 
     async migrateLegacyBackupJson(

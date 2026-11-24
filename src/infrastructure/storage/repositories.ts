@@ -628,7 +628,7 @@ function normalizeAuditEntry(entry: SecurityAuditEntry): SecurityAuditEntry {
   };
 }
 
-function validateAuditEntriesFromBackup(raw: unknown): SecurityAuditEntry[] {
+function validateAuditEntriesCommon(raw: unknown): SecurityAuditEntry[] {
   if (!Array.isArray(raw)) {
     throw new ValidationError(
       'INVALID_BACKUP_SCHEMA',
@@ -694,8 +694,22 @@ function validateAuditEntriesFromBackup(raw: unknown): SecurityAuditEntry[] {
       );
     }
 
-    // Security policy: ignore any archive-supplied provenance fields (origin, importedAt,
-    // importedFromDeviceId). Restore pipeline strictly assigns BACKUP_IMPORT provenance.
+    const normalizedOrigin: SecurityAuditOrigin | undefined =
+      item.origin === 'BACKUP_IMPORT'
+        ? 'BACKUP_IMPORT'
+        : item.origin === 'LOCAL'
+          ? 'LOCAL'
+          : undefined;
+    const importedAt = assertOptionalNullableNumber(
+      item.importedAt,
+      `auditEntries[${idx}].importedAt`
+    );
+    const importedFromDeviceId = assertOptionalNullableString(
+      item.importedFromDeviceId,
+      `auditEntries[${idx}].importedFromDeviceId`,
+      128
+    );
+
     return {
       id: item.id,
       timestamp: item.timestamp,
@@ -712,8 +726,38 @@ function validateAuditEntriesFromBackup(raw: unknown): SecurityAuditEntry[] {
         `auditEntries[${idx}].details`,
         BACKUP_MAX_DETAIL_STRING_LENGTH
       ),
+      ...(normalizedOrigin ? { origin: normalizedOrigin } : {}),
+      ...(importedAt !== undefined ? { importedAt } : {}),
+      ...(importedFromDeviceId !== undefined ? { importedFromDeviceId } : {}),
     };
   });
+}
+
+function validateAuditEntriesFromBackup(raw: unknown): SecurityAuditEntry[] {
+  // Security policy: strip any archive-supplied provenance fields (origin, importedAt,
+  // importedFromDeviceId). Restore pipeline strictly assigns BACKUP_IMPORT provenance.
+  return validateAuditEntriesCommon(raw).map((entry) => ({
+    id: entry.id,
+    timestamp: entry.timestamp,
+    action: entry.action,
+    actorRole: entry.actorRole,
+    deviceId: entry.deviceId,
+    outcome: entry.outcome,
+    details: entry.details,
+  }));
+}
+
+function assertArchiveWithinByteLimit(archive: EncryptedBackupArchiveV2): void {
+  const serializedBytes = new TextEncoder().encode(
+    JSON.stringify(archive, null, 2)
+  ).byteLength;
+  if (serializedBytes > BACKUP_MAX_RAW_JSON_BYTES) {
+    throw new ValidationError(
+      'BACKUP_LIMIT_EXCEEDED',
+      'حجم ملف النسخة الاحتياطية الناتج يتجاوز الحد الأقصى المسموح (10 MiB).',
+      `Serialized backup archive (${serializedBytes} bytes) exceeds BACKUP_MAX_RAW_JSON_BYTES`
+    );
+  }
 }
 
 function canonicalLegacyArchivePayload(
@@ -1426,10 +1470,14 @@ export class IndexedDbBackupProvider implements IBackupProvider {
       }
     }
 
-    const boundedAudits =
-      auditEntries.length > BACKUP_MAX_AUDIT_ENTRIES
-        ? auditEntries.slice(0, BACKUP_MAX_AUDIT_ENTRIES)
-        : auditEntries;
+    const validatedSettings = validateSettingsFromBackup({
+      ...DEFAULT_APP_SETTINGS,
+      ...settings,
+    });
+    const validatedLinkedDevices = validateLinkedDevicesFromBackup(linkedDevices);
+    const validatedSyncEvents = validateSyncEventsFromBackup(syncEvents);
+    const validatedAudits =
+      validateAuditEntriesCommon(auditEntries).map(normalizeAuditEntry);
 
     const exportedAt = Date.now();
     const innerPayload: BackupInnerPayloadV2 = {
@@ -1442,10 +1490,10 @@ export class IndexedDbBackupProvider implements IBackupProvider {
             cryptoKeyId: identity.cryptoKeyId,
           }
         : null,
-      settings: validateAppSettings({ ...DEFAULT_APP_SETTINGS, ...settings }),
-      linkedDevices,
-      syncEvents,
-      auditEntries: boundedAudits.map(normalizeAuditEntry),
+      settings: validatedSettings,
+      linkedDevices: validatedLinkedDevices,
+      syncEvents: validatedSyncEvents,
+      auditEntries: validatedAudits,
     };
 
     const archive = await this.crypto.encryptBackupPayload({
@@ -1454,12 +1502,13 @@ export class IndexedDbBackupProvider implements IBackupProvider {
       schemaVersion: APP_DB_VERSION,
       exportedAt,
     });
+    assertArchiveWithinByteLimit(archive);
 
     return {
       archive,
-      eventCount: syncEvents.length,
-      linkedDeviceCount: linkedDevices.length,
-      auditCount: boundedAudits.length,
+      eventCount: validatedSyncEvents.length,
+      linkedDeviceCount: validatedLinkedDevices.length,
+      auditCount: validatedAudits.length,
     };
   }
 
@@ -1614,6 +1663,13 @@ export class IndexedDbBackupProvider implements IBackupProvider {
       existingLocalDevices,
       currentIdentity
     );
+    if (sanitizedDevices.length > BACKUP_MAX_LINKED_DEVICES) {
+      throw new ValidationError(
+        'BACKUP_LIMIT_EXCEEDED',
+        `إجمالي الأجهزة المرتبطة والمسحوبة بعد الاستعادة يتجاوز الحد الأقصى (${BACKUP_MAX_LINKED_DEVICES}).`,
+        'Combined linkedDevices after revocation preservation exceeds BACKUP_MAX_LINKED_DEVICES'
+      );
+    }
     const { events: sanitizedEvents, crossDeviceRestore } =
       this.applySyncEventReplayAndIdentityPolicy(
         validatedEvents,
@@ -1685,6 +1741,15 @@ export class IndexedDbBackupProvider implements IBackupProvider {
         const syncStore = tx.objectStore(STORES.SYNC_EVENTS);
         const auditStore = tx.objectStore(STORES.SECURITY_AUDIT);
 
+        const existingAuditCount = await reqToPromise(auditStore.count());
+        if (existingAuditCount + validatedAudits.length > BACKUP_MAX_AUDIT_ENTRIES) {
+          throw new ValidationError(
+            'BACKUP_LIMIT_EXCEEDED',
+            `إجمالي سجلات التدقيق المحلية (${existingAuditCount}) والمستوردة (${validatedAudits.length}) يتجاوز الحد الأقصى (${BACKUP_MAX_AUDIT_ENTRIES})، ولم يتم المساس بالسجلات المحلية.`,
+            'Combined local and imported auditEntries exceed BACKUP_MAX_AUDIT_ENTRIES'
+          );
+        }
+
         const currentSettingsRecord = (await reqToPromise(
           settingsStore.get('app_settings')
         )) as StoredSettingsRecord | undefined;
@@ -1736,6 +1801,40 @@ export class IndexedDbBackupProvider implements IBackupProvider {
       crossDeviceRestore,
       restoredRole: preservedRole,
     };
+  }
+
+  private sanitizeLegacyDevicesForMigration(
+    backedUpDevices: LinkedDevice[]
+  ): LinkedDevice[] {
+    const sanitizedMap = new Map<string, LinkedDevice>();
+    for (const dev of backedUpDevices) {
+      const existing = sanitizedMap.get(dev.publicId);
+      const isRevoked =
+        dev.pairingState === 'REVOKED' || existing?.pairingState === 'REVOKED';
+      sanitizedMap.set(dev.publicId, {
+        ...dev,
+        pairingState: isRevoked ? 'REVOKED' : 'UNPAIRED',
+        verifiedByRelay: false,
+        pairedAt: null,
+      });
+    }
+    return Array.from(sanitizedMap.values());
+  }
+
+  private freezeLegacySyncEventsForMigration(events: SyncEvent[]): SyncEvent[] {
+    return events.map((evt) => {
+      if (evt.status === 'PENDING' || evt.status === 'IN_PROGRESS') {
+        return {
+          ...evt,
+          status: 'FAILED' as const,
+          nextRetryAt: null,
+          inboundAckConfirmed: false,
+          lastError:
+            'حدث مُرحّل من نسخة v1 غير مشفرة — أُوقف إعادة الإرسال أو تأكيد ACK لحماية الهوية ومنع إعادة التشغيل.',
+        };
+      }
+      return { ...evt };
+    });
   }
 
   async migrateLegacyBackup(
@@ -1794,6 +1893,50 @@ export class IndexedDbBackupProvider implements IBackupProvider {
       );
     }
 
+    if (
+      typeof legacy.checksumSha256 !== 'string' ||
+      !/^[0-9a-f]{64}$/i.test(legacy.checksumSha256)
+    ) {
+      throw new ValidationError(
+        'INVALID_BACKUP_SCHEMA',
+        'بصمة SHA-256 للنسخة القديمة مفقودة أو غير صالحة.',
+        'Invalid legacy checksumSha256 format'
+      );
+    }
+
+    if (
+      !isPlainRecord(legacy.settings) ||
+      !Array.isArray(legacy.linkedDevices) ||
+      !Array.isArray(legacy.syncEvents) ||
+      !Array.isArray(legacy.auditEntries)
+    ) {
+      throw new ValidationError(
+        'INVALID_BACKUP_SCHEMA',
+        'بنية الحقول الأساسية في النسخة القديمة غير صالحة.',
+        'Legacy backup archive missing required array/object collections'
+      );
+    }
+
+    // Validate all schema bounds BEFORE computing canonical SHA-256 or migrating
+    const validatedSettings = validateSettingsFromBackup(legacy.settings);
+    const validatedDevices = validateLinkedDevicesFromBackup(legacy.linkedDevices);
+    const validatedEvents = validateSyncEventsFromBackup(legacy.syncEvents);
+    const validatedAudits = validateAuditEntriesFromBackup(legacy.auditEntries);
+
+    if (legacy.identity !== null && legacy.identity !== undefined) {
+      if (!isPlainRecord(legacy.identity)) {
+        throw new ValidationError(
+          'INVALID_BACKUP_SCHEMA',
+          'بيانات الهوية في النسخة القديمة غير صالحة.',
+          'Invalid legacy identity object'
+        );
+      }
+      assertBoundedString(legacy.identity.publicId, 'identity.publicId', 128);
+      assertBoundedString(legacy.identity.cryptoKeyId, 'identity.cryptoKeyId', 128);
+      validatePublicJwk(legacy.identity.publicKeyJwk, 'identity.publicKeyJwk');
+      validatePublicJwk(legacy.identity.ecdhPublicKeyJwk, 'identity.ecdhPublicKeyJwk');
+    }
+
     const expectedChecksum = await this.crypto.sha256Hex(
       canonicalLegacyArchivePayload({
         schemaVersion: legacy.schemaVersion,
@@ -1806,7 +1949,7 @@ export class IndexedDbBackupProvider implements IBackupProvider {
       })
     );
 
-    if (expectedChecksum !== legacy.checksumSha256) {
+    if (expectedChecksum !== legacy.checksumSha256.toLowerCase()) {
       throw new StorageError(
         'BACKUP_CHECKSUM_MISMATCH',
         'فشل التحقق من بصمة SHA-256 للنسخة القديمة؛ قد يكون الملف تالفاً أو معدّلاً.',
@@ -1814,58 +1957,25 @@ export class IndexedDbBackupProvider implements IBackupProvider {
       );
     }
 
-    const validatedSettings = validateSettingsFromBackup(legacy.settings);
-    const validatedDevices = validateLinkedDevicesFromBackup(legacy.linkedDevices);
-    const validatedEvents = validateSyncEventsFromBackup(legacy.syncEvents);
-    const validatedAudits = validateAuditEntriesFromBackup(legacy.auditEntries);
-
-    let sourceDevice: { publicId: string; cryptoKeyId: string } | null = null;
-    if (legacy.identity !== null && legacy.identity !== undefined) {
-      if (!isPlainRecord(legacy.identity)) {
-        throw new ValidationError(
-          'INVALID_BACKUP_SCHEMA',
-          'بيانات الهوية في النسخة القديمة غير صالحة.',
-          'Invalid legacy identity object'
-        );
-      }
-      sourceDevice = {
-        publicId: assertBoundedString(
-          legacy.identity.publicId,
-          'identity.publicId',
-          128
-        ),
-        cryptoKeyId: assertBoundedString(
-          legacy.identity.cryptoKeyId,
-          'identity.cryptoKeyId',
-          128
-        ),
-      };
-    }
-
-    // Apply strict Identity & Trust policy inside isolated migration buffer (zero DB side effects!)
-    const [currentIdentity, existingLocalDevices] = await Promise.all([
-      this.deviceRepo.getIdentity(),
-      this.deviceRepo.getLinkedDevices(),
-    ]);
-
-    const sanitizedDevices = this.applyLinkedDeviceTrustPolicy(
-      validatedDevices,
-      existingLocalDevices,
-      currentIdentity
-    );
-    const { events: sanitizedEvents } = this.applySyncEventReplayAndIdentityPolicy(
-      validatedEvents,
-      sourceDevice,
-      currentIdentity
-    );
+    // Pure, isolated format conversion (v1 -> v2):
+    // - NEVER reads local device identity or local linked_devices (no cross-pollination).
+    // - NEVER trusts unauthenticated legacy.identity as sourceDevice (always sets null).
+    // - Always freezes PENDING/IN_PROGRESS events to FAILED to prevent forged-identity replay.
+    // - Always downgrades peer trust (PAIRED -> UNPAIRED, REVOKED stays REVOKED).
+    // - Strips legacy role claim from settings inside migrated archive (role: null).
+    const sanitizedDevices = this.sanitizeLegacyDevicesForMigration(validatedDevices);
+    const sanitizedEvents = this.freezeLegacySyncEventsForMigration(validatedEvents);
 
     const exportedAt = Date.now();
     const innerPayload: BackupInnerPayloadV2 = {
       payloadVersion: 2,
       schemaVersion: APP_DB_VERSION,
       exportedAt,
-      sourceDevice,
-      settings: validatedSettings,
+      sourceDevice: null,
+      settings: {
+        ...validatedSettings,
+        role: null,
+      },
       linkedDevices: sanitizedDevices,
       syncEvents: sanitizedEvents,
       auditEntries: validatedAudits,
@@ -1877,6 +1987,7 @@ export class IndexedDbBackupProvider implements IBackupProvider {
       schemaVersion: APP_DB_VERSION,
       exportedAt,
     });
+    assertArchiveWithinByteLimit(archive);
 
     return {
       archive,

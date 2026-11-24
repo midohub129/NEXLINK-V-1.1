@@ -1,0 +1,254 @@
+================================================================================
+تقرير التنفيذ التراكمي — NEXLINK V1.1 (Hydrogen 4)
+المهام المعتمدة: المهام 1–4
+التاريخ: 2026-11-24
+الحالة العامة: مكتمل التنفيذ والتحقق المحلي للمهام 1–4 (بانتظار موافقة المستخدم للخطوة التالية)
+================================================================================
+
+ملاحظة تنظيمية:
+هذا الملف هو السجل التراكمي الرسمي لتنفيذ المهام الأربع المعتمدة (1، 2، 3، 4).
+لم يتم تنفيذ أي Commit أو Push أو Merge أو فتح PR أو تشغيل يدوي لـ GitHub Actions،
+ولم يتم المساس ببروتوكول E2EE أو Pairing/KDF أو Relay أو ACK/Idempotency أو قواعد RBAC
+أو تحسينات الواجهة خارج نطاق المهمة 3.
+
+================================================================================
+التقرير 1: المهمة 1 — إصلاح الثغرة المنطقية في ترحيل v1 (الأولوية: حرجة)
+================================================================================
+
+1. الملفات التي تم فحصها وتعديلها:
+   - فحص وتعديل: src/infrastructure/storage/repositories.ts
+   - فحص وتعديل: tests/unit/backupV2.test.ts
+   - فحص (دون تعديل): tests/integration/backupEndToEnd.test.ts
+
+2. وصف المشكلة والسبب الجذري:
+   أ) تسريب حالة الجهاز المحوِّل إلى الأرشيف المرحَّل:
+      كانت الدالة migrateLegacyBackup تستدعي this.deviceRepo.getIdentity() و
+      this.deviceRepo.getLinkedDevices() ثم تمررها إلى applyLinkedDeviceTrustPolicy،
+      مما يؤدي إلى حقن الأجهزة المسحوبة محلياً (locallyRevoked) من قاعدة بيانات
+      الجهاز الذي يجري الترحيل داخل أرشيف v2 الناتج، وحذف أي جهاز من الأرشيف
+      يطابق publicId للجهاز المحوِّل، بدلاً من عزل الترحيل كتحويل صيغة نقي (v1 -> v2).
+   ب) ثغرة انتحال الهوية وإعادة التشغيل (Identity Forgery & Replay):
+      صيغة v1 غير مشفرة وتعتمد على بصمة SHA-256 غير موقّعة فقط، ومع ذلك كانت
+      migrateLegacyBackup تثبّت legacy.identity داخل حقل sourceDevice في أرشيف v2
+      الناتج وتمرره إلى applySyncEventReplayAndIdentityPolicy. بذلك إذا زُوّر
+      legacy.identity (مع إعادة حساب SHA-256) ليطابق هوية الجهاز المستهدف، يمر
+      فحص sameDevice === true عند الاستعادة وتُترك أحداث PENDING وIN_PROGRESS
+      قابلة لإعادة الإرسال أو ACK بدلاً من تجميدها إلى FAILED.
+   ج) التحقق المتأخر من البنية والحدود ومفاتيح JWK الخاصة:
+      كان يُستدعى canonicalLegacyArchivePayload (JSON.stringify) على المصفوفات
+      قبل التحقق من أنها مصفوفات صالحة وضمن الحدود، ولم يتم فحص حقول publicKeyJwk
+      وecdhPublicKeyJwk داخل legacy.identity عبر validatePublicJwk لرفض المفاتيح
+      الخاصة ('d').
+
+3. التعديلات الفعلية المنفذة وأسماء الدوال وأرقام الأسطر:
+   - الملف: src/infrastructure/storage/repositories.ts
+     * الدالة migrateLegacyBackup (الأسطر 1840–1998):
+       - التحقق الصارم من صيغة checksumSha256 (64 حرفاً ست عشرياً) ومن بنية
+         settings / linkedDevices / syncEvents / auditEntries وحدودها، وفحص
+         publicKeyJwk وecdhPublicKeyJwk في legacy.identity عبر validatePublicJwk
+         قبل حساب SHA-256.
+       - إزالة قراءة deviceRepo.getIdentity() وdeviceRepo.getLinkedDevices() تماماً
+         من مسار ترحيل v1.
+       - إضافة الدالة الخاصة sanitizeLegacyDevicesForMigration (الأسطر 1806–1822)
+         لتحويل الأجهزة داخل الأرشيف فقط (خفض غير المسحوب إلى UNPAIRED مع
+         verifiedByRelay: false وpairedAt: null، وإبقاء REVOKED على حاله دون حقن
+         أجهزة من الجهاز المحوِّل).
+       - إضافة الدالة الخاصة freezeLegacySyncEventsForMigration (الأسطر 1824–1838)
+         لتجميد جميع أحداث PENDING وIN_PROGRESS القادمة من v1 قسراً إلى FAILED مع
+         nextRetryAt: null وinboundAckConfirmed: false.
+       - تعيين sourceDevice: null وتعيين settings.role: null داخل أرشيف v2 الناتج
+         حتى لا يتمكن أي أرشيف v1 من استيفاء sameDevice === true عند الاستعادة.
+       - استدعاء assertArchiveWithinByteLimit(archive) (السطر 1990) قبل الإرجاع.
+   - الملف: tests/unit/backupV2.test.ts
+     * إضافة الاختبار (السطر 636):
+       "isolates legacy v1 migration from migrating device state, freezes pending events, and blocks forged identity replay"
+
+4. الاختبارات التي شُغِّلت فعلياً ونتائجها:
+   - npm run test:unit (يتضمن الاختبار الجديد للمهمة 1 + جميع اختبارات الوحدة):
+     النتيجة: 27/27 ناجح (0 فشل) عبر 5 حزم (duration_ms 6684.51).
+   - npm run test:integration (يتضمن "rejects legacy v1 unencrypted backups by default and safely migrates v1 to encrypted v2..."):
+     النتيجة: 13/13 ناجح (0 فشل) عبر 4 حزم (duration_ms 2795.25).
+
+5. المشكلات المتبقية والقيود البيئية وما لم يُنفّذ:
+   - تم إغلاق المهمة 1 بالكامل محلياً، ولا تزال اختبارات Android وCI البعيد بانتظار المراحل اللاحقة وموافقة المستخدم.
+
+================================================================================
+التقرير 2: المهمة 2 — توحيد حدود التصدير والاستعادة ومنع فقدان السجلات (الأولوية: عالية)
+================================================================================
+
+1. الملفات التي تم فحصها وتعديلها:
+   - فحص وتعديل: src/infrastructure/storage/repositories.ts
+   - فحص وتعديل: tests/helpers/inMemoryIndexedDb.ts
+   - فحص وتعديل: tests/unit/backupV2.test.ts
+   - فحص (دون تعديل): src/domain/models/backup.ts, src/application/settings/settingsService.ts
+
+2. وصف المشكلة والسبب الجذري:
+   - في دالة exportBackup كانت السجلات تتعرض لاقتصاص صامت عبر:
+     auditEntries.slice(0, BACKUP_MAX_AUDIT_ENTRIES)
+     مما يؤدي إلى حذف السجلات الأقدم بصمت عند تجاوز 1,000 سجل، بالمخالفة الصريحة
+     لمتطلبات عدم الحذف الصامت وتطابق حدود التصدير والاستعادة.
+   - كما لم تكن exportBackup تتحقق من حدود BACKUP_MAX_SYNC_EVENTS (5,000) أو
+     BACKUP_MAX_LINKED_DEVICES (200) أو BACKUP_MAX_SELECTED_APPS (500) أو الحد
+     الأقصى لحجم الأرشيف المتسلسل BACKUP_MAX_RAW_JSON_BYTES (10 MiB)، فكان يمكن
+     تصدير نسخة يرفضها restoreBackup لاحقاً.
+   - وفي restoreBackup، نظراً للإبقاء على السجلات المحلية ودمج السجلات المستوردة
+     فوقها، لم يكن هناك فحص يمنع تجاوز مجموع (السجلات المحلية + المستوردة) أو
+     (الأجهزة المستعادة + المسحوبة محلياً) للحدود المعتمدة، مما قد يترك قاعدة
+     البيانات في حالة غير قابلة للتصدير لاحقاً.
+
+3. التعديلات الفعلية المنفذة وأسماء الدوال وأرقام الأسطر:
+   - الملف: src/infrastructure/storage/repositories.ts
+     * الدالة validateAuditEntriesCommon (الأسطر 631–734) والدالة
+       validateAuditEntriesFromBackup (الأسطر 736–748):
+       توحيد فحص بنية وحدود auditEntries في التصدير والاستعادة والترحيل، مع إزالة
+       خصائص provenance المزورة في مسار الاستعادة/الترحيل فقط، والحفاظ على
+       origin/importedAt/importedFromDeviceId في مسار التصدير.
+     * الدالة assertArchiveWithinByteLimit (الأسطر 750–761):
+       فحص الحجم الفعلي للأرشيف المتسلسل بصيغة JSON مقابل BACKUP_MAX_RAW_JSON_BYTES
+       في كل من exportBackup وmigrateLegacyBackup.
+     * الدالة exportBackup (الأسطر 1441–1509):
+       إزالة slice الصامت نهائياً، وتطبيق validateSettingsFromBackup و
+       validateLinkedDevicesFromBackup وvalidateSyncEventsFromBackup و
+       validateAuditEntriesCommon وassertArchiveWithinByteLimit، بحيث تفشل
+       صراحةً برمز BACKUP_LIMIT_EXCEEDED عند تجاوز أي حد دون حذف أي سجل.
+     * الدالة restoreBackup (الأسطر 1666–1752):
+       فحص sanitizedDevices.length > BACKUP_MAX_LINKED_DEVICES قبل المعاملة، وفحص
+       existingAuditCount + validatedAudits.length > BACKUP_MAX_AUDIT_ENTRIES داخل
+       معاملة IndexedDB عبر auditStore.count() قبل أي تعديل، بحيث تفشل الاستعادة
+       ذرياً دون مساس بالسجلات المحلية.
+   - الملف: tests/helpers/inMemoryIndexedDb.ts
+     * إضافة الدالة count() إلى FakeObjectStore (الأسطر 210–215) لدعم
+       auditStore.count() في بيئة اختبارات الوحدة بـ Node.js.
+   - الملف: tests/unit/backupV2.test.ts
+     * إضافة الاختبار (السطر 832):
+       "enforces symmetric export and restore limits without silently dropping audit logs"
+
+4. الاختبارات التي شُغِّلت فعلياً ونتائجها:
+   - npm run test:unit:
+     النتيجة: 27/27 ناجح (0 فشل) — يثبت رفض تصدير > 500 تطبيق، > 200 جهاز،
+     > 1000 سجل تدقيق دون حذف صامت، ونجاح التصدير عند 1000 تماماً، والرفض الذري
+     للاستعادة عند تجاوز مجموع السجلات المحلية + المستوردة للحد الأقصى مع بقاء
+     السجل المحلي (DEVICE_REVOKED) سليماً.
+   - npm run test:e2e (Chromium حقيقي + IndexedDB حقيقي):
+     النتيجة: 4/4 ناجح (0 فشل) — تثبت توافق auditStore.count() في المتصفح الفعلي.
+
+5. المشكلات المتبقية والقيود البيئية وما لم يُنفّذ:
+   - تم إغلاق المهمة 2 بالكامل محلياً، ولا يزال التشغيل على GitHub Actions بانتظار موافقة الدفع.
+
+================================================================================
+التقرير 3: المهمة 3 — معالجة فشل ما بعد معاملة الاستعادة (الأولوية: عالية)
+================================================================================
+
+1. الملفات التي تم فحصها وتعديلها:
+   - فحص وتعديل: src/domain/models/backup.ts
+   - فحص وتعديل: src/application/container.ts
+   - فحص وتعديل: src/presentation/components/ActionModal.tsx
+   - فحص وتعديل: tests/unit/backupV2.test.ts
+   - فحص (دون تعديل): src/application/devices/deviceManager.ts, src/application/sync/syncEngine.ts,
+     src/application/errors/errorManager.ts, src/domain/errors/appError.ts, src/App.tsx
+
+2. وصف المشكلة والسبب الجذري:
+   - في دالة container.restoreBackupJson السابقة، كانت الاستعادة في قاعدة البيانات
+     (backupProvider.restoreBackup) متبوعة مباشرةً بسلسلة من خطوات التحديث في الذاكرة:
+     settingsService.initialize()، transportClient.setBaseUrl(...)،
+     securityManager.initialize()، deviceManager.start()، syncEngine.start()،
+     issueSession/clearSession، وsecurityManager.recordAudit().
+   - إذا فشل أي من هذه الخطوات اللاحقة بعد التزام معاملة IndexedDB، كان الخطأ
+     يرتد إلى واجهة المستخدم كأنه فشل/تراجع للاستعادة بأكملها رغم أن قاعدة البيانات
+     قد تغيرت فعلاً، كما كانت الخطوة الفاشلة تمنع تنفيذ بقية خطوات تحديث الخدمات
+     المستقلة، ولم يكن يُوقَف syncEngine قبل بدء الاستعادة لتفادي التزامن المتداخل.
+
+3. التعديلات الفعلية المنفذة وأسماء الدوال وأرقام الأسطر:
+   - الملف: src/domain/models/backup.ts
+     * إضافة الحقل الاختياري postRestoreWarnings?: string[] إلى BackupRestoreResult
+       (السطر 131).
+   - الملف: src/application/container.ts
+     * استخراج وتصدير الدالة executeRestoreWithPostCommitRecovery (الأسطر 99–215)
+       وواجهة RestoreRecoveryDeps (الأسطر 68–90)، واستخدامها داخل
+       container.restoreBackupJson (الأسطر 595–627):
+       - إيقاف محرك المزامنة مؤقتاً (stopSyncEngine) قبل restoreBackup.
+       - عند فشل ما قبل الالتزام (pre-commit): إعادة تشغيل syncEngine وإعادة رمي
+         الخطأ الأصلي دون أي تحذيرات مضللة.
+       - بعد نجاح التزام restoreBackup: عزل كل خطوة من خطوات التحديث اللاحقة
+         (reloadSettings + setRelayBaseUrl، initializeSecurity، startDeviceManager،
+         startSyncEngine، issueSession/clearSession، recordAudit) في try/catch مستقل؛
+         بحيث يستمر تنفيذ جميع الخطوات الأخرى عند تعثر أي خطوة، ويُلتقط الخطأ في
+         ErrorManager (بمصدر ErrorSource الصحيح مثل STORAGE / SECURITY / LIFECYCLE / SYNC)،
+         وتُعاد النتيجة مع postRestoreWarnings دون إعلان فشل كاذب لالتزام القاعدة.
+   - الملف: src/presentation/components/ActionModal.tsx
+     * تحديث معالج الاستعادة (الأسطر 1283–1299) لإظهار تأكيد نجاح التزام الاستعادة
+       في statusMessage، وعرض تنبيه صريح في errorMessage عند وجود postRestoreWarnings
+       يوضح أن البيانات حُفظت في قاعدة البيانات مع التوصية بإعادة تحميل التطبيق.
+   - الملف: tests/unit/backupV2.test.ts
+     * إضافة الاختبار (السطر 937):
+       "isolates post-commit restore refresh/audit failures from pre-commit rollback errors and runs all independent recovery steps"
+
+4. الاختبارات التي شُغِّلت فعلياً ونتائجها:
+   - npm run test:unit:
+     النتيجة: 27/27 ناجح (0 فشل) — يتحقق من استعادة syncEngine وإعادة رمي الخطأ
+     عند فشل ما قبل الالتزام، ومن إكمال كافة خطوات التحديث وإرجاع 4 تحذيرات في
+     postRestoreWarnings والتقاط 4 أخطاء في ErrorManager دون إعلان فشل الالتزام
+     عند تعثر reloadSettings وinitializeSecurity وstartSyncEngine وrecordAudit.
+   - npm run test:e2e (Chromium حقيقي + IndexedDB حقيقي):
+     النتيجة: 4/4 ناجح (0 فشل) — يثبت عمل المسار المتكامل في المتصفح بعد التعديل.
+
+5. المشكلات المتبقية والقيود البيئية وما لم يُنفّذ:
+   - تم إغلاق المهمة 3 بالكامل محلياً.
+
+================================================================================
+التقرير 4: المهمة 4 — مزامنة package-lock.json مع package.json والتحقق النهائي الشامل
+================================================================================
+
+1. الملفات التي تم فحصها وتعديلها:
+   - فحص: package.json
+   - فحص وتعديل: package-lock.json (عبر npm install --package-lock-only)
+
+2. وصف المشكلة والسبب الجذري:
+   - عند فحص التطابق عبر npm ci --dry-run قبل الإصلاح، فشل الأمر برمز خروج (1)
+     بسبب غياب حزم Playwright المضافة إلى devDependencies في package.json من ملف
+     القفل:
+     Missing: @playwright/test@1.65.1 from lock file
+     Missing: playwright@1.65.1 from lock file
+     Missing: playwright-core@1.65.1 from lock file
+     وكان ذلك سيؤدي حتماً إلى فشل خطوة npm ci في GitHub Actions.
+
+3. التعديلات الفعلية المنفذة:
+   - تنفيذ الأمر: npm install --package-lock-only
+   - التحقق من وجود @playwright/test@1.65.1 وplaywright@1.65.1 وplaywright-core@1.65.1
+     داخل package-lock.json (الأسطر 19، 535، 537).
+   - التحقق عبر npm ci --dry-run (رمز الخروج: 0).
+
+4. نتائج التحقق النهائي الشامل بعد آخر تعديل على الشيفرة وملف القفل:
+   +-----------------------------------+-----------+----------------------------------------------+
+   | الأمر الحرفي المنفّذ             | رمز الخروج | النتيجة الفعلية                              |
+   +-----------------------------------+-----------+----------------------------------------------+
+   | npm ci --dry-run                  | 0         | up to date in 572ms (package-lock متطابق)    |
+   | npm run format:check              | 0         | All matched files use Prettier code style!   |
+   | npm run typecheck                 | 0         | tsc -b --noEmit دون أخطاء                    |
+   | npm run lint                      | 0         | eslint . دون أخطاء                           |
+   | npm run test:unit                 | 0         | 27 passed / 0 failed (5 suites, 6684ms)      |
+   | npm run test:integration          | 0         | 13 passed / 0 failed (4 suites, 2795ms)      |
+   | npm run test:e2e                  | 0         | 4 passed / 0 failed (Chromium + Real IDB)    |
+   | npm run build                     | 0         | tsc -b && vite build (1653 modules, dist/)   |
+   | npm audit --audit-level=moderate  | 0         | found 0 vulnerabilities                      |
+   | compile_applet + lint_applet      | نجاح      | البناء وESLint سليمان                        |
+   +-----------------------------------+-----------+----------------------------------------------+
+
+   تفصيل اختبارات Playwright E2E الحقيقية في Chromium (4/4 ناجح في 20.5s):
+   1. exports EncryptedBackupArchive v2 via UI without plaintext/secrets using real Chromium WebCrypto & IndexedDB (3.5s) — PASS
+   2. restores backup into real IndexedDB, preserves target identity/role, downgrades paired peers, and distinguishes imported audits (5.5s) — PASS
+   3. keeps browser IndexedDB completely unchanged on wrong passphrase, tampering, unsupported version, corrupt JSON, and mid-transaction failure (5.1s) — PASS
+   4. upgrades existing browser IndexedDB v3 audit records to v4 with origin=LOCAL and renders them in UI without data loss (1.7s) — PASS
+
+5. المشكلات المتبقية والقيود البيئية وما لم يُنفّذ بعد:
+   - قيود البيئة المحلية: بيئة حاوية التنفيذ لا تحتوي على Java / Android SDK
+     (which java فارغ، ANDROID_HOME= فارغ)، ولذلك لم يُشغّل محلياً بناء
+     Android Debug APK أو اختبارات Android JVM Unit Tests.
+   - المهام المتبقية وفق الترتيب المعتمد (بانتظار موافقة المستخدم الصريحة):
+     * المهمة 5: مراجعة/دفع التغييرات وإعادة تشغيل GitHub Actions والتحقق من جميع
+       الوظائف (بما فيها npm ci وPlaywright Chromium وAndroid).
+     * المهمة 6: مراجعة نتائج Playwright الفعلية وتقاريرها المرفوعة من CI.
+     * المهمة 7: استكمال وظائف Android تدريجياً.
+   - تأكيد صريح: لم يتم تنفيذ أي git commit أو git push أو merge أو PR أو تشغيل
+     يدوي لـ CI، والتنفيذ للمهام 1–4 انتهى محلياً بانتظار موافقتك التالية.
+================================================================================

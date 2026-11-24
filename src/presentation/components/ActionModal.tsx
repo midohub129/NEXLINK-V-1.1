@@ -1288,6 +1288,14 @@ export function ActionModal({
                         setStatusMessage(
                           `تمت الاستعادة الآمنة (${result.restoredEvents} حدث، ${result.restoredLinkedDevices} جهاز بحالة غير موثوقة، ${result.restoredAuditEntries} سجل مستورد). تم الحفاظ على هوية هذا الجهاز ومفاتيحه ودوره المحلي.`
                         );
+                        if (
+                          result.postRestoreWarnings &&
+                          result.postRestoreWarnings.length > 0
+                        ) {
+                          setErrorMessage(
+                            `تم حفظ البيانات المستعادة في قاعدة البيانات بنجاح، لكن تعذّر تحديث بعض الخدمات في الذاكرة (${result.postRestoreWarnings.join(' ')}). يُنصح بإعادة تحميل التطبيق.`
+                          );
+                        }
                       } finally {
                         setRestorePassphrase('');
                         setBackupBusy(false);

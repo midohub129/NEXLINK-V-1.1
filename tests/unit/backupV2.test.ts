@@ -1,13 +1,18 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { executeRestoreWithPostCommitRecovery } from '../../src/application/container';
 import { SecurityError, StorageError, ValidationError } from '../../src/domain/errors/appError';
 import {
   BACKUP_KDF_MAX_ITERATIONS,
   BACKUP_KDF_MIN_ITERATIONS,
+  BACKUP_MAX_AUDIT_ENTRIES,
+  BACKUP_MAX_LINKED_DEVICES,
+  BACKUP_MAX_SELECTED_APPS,
   BACKUP_MAX_SYNC_EVENTS,
   ENCRYPTED_BACKUP_FORMAT_ID,
   ENCRYPTED_BACKUP_FORMAT_VERSION,
   type EncryptedBackupArchiveV2,
+  type LegacyBackupArchiveV1,
 } from '../../src/domain/models/backup';
 import { DEFAULT_APP_SETTINGS } from '../../src/domain/models/settings';
 import { WebCryptoProvider } from '../../src/infrastructure/security/webCryptoProvider';
@@ -626,5 +631,423 @@ describe('Encrypted Backup v2 Unit & Cryptographic Verification (Real WebCrypto 
     assert.equal(migratedRows[0].action, 'DEVICE_REVOKED');
     assert.equal(migratedRows[0].origin, 'LOCAL');
     assert.equal(migratedRows[0].importedAt, null);
+  });
+
+  it('isolates legacy v1 migration from migrating device state, freezes pending events, and blocks forged identity replay', async () => {
+    const harness = new InMemoryIndexedDbHarness();
+    const migratingStack = await createRealWebCryptoStack('db-v1-migrating-host', harness);
+    await migratingStack.deviceRepo.saveIdentity({
+      publicId: 'host-migrator-id',
+      cryptoKeyId: 'host-migrator-key',
+      publicKeyJwk: null,
+      ecdhPublicKeyJwk: null,
+      createdAt: 1700000000000,
+    });
+    // Migrating host has its own locally revoked peer that must NOT leak into v1->v2 output
+    await migratingStack.deviceRepo.upsertLinkedDevice({
+      publicId: 'host-local-revoked-secret-peer',
+      cryptoKeyId: 'ecdsa-host-revoked',
+      publicKeyJwk: null,
+      ecdhPublicKeyJwk: null,
+      label: 'Host Secret Revoked Peer',
+      role: 'basic',
+      pairingState: 'REVOKED',
+      pairedAt: null,
+      lastSeenAt: null,
+      verifiedByRelay: false,
+    });
+
+    const targetStack = await createRealWebCryptoStack('db-v1-forged-target', harness);
+    await targetStack.deviceRepo.saveIdentity({
+      publicId: 'target-real-id',
+      cryptoKeyId: 'target-real-key',
+      publicKeyJwk: null,
+      ecdhPublicKeyJwk: null,
+      createdAt: 1700000000000,
+    });
+    await targetStack.settingsRepo.save({
+      ...DEFAULT_APP_SETTINGS,
+      role: 'basic',
+    });
+
+    // Craft a legacy v1 archive claiming the TARGET device's identity & admin role,
+    // containing PENDING/IN_PROGRESS events, a PAIRED peer matching migrating host ID,
+    // and spoofed audit origin='LOCAL'
+    const v1Body: Omit<LegacyBackupArchiveV1, 'checksumSha256'> = {
+      schemaVersion: 3,
+      exportedAt: 1700000050000,
+      settings: {
+        ...DEFAULT_APP_SETTINGS,
+        role: 'admin',
+      },
+      identity: {
+        publicId: 'target-real-id',
+        cryptoKeyId: 'target-real-key',
+        publicKeyJwk: { kty: 'EC', crv: 'P-256', x: '1', y: '2' },
+        ecdhPublicKeyJwk: { kty: 'EC', crv: 'P-256', x: '3', y: '4' },
+        createdAt: 1700000000000,
+      },
+      linkedDevices: [
+        {
+          publicId: 'host-migrator-id',
+          cryptoKeyId: 'host-migrator-key',
+          publicKeyJwk: null,
+          ecdhPublicKeyJwk: null,
+          label: 'Peer Matching Host ID',
+          role: 'basic',
+          pairingState: 'PAIRED',
+          pairedAt: 1700000010000,
+          lastSeenAt: 1700000020000,
+          verifiedByRelay: true,
+        },
+        {
+          publicId: 'v1-revoked-peer',
+          cryptoKeyId: 'ecdsa-v1-revoked',
+          publicKeyJwk: null,
+          ecdhPublicKeyJwk: null,
+          label: 'V1 Revoked Peer',
+          role: 'basic',
+          pairingState: 'REVOKED',
+          pairedAt: null,
+          lastSeenAt: 1700000020000,
+          verifiedByRelay: false,
+        },
+      ],
+      syncEvents: [
+        {
+          id: 1,
+          type: 'notification',
+          payload: 'legacy-pending-must-freeze',
+          createdAt: 1700000030000,
+          status: 'PENDING',
+          retryCount: 0,
+          nextRetryAt: null,
+          idempotencyKey: 'idem-v1-pending',
+          encrypted: true,
+        },
+        {
+          id: 2,
+          type: 'notification',
+          payload: 'legacy-inprogress-must-freeze',
+          createdAt: 1700000040000,
+          status: 'IN_PROGRESS',
+          retryCount: 1,
+          nextRetryAt: null,
+          idempotencyKey: 'idem-v1-inprogress',
+          encrypted: true,
+        },
+      ],
+      auditEntries: [
+        {
+          id: 1,
+          timestamp: 1700000045000,
+          action: 'ROLE_CHANGED',
+          actorRole: 'admin',
+          deviceId: 'target-real-id',
+          outcome: 'ALLOWED',
+          details: 'سجل v1 قديم',
+          origin: 'LOCAL',
+        },
+      ],
+    };
+
+    const canonical = JSON.stringify({
+      schemaVersion: v1Body.schemaVersion,
+      exportedAt: v1Body.exportedAt,
+      settings: v1Body.settings,
+      identity: v1Body.identity,
+      linkedDevices: v1Body.linkedDevices,
+      syncEvents: v1Body.syncEvents,
+      auditEntries: v1Body.auditEntries,
+    });
+    const checksumSha256 = await migratingStack.crypto.sha256Hex(canonical);
+    const v1Raw = JSON.stringify({ ...v1Body, checksumSha256 });
+
+    // Rejects private JWK inside legacy.identity
+    const taintedPrivateV1 = structuredClone({ ...v1Body, checksumSha256 });
+    (taintedPrivateV1.identity!.publicKeyJwk as Record<string, unknown>).d = 'SECRET_D';
+    await assert.rejects(
+      () =>
+        migratingStack.backup.migrateLegacyBackup(
+          JSON.stringify(taintedPrivateV1),
+          STRONG_PASSPHRASE,
+          { userConfirmedLegacyImport: true }
+        ),
+      (err: unknown) =>
+        err instanceof SecurityError && err.code === 'BACKUP_PRIVATE_KEY_REJECTED'
+    );
+
+    const migrated = await migratingStack.backup.migrateLegacyBackup(
+      v1Raw,
+      STRONG_PASSPHRASE,
+      { userConfirmedLegacyImport: true }
+    );
+    const inner = JSON.parse(
+      await migratingStack.crypto.decryptBackupPayload({
+        archive: migrated.archive,
+        passphrase: STRONG_PASSPHRASE,
+      })
+    );
+
+    // Pure isolation & anti-forgery invariants inside migrated v2 archive
+    assert.equal(inner.sourceDevice, null);
+    assert.equal(inner.settings.role, null);
+    assert.equal(inner.linkedDevices.length, 2);
+    assert.ok(
+      !inner.linkedDevices.some(
+        (d: { publicId: string }) => d.publicId === 'host-local-revoked-secret-peer'
+      )
+    );
+    assert.equal(
+      inner.linkedDevices.find(
+        (d: { publicId: string }) => d.publicId === 'host-migrator-id'
+      ).pairingState,
+      'UNPAIRED'
+    );
+    assert.equal(
+      inner.linkedDevices.find(
+        (d: { publicId: string }) => d.publicId === 'v1-revoked-peer'
+      ).pairingState,
+      'REVOKED'
+    );
+    assert.ok(
+      inner.syncEvents.every((e: { status: string }) => e.status === 'FAILED')
+    );
+    assert.equal(inner.auditEntries[0].origin, undefined);
+
+    // Restoring migrated v2 onto forged-target device MUST still treat as cross-device & preserve target role
+    const restoreRes = await targetStack.backup.restoreBackup(
+      migrated.archive,
+      STRONG_PASSPHRASE
+    );
+    assert.equal(restoreRes.crossDeviceRestore, true);
+    assert.equal(restoreRes.restoredRole, 'basic');
+    assert.equal((await targetStack.settingsRepo.get()).role, 'basic');
+    const restoredEvents = await targetStack.syncRepo.getAll();
+    assert.ok(restoredEvents.every((e) => e.status === 'FAILED'));
+    const restoredAudits = await targetStack.auditRepo.getAll();
+    assert.equal(restoredAudits[0].origin, 'BACKUP_IMPORT');
+  });
+
+  it('enforces symmetric export and restore limits without silently dropping audit logs', async () => {
+    const harness = new InMemoryIndexedDbHarness();
+    const stack = await createRealWebCryptoStack('db-symmetric-limits', harness);
+    await stack.deviceRepo.saveIdentity({
+      publicId: 'limit-dev-1',
+      cryptoKeyId: 'limit-key-1',
+      publicKeyJwk: null,
+      ecdhPublicKeyJwk: null,
+      createdAt: 1700000000000,
+    });
+
+    // 1. Export rejects selectedNotificationApps > BACKUP_MAX_SELECTED_APPS
+    await stack.settingsRepo.save({
+      ...DEFAULT_APP_SETTINGS,
+      role: 'admin',
+      selectedNotificationApps: Array.from(
+        { length: BACKUP_MAX_SELECTED_APPS + 1 },
+        (_, i) => `com.app.${i}`
+      ),
+    });
+    await assert.rejects(
+      () => stack.backup.exportBackup(STRONG_PASSPHRASE),
+      (err: unknown) =>
+        err instanceof ValidationError && err.code === 'BACKUP_LIMIT_EXCEEDED'
+    );
+    await stack.settingsRepo.save({ ...DEFAULT_APP_SETTINGS, role: 'admin' });
+
+    // 2. Export rejects linkedDevices > BACKUP_MAX_LINKED_DEVICES
+    for (let i = 0; i <= BACKUP_MAX_LINKED_DEVICES; i += 1) {
+      await stack.deviceRepo.upsertLinkedDevice({
+        publicId: `peer-${i}`,
+        cryptoKeyId: `key-${i}`,
+        publicKeyJwk: null,
+        ecdhPublicKeyJwk: null,
+        label: `Peer ${i}`,
+        role: 'basic',
+        pairingState: 'UNPAIRED',
+        pairedAt: null,
+        lastSeenAt: null,
+        verifiedByRelay: false,
+      });
+    }
+    await assert.rejects(
+      () => stack.backup.exportBackup(STRONG_PASSPHRASE),
+      (err: unknown) =>
+        err instanceof ValidationError && err.code === 'BACKUP_LIMIT_EXCEEDED'
+    );
+    for (let i = 0; i <= BACKUP_MAX_LINKED_DEVICES; i += 1) {
+      await stack.deviceRepo.removeLinkedDevice(`peer-${i}`);
+    }
+
+    // 3. Export MUST NOT silently slice auditEntries beyond BACKUP_MAX_AUDIT_ENTRIES; it must fail explicitly
+    for (let i = 0; i < BACKUP_MAX_AUDIT_ENTRIES; i += 1) {
+      await stack.auditRepo.append({
+        timestamp: 1700000000000 + i,
+        action: 'VAULT_VERIFIED',
+        actorRole: 'admin',
+        deviceId: 'limit-dev-1',
+        outcome: 'ALLOWED',
+        details: `audit-${i}`,
+      });
+    }
+    // At exact limit -> succeeds and exports all 1000 without dropping any
+    const exactLimitExport = await stack.backup.exportBackup(STRONG_PASSPHRASE);
+    assert.equal(exactLimitExport.auditCount, BACKUP_MAX_AUDIT_ENTRIES);
+
+    // One over limit -> MUST throw BACKUP_LIMIT_EXCEEDED (never slice)
+    await stack.auditRepo.append({
+      timestamp: 1700000099999,
+      action: 'DEVICE_REVOKED',
+      actorRole: 'admin',
+      deviceId: 'limit-dev-1',
+      outcome: 'ALLOWED',
+      details: 'must-not-be-silently-dropped',
+    });
+    await assert.rejects(
+      () => stack.backup.exportBackup(STRONG_PASSPHRASE),
+      (err: unknown) =>
+        err instanceof ValidationError && err.code === 'BACKUP_LIMIT_EXCEEDED'
+    );
+
+    // 4. Restore rejects atomically when existing local audits + archive audits > BACKUP_MAX_AUDIT_ENTRIES
+    const targetStack = await createRealWebCryptoStack('db-audit-limit-restore', harness);
+    await targetStack.auditRepo.append({
+      timestamp: 1700000000001,
+      action: 'DEVICE_REVOKED',
+      actorRole: 'admin',
+      deviceId: 'target-dev',
+      outcome: 'ALLOWED',
+      details: 'existing-local-revocation-must-stay',
+    });
+    await assert.rejects(
+      () =>
+        targetStack.backup.restoreBackup(exactLimitExport.archive, STRONG_PASSPHRASE),
+      (err: unknown) =>
+        err instanceof ValidationError && err.code === 'BACKUP_LIMIT_EXCEEDED'
+    );
+    const auditsAfterRejectedRestore = await targetStack.auditRepo.getAll();
+    assert.equal(auditsAfterRejectedRestore.length, 1);
+    assert.equal(
+      auditsAfterRejectedRestore[0].details,
+      'existing-local-revocation-must-stay'
+    );
+  });
+
+  it('isolates post-commit restore refresh/audit failures from pre-commit rollback errors and runs all independent recovery steps', async () => {
+    const baseIdentity = {
+      publicId: 'rec-dev-1',
+      cryptoKeyId: 'rec-key-1',
+      publicKeyJwk: null,
+      ecdhPublicKeyJwk: null,
+      createdAt: 1700000000000,
+    };
+
+    // 1. Pre-commit failure restarts syncEngine and rethrows without post-commit warnings
+    let syncStopped = 0;
+    let syncStarted = 0;
+    let reloadCalled = 0;
+    await assert.rejects(
+      () =>
+        executeRestoreWithPostCommitRecovery({
+          restoreBackup: async () => {
+            throw new ValidationError(
+              'BACKUP_AUTH_FAILED',
+              'فشل التحقق من عبارة المرور.',
+              'wrong passphrase'
+            );
+          },
+          stopSyncEngine: async () => {
+            syncStopped += 1;
+          },
+          startSyncEngine: async () => {
+            syncStarted += 1;
+          },
+          reloadSettings: async () => {
+            reloadCalled += 1;
+            return { ...DEFAULT_APP_SETTINGS, role: 'admin' };
+          },
+          getSettingsSnapshot: () => ({ ...DEFAULT_APP_SETTINGS, role: 'admin' }),
+          setRelayBaseUrl: () => {},
+          initializeSecurity: async () => {},
+          startDeviceManager: async () => {},
+          getIdentity: () => baseIdentity,
+          fallbackIdentity: baseIdentity,
+          issueSession: () => {},
+          clearSession: () => {},
+          recordAudit: async () => {
+            throw new Error('should not run on pre-commit failure');
+          },
+          captureError: () => {},
+        }),
+      (err: unknown) =>
+        err instanceof ValidationError && err.code === 'BACKUP_AUTH_FAILED'
+    );
+    assert.equal(syncStopped, 1);
+    assert.equal(syncStarted, 1);
+    assert.equal(reloadCalled, 0);
+
+    // 2. Post-commit failures in settings/security/devices/sync/audit do NOT throw false rollback errors
+    // and all independent steps still execute
+    const stepsExecuted: string[] = [];
+    const capturedMessages: string[] = [];
+    const result = await executeRestoreWithPostCommitRecovery({
+      restoreBackup: async () => ({
+        restoredEvents: 3,
+        restoredLinkedDevices: 1,
+        restoredAuditEntries: 2,
+        crossDeviceRestore: true,
+        restoredRole: 'admin',
+      }),
+      stopSyncEngine: async () => {
+        stepsExecuted.push('stopSync');
+      },
+      startSyncEngine: async () => {
+        stepsExecuted.push('startSync');
+        throw new Error('sync start transient failure');
+      },
+      reloadSettings: async () => {
+        stepsExecuted.push('reloadSettings');
+        throw new Error('settings cache reload failure');
+      },
+      getSettingsSnapshot: () => ({ ...DEFAULT_APP_SETTINGS, role: 'admin' }),
+      setRelayBaseUrl: () => {},
+      initializeSecurity: async () => {
+        stepsExecuted.push('initSecurity');
+        throw new Error('security init failure');
+      },
+      startDeviceManager: async () => {
+        stepsExecuted.push('startDevices');
+      },
+      getIdentity: () => baseIdentity,
+      fallbackIdentity: baseIdentity,
+      issueSession: () => {
+        stepsExecuted.push('issueSession');
+      },
+      clearSession: () => {
+        stepsExecuted.push('clearSession');
+      },
+      recordAudit: async () => {
+        stepsExecuted.push('recordAudit');
+        throw new Error('audit write failure');
+      },
+      captureError: (_err, _scope, msg) => {
+        capturedMessages.push(msg);
+      },
+    });
+
+    assert.equal(result.restoredEvents, 3);
+    assert.equal(result.restoredRole, 'admin');
+    assert.deepEqual(stepsExecuted, [
+      'stopSync',
+      'reloadSettings',
+      'initSecurity',
+      'startDevices',
+      'startSync',
+      'issueSession',
+      'recordAudit',
+    ]);
+    assert.equal(result.postRestoreWarnings?.length, 4);
+    assert.equal(capturedMessages.length, 4);
   });
 });

@@ -128,6 +128,7 @@ export interface BackupRestoreResult {
   restoredAuditEntries: number;
   crossDeviceRestore: boolean;
   restoredRole: DeviceRole | null;
+  postRestoreWarnings?: string[];
 }
 
 export function buildEncryptedBackupAad(header: {

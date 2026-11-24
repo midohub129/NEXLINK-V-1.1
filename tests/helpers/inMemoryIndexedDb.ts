@@ -207,6 +207,12 @@ export class InMemoryIndexedDbHarness {
             value: Array.from(cfg.records.values()).map((r) => cloneRecord(r)),
           }));
         },
+        count() {
+          return runOp(() => ({
+            ok: true,
+            value: cfg.records.size,
+          }));
+        },
         put(val: Record<string, unknown>) {
           return runOp(() => writeRecord(val, false));
         },
