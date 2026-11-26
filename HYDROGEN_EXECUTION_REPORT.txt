@@ -366,3 +366,438 @@
    - بانتظار المراجعة المستقلة والموافقة التالية قبل أي إجراء Git أو CI.
 ================================================================================
 
+================================================================================
+التقرير 6: تسليم أدلة ومراجعة ذاتية لتعديلات SyncEngine (مهمة تدقيق وقراءة فقط)
+================================================================================
+تاريخ التدقيق: 2026-11-26
+نطاق الصلاحية: قراءة وفحص وتشغيل فحوصات غير معدِّلة فقط — لم يُجرَ أي تعديل على الشيفرة أو الاختبارات أو ملفات الإعداد، ولم يُنفَّذ أي إجراء Git أو CI.
+
+--------------------------------------------------------------------------------
+أولاً: الحالة قبل التدقيق ومصدر الملفات وحالة Git
+--------------------------------------------------------------------------------
+1. مسار العمل الحالي (pwd):
+   /app/applet
+2. المجلد الأب (/app) والمحتويات المحيطة:
+   applet ، cloudsql ، cloud_sql_proxyd ، control-plane-api ، .dev.pid ، start.sh
+3. فحص مستودع Git:
+   - لا يوجد مجلد `.git` داخل `/app/applet` ولا في `/app`.
+   - ناتج `git status` و`git rev-parse HEAD` و`git remote -v`:
+     `fatal: not a git repository (or any of the parent directories): .git` (رمز الخروج: 128).
+   - حالة الفرع وHEAD وRemote: غير متاحة محلياً (`GIT_UNAVAILABLE_NO_DOT_GIT`).
+4. التصنيف الصادق لمصدر الملفات مقارنةً بالمرجع `0d2aeff90a7371aff49634ff4bc82a025468ae72`:
+   - **غير مثبت عبر Git (Unverified via Git / Local Container Snapshot)**:
+     لا يمكن إثبات التطابق أو استخراج `git diff` تشفيرياً مقابل Commit
+     `0d2aeff90a7371aff49634ff4bc82a025468ae72` على GitHub بسبب غياب `.git`.
+   - الملفات الموجودة في `/app/applet` تمثل لقطة بيئة العمل المحلية بعد المهام 1–4
+     والمهمة 5 داخل حاوية التنفيذ (مع بصمات SHA-256 المثبتة أدناه).
+   - كما تبيّن أن ملفات البناء والتقارير المؤقتة السابقة (`dist/index.html`،
+     `tsconfig.tsbuildinfo`، `playwright-report/index.html`) غير موجودة حالياً على القرص
+     بعد استئناف الحاوية.
+
+--------------------------------------------------------------------------------
+ثانياً: قائمة الملفات المعدلة في المهمة 5، وبصماتها، والدوال والأسطر المتأثرة
+--------------------------------------------------------------------------------
++------------------------------------------------+--------+------------+------------------------------------------------------------------+
+| المسار الكامل النسبي من جذر المشروع            | الحجم  | عدد الأسطر | بصمة SHA-256 (التحقق الفعلي على القرص)                          |
++------------------------------------------------+--------+------------+------------------------------------------------------------------+
+| src/application/container.ts                   | 28299  | 767 (768)  | 49da9bb1daf7571cb950277404d515e53d546799e2eb6d4df98783d04e179e9d |
+| src/domain/models/backup.ts                    | 4808   | 160 (161)  | 0afa743b8eff8daa7f38503ea0fcb1d3f77b2a90221161c80b829b6266d7e387 |
+| src/application/sync/syncEngine.ts             | 51806  | 1590 (1591)| e02277f5856a0907bd5ace2a8813269971b2ad8f586f44d0299516b4d63419d3 |
+| src/application/health/healthMonitor.ts        | 3093   | 92 (93)    | 086a490fd27a9030c50bafbe136a36320e1a8446eb5d86a46e78f0357aa1102a |
+| src/presentation/components/ActionModal.tsx    | 78359  | 1622 (1623)| f5427ad9f62f1b97fe1d8b8220c1693094241fd16ef3a85dbc1cdcc8acc56e1b |
+| tests/unit/backupV2.test.ts                    | 49952  | 1337 (1338)| 6e7703a1326e5139017f80c12921f381b6673dd1a4cf4bcbb8d31c6edf65eed7 |
++------------------------------------------------+--------+------------+------------------------------------------------------------------+
+(ملاحظة: الرقم الأول في عمود الأسطر من `wc -l` أي عدد فواصل الأسطر، والرقم بين قوسين من قراءة المحرر شاملة السطر الأخير الفارغ. تم أيضاً تحديث `HYDROGEN_EXECUTION_REPORT.txt` فقط للتقارير التراكمية دون أي تعديل على بقية ملفات المشروع.)
+
+تفصيل الدوال/الواجهات المتأثرة وسبب التغيير في كل ملف:
+1. `src/application/container.ts`:
+   - `import { AppError ... }` (سطر 1)، `describeRestoreError` (91–99)،
+     `executeRestoreWithPostCommitRecovery` (118–319)، `restoreBackupJson` (709–739).
+   - السبب: منع الاستمرار إلى `restoreBackup()` عند فشل `stopSyncEngine()`، وإزالة
+     ابتلاع خطأ `startSyncEngine().catch(() => {})` في مسار فشل ما قبل الالتزام،
+     وتمرير `syncEngineRunning` في نتيجة الاستعادة.
+2. `src/domain/models/backup.ts`:
+   - إضافة `syncEngineRunning?: boolean;` في `BackupRestoreResult` (سطر 132).
+   - السبب: نقل حالة تشغيل `SyncEngine` بعد الاستعادة إلى واجهة المستخدم دون كسر التوافق الخلفي.
+3. `src/application/sync/syncEngine.ts`:
+   - إضافة `private lifecycleState: 'IDLE' | 'RUNNING' | 'STOPPED' | 'ERROR' = 'IDLE'` (سطر 91)،
+     وتحديث `start()` (111–165) و`stop()` (175–200)، وإضافة `getLifecycleState()` (218–220).
+   - السبب: تمكين `HealthMonitor` من التمييز الصريح بين حالات دورة حياة `SyncEngine`.
+4. `src/application/health/healthMonitor.ts`:
+   - تحديث `getSnapshot()` (44–56) لقراءة `this.syncEngine.getLifecycleState()`.
+   - السبب: منع ظهور `syncStatus = 'HEALTHY'` عندما يكون المحرك في حالة `'ERROR'` أو `'STOPPED'`.
+5. `src/presentation/components/ActionModal.tsx`:
+   - تحديث `formatBackupError` (279–284) لمعالجة `context?.syncEngineRestartFailed === true`،
+     وتحديث معالج الاستعادة (1294–1310) لفحص `result.syncEngineRunning === false`.
+   - السبب: عدم إخفاء فشل إعادة تشغيل `SyncEngine` خلف رسالة خطأ ثابتة أو رسالة نجاح عامة.
+6. `tests/unit/backupV2.test.ts`:
+   - تحديث الاستيرادات (3–52)، وإضافة `createRecoveryHarness()` و5 اختبارات وحدة (976–1337).
+   - السبب: اختبار مسارات الفشل والاستعادة ومراقبة الحالة الصحية على مستوى الوحدة.
+
+--------------------------------------------------------------------------------
+ثالثاً: تسليم المحتوى الكامل للملفات المعدلة
+--------------------------------------------------------------------------------
+نظراً لحجم الملفات الستة الكلي (216,317 بايت / 5,568 سطراً)، تم تسليم النسخة الحرفية
+الكاملة لكل ملف دون أي اقتطاع في المرفقات (Artifacts) المصاحبة لهذه الجلسة والمطابقة
+تماماً لبصمات SHA-256 أعلاه:
+- مرفق 1: `task5_files_core.txt` (المحتوى الحرفي الكامل لـ `container.ts` و`backup.ts` و`healthMonitor.ts`)
+- مرفق 2: `task5_files_syncEngine.txt` (المحتوى الحرفي الكامل لـ `syncEngine.ts`)
+- مرفق 3: `task5_files_actionModal.txt` (المحتوى الحرفي الكامل لـ `ActionModal.tsx`)
+- مرفق 4: `task5_files_backupV2_test.txt` (المحتوى الحرفي الكامل لـ `tests/unit/backupV2.test.ts`)
+- مرفق 5: `HYDROGEN_EXECUTION_REPORT.txt` (هذا التقرير التراكمي كاملاً)
+
+--------------------------------------------------------------------------------
+رابعاً: المراجعة الذاتية التقنية — إجابات الأسئلة الـ 29 من الشيفرة الفعلية
+--------------------------------------------------------------------------------
+=== القسم أ: إيقاف SyncEngine وعزل قاعدة البيانات قبل الاستعادة (س1–س6) ===
+
+س1: هل يتوقف SyncEngine قبل استدعاء restoreBackup()؟
+- حقيقة من الشيفرة (`src/application/container.ts:121-122, 174, 724`): نعم، يتم استدعاء
+  `await deps.stopSyncEngine()` (الذي ينادي `syncEngine.stop()`) والانتظار حتى انتهائه
+  قبل استدعاء `await deps.restoreBackup()`.
+- القيد الفعلي: التوقف هنا يزيل مستمعات النقل من `SyncEngine` ويضع حالته إلى `'STOPPED'`،
+  لكنه لا يضمن توقف العمليات غير المتزامنة الجارية أصلاً ولا المؤقتات الخارجية (انظر س2–س4).
+
+س2: هل ينتظر SyncEngine.stop() انتهاء العمليات الجارية (runSyncCycle / pullInboundEvents / ingestInboundEvent / retryPendingInboundAcks / handleDeliveryAcks)؟
+- **لا (ثغرة مثبتة من الشيفرة):** في `src/application/sync/syncEngine.ts:175-200`،
+  تقوم `stop()` فقط بإلغاء الاشتراكات الثلاثة (`unsubInbound`, `unsubDeliveryAcks`,
+  `unsubTransportState`) ثم تنفذ:
+  `this.isProcessing = false;` (سطر 189)
+  `this.pullInFlight = null;` (سطر 190)
+  `this.lifecycleState = 'STOPPED';` (سطر 191)
+- لا توجد أي متابعة أو `await` لأي `Promise` قيد التشغيل من `runSyncCycle()` أو
+  `pullInFlight` أو `ingestInboundEvent()` أو `retryPendingInboundAcks()` أو `handleDeliveryAcks()`.
+
+س3: ما خطر تصفير isProcessing وpullInFlight فوراً أثناء stop()؟
+- **حالة سباق فعلية (Race Condition):** إذا كانت `runSyncCycle()` قد دخلت ووضعت
+  `this.isProcessing = true` (سطر 1244) وكانت متوقفة عند `await this.crypto.encryptForPeer(...)`
+  (سطر 1330) أو `await this.transport.sendSyncBatch(...)` (سطر 1351) أو
+  `await this.repo.updateEvent(...)` (سطر 1391) لحظة استدعاء `stop()`، فإنها تكمل عملها
+  وتكتب في `IndexedDbSyncEventRepository` (عبر معاملات IndexedDB مستقلة لكل استدعاء)
+  بالتوازي مع معاملة `restoreBackup()`! وعند انتهائها تصل إلى كتلة `finally`
+  (الأسطر 1464–1468) فتعيد قراءة `this.eventsCache = await this.repo.getAll()` وتُعيد
+  `this.isProcessing = false` وتطلق `notify()`. كما يسمح تصفير `isProcessing` و`pullInFlight`
+  لنداء جديد بالدخول بالتوازي مع النداء القديم الذي لم ينتهِ بعد.
+
+س4: هل توجد مؤقتات أو مستمعات أو استدعاءات أخرى قد تكتب في IndexedDB أثناء الاستعادة؟
+- **نعم — عدة مسارات مثبتة في الشيفرة:**
+  1) مؤقت `syncTimer` في `schedulerParticipant` (`src/application/container.ts:429-438`):
+     دالة `restoreBackupJson` (`container.ts:724`) توقف `syncEngine.stop()` فقط، ولا توقف
+     `schedulerParticipant.stop()`. يستمر `setInterval` بالعمل؛ وإذا كان `connectionServiceEnabled`
+     مفعلاً وحالة `transportClient.getState() === 'CONNECTED'`، يستدعي كل فترة
+     `syncEngine.runSyncCycle()` و`syncEngine.pullInboundEvents()`.
+  2) غياب حارس `lifecycleState` داخل `SyncEngine`: كل من `runSyncCycle()` (سطر 1164)،
+     `pullInboundEvents()` (سطر 646)، `ingestInboundEvent()` (سطر 671)،
+     `retryPendingInboundAcks()` (سطر 551)، `handleDeliveryAcks()` (سطر 326)،
+     `enqueueNotification()` (سطر 241)، `updateEventStatus()` (سطر 1496)،
+     `manualRetryEvent()` (سطر 1519)، `deleteEvent()` (سطر 1542)، و`clearAllEvents()` (سطر 1558)
+     **لا تتحقق من `this.lifecycleState === 'RUNNING'`**. لذلك حتى بعد نجاح `stop()`، أي مؤقت
+     أو نقر مستخدم على «مزامنة الآن» (`container.ts:576`) سيشغّل المزامنة ويكتب في القاعدة أثناء الاستعادة.
+  3) `DeviceManager` (`src/application/devices/deviceManager.ts:102-109`): يبقى `unsubPairing`
+     نشطاً أثناء الاستعادة؛ فإذا وصل إشعار WebSocket من المرحل (`pairing:*` أو `device:*`)
+     يستدعي `refreshLinkedDevicesFromRelay()` التي تكتب/تحذف في مخزن `LINKED_DEVICES`.
+  4) `RelayTransportClient` (`src/infrastructure/transport/relayTransportClient.ts:444-450`):
+     مؤقت `reconnectTimer` يستمر بالعمل تلقائياً إذا لم يُستدعَ `disconnect()`.
+
+س5: هل يوجد قفل (Mutex/Lock) يمنع تنفيذ عمليتي استعادة متزامنتين؟
+- **لا يوجد قفل برمجي.** الحماية الوحيدة هي حالة واجهة React المحلية `backupBusy` داخل
+  `src/presentation/components/ActionModal.tsx:237, 1287, 1523`؛ وهي تزول إذا أُغلق
+  المودال وأُعيد فتحه، ولا تحمي `container.restoreBackupJson()` أو
+  `executeRestoreWithPostCommitRecovery()` من استدعاءين متزامنين في الشيفرة.
+
+س6: هل تمنع آلية Pre-commit حدوث تداخل إذا نجح stopSyncEngine() شكلياً؟
+- تضمن `executeRestoreWithPostCommitRecovery` عدم استدعاء `restoreBackup()` إذا رمى
+  `stopSyncEngine()` استثناءً (`container.ts:121-170`). لكنها لا تضمن عزل القاعدة عن
+  العمليات الجارية أو المؤقتات للأسباب الموضحة في س2 و س4.
+
+=== القسم ب: دورة حياة SyncEngine وحالته (س7–س13) ===
+
+س7: ماذا يحدث عند استدعاء SyncEngine.start() مرتين؟
+- **تسلسلياً (بعد انتهاء الأولى):** (`syncEngine.ts:111-165`) تعيد تهيئة المستودع وتعيد
+  `IN_PROGRESS` إلى `PENDING` وتعيد تعبئة `eventsCache` و`seenE2eeNonces`، ولا تكرر تسجيل
+  المستمعات لوجود `if (!this.unsubInbound)` إلخ، وتبقي الحالة `'RUNNING'`.
+- **متزامناً (دون `await` بين الاستدعاءين):** لا يوجد `startPromise` لمنع الدخول المتزامن.
+  لأن تسجيل المستمعات (`unsubInbound` إلخ، الأسطر 132–156) يقع بعد 3 عمليات `await`
+  (`initialize`, `resetInProgressToPending`, `getAll`)، فإن الاستدعاءين يمران بشرط
+  `!this.unsubInbound` معاً، فيُسجَّل اشتراكان مكرران لكل مستمع على `transportClient`،
+  وتحتفظ `SyncEngine` بمرجع الإلغاء الثاني فقط فتتسرب الاشتراكات الأولى دون إمكانية إلغائها في `stop()`.
+
+س8: ماذا يحدث عند استدعاء SyncEngine.stop() مرتين؟
+- آمن من جهة تكرار إلغاء المستمعات لأن المراجع الثلاثة تُصفَّر إلى `null` بعد استدعائها
+  (`syncEngine.ts:177-188`)، وتبقى الحالة `'STOPPED'`. لكنه يكرر تصفير `isProcessing`
+  و`pullInFlight` دون انتظار.
+
+س9: ماذا يحدث عند تداخل SyncEngine.start() مع SyncEngine.stop()؟
+- **سباق حالة متاح:** لا يوجد قفل مشترك بين `start()` و`stop()` (بخلاف `LifecycleManager`).
+  إذا استُدعيت `stop()` بينما `start()` متوقفة عند `await this.repo.getAll()` (سطر 123)،
+  تضع `stop()` الحالة إلى `'STOPPED'`، ثم تستكمل `start()` عملها فتسجل المستمعات
+  وتبدّل الحالة إلى `'RUNNING'`، بينما يظن المستدعي أن المحرك متوقف.
+
+س10: إذا فشل start() بعد تسجيل جزء من المستمعات، هل يتم التنظيف (Rollback)؟
+- **لا (`syncEngine.ts:132-164`).** إذا نجح تسجيل `unsubInbound` و/أو `unsubDeliveryAcks` ثم
+  رمى `this.transport.subscribe(...)` (سطر 147) خطأً، تنتقل الدالة إلى `catch` (سطر 160)
+  وتضع `lifecycleState = 'ERROR'` وتترك المستمعات التي سُجّلت فعلاً عالقة دون إلغاء.
+  (وبالمثل تبقى أي تغييرات من `resetInProgressToPending()` في المستودع.)
+
+س11: إذا فشل stop() في المنتصف، هل تتأثر بقية المستمعات وحالة المحرك؟
+- **نعم (`syncEngine.ts:176-199`).** إذا رمى `this.unsubInbound()` خطأً، يقفز التنفيذ إلى
+  `catch` (سطر 193) قبل إلغاء `unsubDeliveryAcks` و`unsubTransportState`، وتصبح الحالة
+  `'ERROR'` مع بقاء المستمعَين الآخرَين مسجلَين.
+
+س12: هل حالة `'RUNNING'` تثبت أن النقل متصل أو أن دورة مزامنة قد نُفّذت؟
+- **لا (`syncEngine.ts:111-159`).** `'RUNNING'` تعني فقط اكتمال تهيئة `repo` وتحميل الذاكرة
+  المخبأة واشتراك مستمعات النقل. لا تفحص اتصال المرحل (`CONNECTED`) ولا تنفذ دورة مزامنة.
+
+س13: كيف تتغير حالة `'ERROR'` ومتى تزول؟
+- تزول `'ERROR'` عند نجاح استدعاء لاحق لـ `start()` فتصبح `'RUNNING'` (سطر 158)، أو عند
+  نجاح استدعاء لاحق لـ `stop()` فتصبح `'STOPPED'` (سطر 191). وفشل `runSyncCycle()` أو
+  `pullInboundEvents()` أثناء التشغيل لا يحوّل `lifecycleState` إلى `'ERROR'`.
+
+=== القسم ج: HealthMonitor والتقارير الصحية (س14–س18) ===
+
+س14: هل تمنع حالة `'STOPPED'` إرجاع `syncStatus = 'HEALTHY'`؟
+- **نعم (`src/application/health/healthMonitor.ts:48-49`).** الشرط `else if (syncLifecycle === 'STOPPED')`
+  يأتي مباشرة بعد `'ERROR'` وقبل جميع فروع `'HEALTHY'`. يعيد `'DEGRADED'` إذا كان
+  `failedCount > 0` وإلا `'IDLE'`.
+- ملاحظة: إذا كان المحرك `'STOPPED'` ويوجد أحداث `PENDING` أو `IN_PROGRESS` دون أحداث
+  `FAILED`، يعيد `HealthMonitor` القيمة `'IDLE'` مما لا يبرز وجود طابور معلق.
+
+س15: هل تمنع حالة `'ERROR'` إرجاع `syncStatus = 'HEALTHY'`؟
+- **نعم (`healthMonitor.ts:46-47`).** إذا كان `syncLifecycle === 'ERROR'` يعيد فوراً `'UNAVAILABLE'`.
+
+س16: ماذا يعيد HealthMonitor عندما يكون SyncEngine في الحالة الابتدائية `'IDLE'`؟
+- (`healthMonitor.ts:45-56`):
+  - إذا `failedCount > 0 && pendingCount === 0` -> `'DEGRADED'`.
+  - **ملاحظة حرجة:** إذا `pendingCount > 0` (أو `isSyncRunning()`) وكان `transportStatus === 'CONNECTED'`،
+    فإن السطرين 52–53 يعيدان `'HEALTHY'` **رغم أن `syncLifecycle === 'IDLE'` ولم يبدأ
+    المحرك بعد!**
+  - في غير ذلك يعيد `'IDLE'`.
+
+س17: هل يمكن أن يعيد HealthMonitor القيمة `'HEALTHY'` اعتماداً على أحداث قديمة رغم انقطاع الاتصال؟
+- **نعم (`healthMonitor.ts:54-55`).**
+  `else if (syncedCount > 0 && syncLifecycle === 'RUNNING') { syncStatus = 'HEALTHY'; }`
+  إذا وجد حدث واحد قديم أو مستعاد بحالة `'SYNCED'` (مع `pendingCount === 0` و`failedCount === 0`)
+  وكان المحرك `'RUNNING'`، فسيُرجع `'HEALTHY'` حتى لو كان `transportStatus` يساوي
+  `'DISCONNECTED'` أو `'ERROR'` أو `'RECONNECTING'`.
+
+س18: هل يؤثر آخر خطأ في ErrorManager على حساب `syncStatus`؟
+- **لا.** `HealthMonitor.getSnapshot()` (`healthMonitor.ts:58, 70-77`) يعرض `lastError`
+  للمراقبة فقط ولا يُدخل مصدر الخطأ (مثل `'SYNC'` أو `'TRANSPORT'`) في معادلة `syncStatus`.
+
+=== القسم د: مسارات الفشل والأخطاء في الاستعادة والواجهة (س19–س25) ===
+
+س19: إذا فشل `stopSyncEngine()`، هل يوجد أي مسار ينفذ `restoreBackup()`؟
+- **لا (`container.ts:121-170`).** كل المسارات داخل `catch (stopErr)` تنتهي بالرمي عند
+  الأسطر 156 أو 159 أو 162 ولا تصل أبداً إلى السطر 174 (`deps.restoreBackup()`).
+
+س20: كيف يُعالَج فشل `stopSyncEngine()` متبوعاً بفشل `startSyncEngine()`؟
+- (`container.ts:123-156`): يُلتقط `stopErr` بمصدر `'SYNC'`، ثم تُستدعى `startSyncEngine()`.
+  إذا فشلت أيضاً يُلتقط `recoverErr` بمصدر `'SYNC'`، ويُرمى `AppError` برمز
+  `'BACKUP_RESTORE_SYNC_STOP_AND_RESTART_FAILED'` ومصدر `'SYNC'` و`cause: stopErr`
+  و`context: { stopError: stopErr, syncRestartError: restartErr, syncEngineRestartFailed: true }`.
+
+س21: عند فشل `restoreBackup()`، ما الفرق بين نجاح `startSyncEngine()` وفشلها؟
+- عند نجاحها (`container.ts:221`): يُعاد رمي `preCommitErr` الأصلي بعينه (`throw preCommitErr;`)
+  دون تسجيل في `ErrorManager`.
+- عند فشلها (`container.ts:179-219`): يُسجّل `syncRestartErr` في `ErrorManager` بمصدر `'SYNC'`.
+  - إذا كان `preCommitErr instanceof AppError`: يُنشأ `new AppError` يحمل `code` و`source`
+    و`retryable` الأصليين مع `cause: preCommitErr` و`context.syncEngineRestartFailed = true`.
+    **ملاحظة صادقة:** هذا التغليف يغيّر الصنف إلى `AppError` المجرد بحيث يصبح
+    `err instanceof ValidationError` أو `SecurityError` مساوياً `false` (بينما يبقى في `err.cause`).
+  - إذا لم يكن `AppError`: يُنشأ `AppError` برمز `'BACKUP_RESTORE_AND_SYNC_RESTART_FAILED'`
+    ومصدر `'STORAGE'`.
+
+س22: إذا التزمت `restoreBackup()` وفشل تحديث ما بعد الالتزام، هل تستمر بقية الخطوات؟
+- **نعم (`container.ts:224-318`).** كل خطوة من الخطوات الست (إعدادات+مرحل، أمان، أجهزة،
+  محرك المزامنة، الجلسة، سجل التدقيق) داخل `try/catch` مستقل.
+- **ملاحظات دقيقة:**
+  1) إذا فشل `reloadSettings()`، يستخدم الكود `restoredSettings = deps.getSettingsSnapshot()`
+     (الإعدادات السابقة في الذاكرة قبل الاستعادة!) عند استدعاء `issueSession` واختيار
+     `effectiveRole`، ولا يُحدَّث `setRelayBaseUrl` من الإعدادات المستعادة في قاعدة البيانات.
+  2) دالتا `deps.getIdentity()` (سطر 274) و`deps.getSettingsSnapshot()` (سطر 226) غير
+     محاطتين بـ `try/catch` (رغم كونهما متزامنتين لقراءة الذاكرة في `AppContainer`).
+
+س23: ما الذي يثبته حقل `syncEngineRunning` في `BackupRestoreResult` فعلياً؟
+- (`container.ts:225, 263-264, 316`): يثبت فقط أن استدعاء `await deps.startSyncEngine()`
+  داخل خطوة ما بعد الالتزام قد عاد دون رمي استثناء. **لا** يتحقق مباشرةً من
+  `syncEngine.getLifecycleState() === 'RUNNING'`، ولا من استمرار `schedulerParticipant`،
+  ولا من عدم تغير حالة المحرك لحظة الإرجاع.
+
+س24: هل تعرض `ActionModal.tsx` أي تكرار أو تعارض في رسائل الاستعادة؟
+- **نعم، تم رصد مشكلتين فعليتين في `src/presentation/components/ActionModal.tsx`:**
+  1) **تكرار نصي في `formatBackupError` (الأسطر 279–284):** عند حدوث
+     `BACKUP_RESTORE_SYNC_STOP_AND_RESTART_FAILED` (الذي فيه `cause: stopErr` وهي `Error` عادية
+     وليست `AppError`) أو أي خطأ غير `AppError` مع `syncEngineRestartFailed: true`، يكون
+     `baseMessage = err.userMessage` (سطر 282) محتوياً أصلاً على عبارة تعذّر إعادة التشغيل
+     (من `container.ts:146, 209`)، ثم يضيف السطر 283 نصاً ثانياً:
+     `بالإضافة إلى ذلك، تعذّر إعادة تشغيل محرك المزامنة (المحرك متوقف حالياً).`!
+  2) **ازدواجية صندوقي النجاح والخطأ بعد الالتزام (الأسطر 1294–1310):** عند وجود تحذير
+     ما بعد الالتزام (مثلاً فشل `reloadSettings` أو `recordAudit` حتى لو نجح `SyncEngine`)،
+     تظهر رسالة `statusMessage` الزرقاء («تمت الاستعادة الآمنة...» أو «لكن محرك المزامنة متوقف
+     حالياً») **بجانب** رسالة `errorMessage` الحمراء في الوقت نفسه. كما أنه إذا فشل
+     `startSyncEngine()` مع وجود `postRestoreWarnings` من خطوات أخرى، يتضمن النص التحذيري
+     قائمة التحذيرات، أما إذا كانت `postRestoreWarnings` غير معرّفة فيرجع لمصفوفة احتياطية.
+
+س25: ما قيم `ErrorSource` المسجلة في `ErrorManager` خلال الاستعادة؟
+- فشل `stopSyncEngine`: `'SYNC'` (سطر 126).
+- فشل إعادة التشغيل بعد فشل `stopSyncEngine`: `'SYNC'` (سطر 137) والخطأ المرمي `'SYNC'` (145).
+- فشل إعادة التشغيل بعد فشل `restoreBackup`: `'SYNC'` (سطر 183)؛ والخطأ المرمي يحمل
+  `preCommitErr.source` أو `'STORAGE'` (أسطر 192، 208).
+- بعد الالتزام: `reloadSettings` -> `'STORAGE'` (234)، `initializeSecurity` -> `'SECURITY'` (245)،
+  `startDeviceManager` -> `'LIFECYCLE'` (256)، `startSyncEngine` -> `'SYNC'` (268)،
+  `issueSession/clearSession` -> `'SECURITY'` (289)، `recordAudit` -> `'STORAGE'` (308).
+
+=== القسم هـ: الأثر والتوافق على المستهلكين (س26–س29) ===
+
+س26: هل فُحص جميع مستهلكي `BackupRestoreResult` في `src/` و`tests/`؟
+- نعم (عبر `grep`): `src/domain/interfaces/repositories.ts`, `src/infrastructure/storage/repositories.ts`,
+  `src/application/container.ts`, `src/App.tsx`, `src/presentation/components/ActionModal.tsx`,
+  `tests/unit/backupV2.test.ts`, `tests/integration/backupEndToEnd.test.ts`.
+  إضافة `syncEngineRunning?: boolean` متوافقة خلفياً مع `IndexedDbBackupProvider`.
+
+س27: هل فُحص جميع مستهلكي `SyncEngine.getLifecycleState()` و`HealthMonitor.syncStatus`؟
+- نعم: `getLifecycleState()` لا يُستدعى إلا في `healthMonitor.ts:44` و`backupV2.test.ts:1325,1329,1334`.
+  و`health.syncStatus` يُعرض في `ActionModal.tsx:1039` ولا يوجد أي مستهلك آخر في الواجهة
+  (`DashboardView` يعرض `health.pendingCount/syncedCount/failedCount` و`health.lastError` فقط).
+
+س28: هل مستعدلات المهمة 5 أي مساس بـ Android أو Relay أو E2EE أو Pairing؟
+- **لا.** لم يُعدَّل أي ملف في `app/` أو `server/` أو `webCryptoProvider.ts` أو `relayTransportClient.ts` أو `repositories.ts`.
+
+س29: كيف يتفاعل التعديل مع `LifecycleManager` و`schedulerParticipant`؟
+- `LifecycleManager` (`src/application/lifecycle/lifecycleManager.ts`) يتعامل مع الواجهة
+  `ILifecycleParticipant` (`start`/`stop`) ولم تتغير تواقيعها. لكن `container.restoreBackupJson`
+  يتخطى `schedulerParticipant` و`deviceManager.stop()` ولا ينسق عبر `LifecycleManager` (انظر س4).
+
+--------------------------------------------------------------------------------
+خامساً: مراجعة اختبارات المهمة 5 (الأسئلة الـ 7 حول `tests/unit/backupV2.test.ts`)
+--------------------------------------------------------------------------------
+1. ما الذي تختبره الاختبارات الـ 5 الجديدة فعلياً (وما مدى اعتمادها على Mocks)؟
+   - الاختبارات 1–4 والنصف الأول من الاختبار 5 (الأسطر 1051–1239) تختبر الدالة المعزولة
+     `executeRestoreWithPostCommitRecovery(h.deps)` باستخدام `createRecoveryHarness()`
+     المبني كلياً من دوال محاكاة (`Mock/Stub callbacks`) دون `AppContainer` ودون `IndexedDB`
+     ودون `SyncEngine` حقيقي.
+   - النصف الثاني من الاختبار 5 (الأسطر 1240–1336) يشغّل `SyncEngine` و`HealthMonitor`
+     و`ErrorManager` و`SettingsService` و`SecurityManager` و`DeviceManager` حقيقية، لكن فوق
+     `InMemorySyncEventRepository` (`FailingStartSyncRepo`) في الذاكرة و`ITransportClient` وهمي
+     ثابت الحالة (`getState: () => 'CONNECTED'`).
+
+2. هل تختبر التزامن أو العمليات الجارية أثناء `stop()`؟
+   - **لا.** لا يوجد أي اختبار يحاكي `runSyncCycle()` أو `pullInboundEvents()` جارية أثناء
+     استدعاء `stop()` أو متداخلة مع `restoreBackup()` (س2، س3).
+
+3. هل تختبر `schedulerParticipant` أو الاستعادتين المتزامنتين أو سباقات `start()`/`stop()`؟
+   - **لا.** لا يوجد اختبار لمؤقت `syncTimer` (س4)، ولا لاستعادتين متزامنتين (س5)،
+     ولا لتداخل `SyncEngine.start()` مع `stop()` (س9)، ولا لاستدعاء `start()` مرتين متزامنتين (س7).
+
+4. هل تختبر الفشل الجزئي لـ `SyncEngine.start()` أو `SyncEngine.stop()`؟
+   - **لا.** الاختبار 5 يُفشل `start()` في `FailingStartSyncRepo.initialize()` (سطر 1291)
+     قبل تسجيل أي مستمع على `transport`، ولا يختبر فشل `subscribe()` بعد تسجيل مستمعات (س10)
+     ولا فشل `stop()` نفسه على `SyncEngine` الحقيقي (س11).
+
+5. هل تغطي الاختبارات جميع حالات `HealthMonitor`؟
+   - **لا.** يغطي الاختبار 5 فقط التحول: `RUNNING+CONNECTED+SYNCED -> HEALTHY`، ثم
+     `STOPPED -> notEqual('HEALTHY')` (دون التحقق من القيمة الدقيقة `IDLE` أو `DEGRADED`)، ثم
+     `ERROR -> UNAVAILABLE`. لا يختبر `IDLE + pendingCount > 0` (س16)، ولا `STOPPED + pendingCount > 0`،
+     ولا `RUNNING + DISCONNECTED + syncedCount > 0` (س17).
+
+6. هل تغطي الاختبارات تغييرات `ActionModal.tsx` أو المسار الكامل لـ `createAppContainer()`؟
+   - **لا.** لا تغطي اختبارات الوحدة ولا `tests/e2e/backupRestore.spec.ts` دالة `formatBackupError`
+     مع `syncEngineRestartFailed: true` ولا مسار `result.syncEngineRunning === false` في الواجهة.
+
+7. ما وضع `tests/e2e/backupRestore.spec.ts` و`npm run build` حالياً؟
+   - لم تُعدَّل في المهمة 5، وذُكر تشغيلها في التقرير 5 السابق؛ لكن في الحاوية المستأنفة حالياً
+     لا توجد مخرجات `dist/` أو `playwright-report/` على القرص، ولم يُعد تشغيلهما في جلسة
+     التدقيق هذه التي اقتصرت على الفحص غير المعدِّل.
+
+--------------------------------------------------------------------------------
+سادساً: نتائج الاختبارات والفحوصات المثبتة فعلياً في جلسة التدقيق (على البصمة الحالية)
+--------------------------------------------------------------------------------
+تم تشغيل الأوامر غير المعدِّلة التالية فعلياً في هذه الجلسة، وتم التحقق من تطابق بصمات
+SHA-256 للملفات الستة قبل التشغيل وبعده دون أي تغيير:
++------------------------------+-----------+----------------------------------------------------+
+| الأمر الحرفي                 | رمز الخروج | النتيجة الفعلية المثبتة                             |
++------------------------------+-----------+----------------------------------------------------+
+| npm run format:check         | 0         | All matched files use Prettier code style!         |
+| npm run typecheck            | 0         | tsc -b --noEmit دون أخطاء                          |
+| npm run lint                 | 0         | eslint . دون أخطاء                                 |
+| npm run test:unit            | 0         | 31 passed / 0 failed (5 suites, duration_ms 6691)  |
+| npm run test:integration     | 0         | 13 passed / 0 failed (4 suites, duration_ms 2730)  |
++------------------------------+-----------+----------------------------------------------------+
+
+ما لا تثبته هذه الاختبارات:
+- لا تثبت عمل المتصفح الحقيقي وIndexedDB الحقيقي (لأن `test:unit` يعتمد `InMemoryIndexedDbHarness`
+  و`createRecoveryHarness` الوهمي و`InMemorySyncEventRepository`).
+- لا تثبت بناء حزمة الإنتاج `vite build` ولا اختبارات Playwright E2E على البصمة الحالية في هذه الجلسة.
+- لا تثبت بناء Android أو تشغيله أو نجاح GitHub Actions CI.
+
+--------------------------------------------------------------------------------
+سابعاً: القيود البيئية التي منعت التحقق الكامل
+--------------------------------------------------------------------------------
+1. غياب مجلد `.git` في بيئة الحاوية: منع التحقق من الفرع أو `HEAD` أو `0d2aeff90a7371aff49634ff4bc82a025468ae72`.
+2. غياب بيئة Android (`which java` = NONE، `ANDROID_HOME` = EMPTY): منع بناء أو اختبار Android.
+3. التزام حدود الصلاحية (قراءة فقط): لم يُشغّل GitHub Actions CI، ولم يُعد تشغيل `test:e2e`
+   أو `build` لأنها تكتب مجلدات مخرجات (`playwright-report/`, `test-results/`, `dist/`).
+
+--------------------------------------------------------------------------------
+ثامناً: المشكلات والثغرات المحتملة المكتشفة أثناء التدقيق (دون إصلاح)
+--------------------------------------------------------------------------------
+1. [عالية] `SyncEngine.stop()` لا ينتظر `runSyncCycle()` أو `pullInboundEvents()` أو غيرهما
+   ويصفّر `isProcessing = false` و`pullInFlight = null` فوراً، مما يتيح تداخل المزامنة مع
+   معاملة الاستعادة وكتابة/تحديث `eventsCache` بشكل متضارب (`syncEngine.ts:175-200`).
+2. [عالية] مؤقت `syncTimer` في `schedulerParticipant` (`container.ts:429-438`) لا يتوقف أثناء
+   الاستعادة، وطرق `SyncEngine` (`runSyncCycle`, `pullInboundEvents`, `enqueueNotification`, إلخ)
+   لا تفحص `lifecycleState === 'RUNNING'`، كما يبقى مستمع `DeviceManager.unsubPairing` نشطاً.
+3. [متوسطة] لا يوجد قفل برمجي (Mutex) يمنع استدعاءين متزامنين لـ `restoreBackupJson()` أو
+   `executeRestoreWithPostCommitRecovery()`.
+4. [متوسطة] في `SyncEngine`: لا يوجد Mutex بين `start()` و`stop()`، واستدعاء `start()` متزامناً
+   يسجل مستمعات مكررة، وفشل `start()` أو `stop()` في المنتصف يترك مستمعات مسجلة دون تنظيف
+   (`syncEngine.ts:111-200`).
+5. [متوسطة] في `HealthMonitor.getSnapshot()` (`healthMonitor.ts:44-56`): قد يعيد `'HEALTHY'`
+   أثناء `'IDLE'` عند وجود أحداث `PENDING` متزامنة مع اتصال المرحل؛ وقد يعيد `'HEALTHY'`
+   في حالة `'RUNNING'` بالاعتماد على أحداث `'SYNCED'` قديمة/مستعادة حتى مع انقطاع الاتصال
+   (`DISCONNECTED`/`ERROR`)؛ ويعيد `'IDLE'` عند `'STOPPED'` حتى مع وجود أحداث `'PENDING'`.
+6. [منخفضة–متوسطة] في `ActionModal.tsx:279-284` (`formatBackupError`): عند
+   `BACKUP_RESTORE_SYNC_STOP_AND_RESTART_FAILED` (حيث `cause` ليس `AppError`) تتكرر جملة
+   تعذّر إعادة تشغيل محرك المزامنة مرتين في رسالة الخطأ. كما أن تغليف `preCommitErr` في
+   `container.ts:190` يفقد نوع الصنف الفرعي (`instanceof ValidationError` يصبح `false`، مع
+   بقاء الأصلي في `err.cause`).
+7. [منخفضة] في `container.ts:226-238`: إذا فشل `reloadSettings()` بعد الالتزام، تعتمد خطوة
+   الجلسة لاحقاً على لقطة الإعدادات القديمة قبل الاستعادة.
+8. [فجوة اختبارات] الاختبارات الـ 5 في `tests/unit/backupV2.test.ts` تعتمد أساساً على
+   `createRecoveryHarness()` الوهمي، ولا تغطي التداخل المتزامن ولا فشل `ActionModal` لواجهة
+   توقف محرك المزامنة ولا تغطي جميع فروع `HealthMonitor`.
+
+--------------------------------------------------------------------------------
+تاسعاً: التصنيف الصريح للأدلة (فصل صارم إلى 4 فئات)
+--------------------------------------------------------------------------------
+1. حقيقة مثبتة من الشيفرة الحالية:
+   - جميع أرقام الأسطر، بصمات SHA-256، بنية `executeRestoreWithPostCommitRecovery`، غياب
+     انتظار العمليات الجارية في `SyncEngine.stop()`، عدم إيقاف `schedulerParticipant`، غياب
+     فحص `lifecycleState` داخل `runSyncCycle`/`pullInboundEvents`، سلوك `HealthMonitor` عند
+     `IDLE`/`STOPPED`/`SYNCED`، التكرار النصي في `ActionModal.formatBackupError`، وبنية
+     الاختبارات الـ 5 في `tests/unit/backupV2.test.ts`.
+2. نتيجة اختبار فعلية مثبتة:
+   - اجتياز `npm run format:check`، `npm run typecheck`، `npm run lint`،
+     `npm run test:unit` (31/31)، `npm run test:integration` (13/13) في جلسة التدقيق الحالية
+     على البصمات المثبتة أعلاه.
+   - ثبتت إمكانية قراءة مخرجات الاختبارات الـ 5 عبر Node.js (`31/31`) بما تحققه من سلوك
+     `executeRestoreWithPostCommitRecovery` المعزول وحالة `SyncEngine -> HealthMonitor` المحدودة.
+3. استنتاج هندسي:
+   - إمكانية وقوع تداخل فعلي في IndexedDB أثناء الاستعادة إذا أُطلق `syncTimer` أو كانت دورة
+     `runSyncCycle`/`pullInboundEvents` متوقفة عند `await` أثناء `stopSyncEngine()`؛ واحتمال
+     تسرب مستمعات النقل عند تداخل `start()` أو فشل `start()`/`stop()` الجزئي.
+4. أمر لم يتم التحقق منه:
+   - التطابق مع Commit `0d2aeff90a7371aff49634ff4bc82a025468ae72` أو وجود فرع `main` على GitHub (لعدم وجود `.git`).
+   - تشغيل `npm run test:e2e` و`npm run build` على البصمة الحالية في جلسة التدقيق الحالية (ومخرجاتها غائبة في الحاوية المستأنفة).
+   - بناء أو اختبار Android ونتائج GitHub Actions CI.
+
+--------------------------------------------------------------------------------
+التوصية: يحتاج إصلاحات قبل المراجعة
+(أو للمراجعة الهندسية المستقلة لقرار نطاق الإصلاح: النقاط الحرجة 1 و2 و4 و5 الموثقة في القسم ثامناً).
+الخطوة التالية المقترحة (دون تنفيذ حتى موافقة صريحة):
+مراجعة المراجع الهندسي المستقل (ChatGPT) للأدلة والثغرات الموثقة في هذا التقرير، وتحديد
+ما إذا كان المطلوب فتح مرحلة تصحيح ثانية لإغلاق فجوات `SyncEngine.stop()` و`schedulerParticipant`
+و`HealthMonitor` و`ActionModal` واختباراتها قبل أي Commit أو Push.
+================================================================================
+
+
