@@ -1,0 +1,1013 @@
+================================================================================
+NEXLINK V1.1 — المرحلة التصحيحية الثانية (وثيقة تحليل وتصميم هندسي فقط)
+تصميم عزل استعادة النسخ الاحتياطية وضبط دورة حياة SyncEngine والخدمات
+================================================================================
+المشروع: midohub129/NEXLINK-V-1.1
+الفرع المستهدف المرجعي: main
+نطاق هذه الوثيقة: تحليل وتصميم هندسي مسبق فقط — لم يتم تعديل أي ملف شيفرة أو
+اختبار أو إعداد، ولم يُنفَّذ أي إجراء Git أو GitHub Actions CI.
+التاريخ: 2026-11-26
+
+================================================================================
+القسم 1: الحالة المرجعية ونطاق التصميم والقيود
+================================================================================
+1.1 الحالة المرجعية المعتمدة:
+- يعتمد هذا التصميم على الفحص المباشر للشيفرة الحالية في `/app/applet` وعلى
+  `HYDROGEN_EXECUTION_REPORT.txt` (القسم: «التقرير 6: تسليم أدلة ومراجعة ذاتية
+  لتعديلات SyncEngine»).
+- البصمات المرجعية التي بُني عليها التحليل:
+  * src/application/container.ts (768 سطراً)
+  * src/domain/models/backup.ts (161 سطراً)
+  * src/application/sync/syncEngine.ts (1591 سطراً)
+  * src/application/health/healthMonitor.ts (93 سطراً)
+  * src/presentation/components/ActionModal.tsx (1623 سطراً)
+  * tests/unit/backupV2.test.ts (1338 سطراً)
+  * بالإضافة إلى الفحص المباشر لـ:
+    - src/application/lifecycle/lifecycleManager.ts (115 سطراً)
+    - src/application/devices/deviceManager.ts (428 سطراً)
+    - src/application/security/securityManager.ts (236 سطراً)
+    - src/application/settings/settingsService.ts (137 سطراً)
+    - src/application/errors/errorManager.ts (88 سطراً)
+    - src/application/logging/loggerService.ts (135 سطراً)
+    - src/infrastructure/storage/indexedDbDatabase.ts (331 سطراً)
+    - src/infrastructure/storage/repositories.ts (2272 سطراً)
+    - src/infrastructure/transport/relayTransportClient.ts (716 سطراً)
+    - src/infrastructure/datasources/deviceDataSources.ts (123 سطراً)
+    - src/App.tsx (328 سطراً)
+    - src/presentation/components/DashboardView.tsx (415 سطراً)
+    - src/presentation/components/NotificationHistoryView.tsx (694 سطراً)
+    - tests/e2e/backupRestore.spec.ts (648 سطراً)
+
+1.2 قيد حالة Git:
+- لا يوجد مجلد `.git` في بيئة الحاوية (`NO_GIT_REPO`)، ولذلك فإن التحقق من
+  التطابق التشفيري مع GitHub SHA (`0d2aeff90a7371aff49634ff4bc82a025468ae72`)
+  غير متاح محلياً ويظل معلّقاً لحين الفحص من بيئة المستودع الكاملة.
+
+1.3 الأهداف (Goals):
+1) عزل قاعدة بيانات IndexedDB ومخازن الحالة في الذاكرة عزلاً كاملاً (Fail-Closed)
+   أثناء تنفيذ استعادة النسخة الاحتياطية المشفرة v2.
+2) إغلاق جميع الثغرات الـ 9 الموثقة في التقرير 6:
+   - غياب انتظار العمليات الجارية في `SyncEngine.stop()`.
+   - استمرار `schedulerParticipant` (`syncTimer` + `unsubSettingsEndpoint`) أثناء الاستعادة.
+   - بقاء مستمعات `DeviceManager.unsubPairing` ومؤقت `RelayTransportClient.reconnectTimer` نشطة.
+   - غياب قفل Mutex برمجي يمنع تداخل استعادتين أو دخول عمليات كتابة أثناء الاستعادة.
+   - غياب حارس `lifecycleState === 'RUNNING'` وحارس الاستعادة داخل دوال `SyncEngine` و`DeviceManager`.
+   - سباقات `SyncEngine.start()`/`stop()` وتسرب المستمعات عند الفشل الجزئي.
+   - فجوات `HealthMonitor.getSnapshot()` (`IDLE`, `STOPPED`, `RUNNING+DISCONNECTED`, أخطاء `ErrorManager`).
+   - تكرار النص وتعارض لافتات النجاح/الخطأ في `ActionModal.tsx` وعدم انعكاس حالة توقف المحرك/الاستعادة في `DashboardView`/`NotificationHistoryView` وفشل `reloadSettings()` في `container.ts`.
+   - فجوات الاختبارات (تغطية 17 سيناريو حقيقياً بدلاً من الاعتماد المفرط على Mocks).
+
+1.4 خارج النطاق (Non-Goals / قيود غير قابلة للتجاوز):
+- ممنوع تعديل بروتوكول E2EE أو KDF (`PBKDF2-HMAC-SHA-256`) أو تنسيق مغلفات
+  E2EE أو مغلف النسخة الاحتياطية `nexlink-encrypted-backup` v2.
+- ممنوع تعديل بروتوكول الاقتران المتبادل (Pairing) أو بروتوكول خادم المرحل (`server/`).
+- ممنوع تعديل شيفرة Android (`app/`) في هذه المرحلة التصحيحية.
+- ممنوع استعادة هوية الجهاز (`STORES.IDENTITY`) أو مفاتيح Keystore أو رفع ثقة
+  الأجهزة المرتبطة (`PAIRED -> UNPAIRED` وتبقى `REVOKED` كما هي) أو تغيير دور
+  الجهاز المستهدف (`preservedRole`).
+
+================================================================================
+القسم 2: الجرد الكامل للخدمات والمؤقتات والمستمعات ومسارات الكتابة في IndexedDB
+================================================================================
+2.1 ملاحظة معمارية مهمة حول IndexedDB (`src/infrastructure/storage/indexedDbDatabase.ts`):
+- يحتوي `IndexedDbDatabase` على طابور `writeQueue` (الأسطر 135، 249–319) يسلسل
+  المعاملات الفردية (`put`, `add`, `deleteKey`, `clearStore`, `runTransaction('readwrite')`).
+- **لماذا لا يكفي `writeQueue` وحده لعزل الاستعادة؟**
+  لأن `SyncEngine.runSyncCycle()` و`ingestInboundEvent()` و`DeviceManager.refreshLinkedDevicesFromRelay()`
+  تنفذ **سلسلة معاملات منفصلة تتخللها عمليات `await` غير متزامنة** (تشفير WebCrypto،
+  طلبات HTTP إلى المرحل، إلخ). طابور `writeQueue` يمنع تصادم معاملتين في اللحظة
+  ذاتها فقط، لكنه **لا يمنع**:
+  1) قيام `runSyncCycle()` التي بدأت قبل الاستعادة بكتابة `updateEvent('SYNCED' | 'FAILED')`
+     *بعد* إغلاق معاملة `restoreBackup()` وتطبيق البيانات المستعادة (أو على `id` لم يعد
+     موجوداً أو صار يعود لحدث مختلف بعد مسح `SYNC_EVENTS` وإعادة بنائه).
+  2) استدعاء `eventsCache = await this.repo.getAll()` في `finally` لـ `runSyncCycle()`
+     (`syncEngine.ts:1465`) وإعادة `isProcessing = false` بالتوازي مع الاستعادة.
+  3) قيام `IndexedDbBackupProvider.restoreBackup()` بقراءة `getIdentity()` و`getLinkedDevices()`
+     في الخطوة 10 (`repositories.ts:1656-1659`) ثم قيام `DeviceManager.refreshLinkedDevicesFromRelay()`
+     بتعديل `LINKED_DEVICES` قبل بدء معاملة الخطوة 12 (`repositories.ts:1730`) — أي
+     نافذة سباق TOCTOU بين القراءة والكتابة الذرية!
+
+2.2 الجرد التحقيقي الكامل لجميع المكونات والمؤقتات والمستمعات في `src/`:
+
++-------------------------------+----------------------------------------+------------------------------+------------------------------------------+
+| المكوّن / الخدمة              | المؤقتات والمستمعات النشطة             | مخازن IndexedDB التي يكتبها  | الحالة المثبتة حالياً أثناء الاستعادة    |
++-------------------------------+----------------------------------------+------------------------------+------------------------------------------+
+| 1. schedulerParticipant       | - `syncTimer` (setInterval,            | غير مباشر عبر استدعاء:       | **غير متوقف أثناء الاستعادة!**           |
+|    (`container.ts:395-457`)   |   الأسطر 429–438)                      | `syncEngine.runSyncCycle()`  | يستمر المؤقت بالنبض، كما أن              |
+|                               | - `unsubSettingsEndpoint` (اشتراك      | و`pullInboundEvents()`.      | `reloadSettings()` يطلق `notify()`       |
+|                               |   `settingsService.subscribe`,         |                              | فيعيد `restartTimer()` في منتصف الاستعادة|
+|                               |   الأسطر 442–445)                      |                              | (`container.ts:442-445`).                |
++-------------------------------+----------------------------------------+------------------------------+------------------------------------------+
+| 2. SyncEngine                 | - `unsubInbound` (WS `sync:event`)     | `STORES.SYNC_EVENTS`         | يُستدعى `stop()` لكنه:                   |
+|    (`syncEngine.ts:69-1590`)  | - `unsubDeliveryAcks` (`sync:delivered`)| و`STORES.SECURITY_AUDIT`    | أ) لا ينتظر العمليات الجارية.          |
+|                               | - `unsubTransportState`                | (عبر `security.recordAudit`) | ب) يصفّر `isProcessing`/`pullInFlight`   |
+|                               |   (`handleTransportConnected`)         |                              |    فوراً.                                |
+|                               | - استدعاءات مباشرة من الواجهة/المؤقت: |                              | ج) دواله لا تتحقق من `lifecycleState`    |
+|                               |   `runSyncCycle`, `pullInboundEvents`, |                              |    أو قفل الاستعادة.                     |
+|                               |   `enqueueNotification`, `updateEventStatus`,|                        |                                          |
+|                               |   `manualRetryEvent`, `deleteEvent`,   |                              |                                          |
+|                               |   `clearAllEvents`                     |                              |                                          |
++-------------------------------+----------------------------------------+------------------------------+------------------------------------------+
+| 3. DeviceManager              | - `unsubTransport`                     | `STORES.IDENTITY` (عند بدء   | **لا يُستدعى `stop()` قبل الاستعادة!**   |
+|    (`deviceManager.ts:20-427`)| - `unsubPairing` (`subscribePairingUpdates`)| التشغيل فقط)              | يبقى `unsubPairing` نشطاً ويكتب في       |
+|                               | - استدعاءات مباشرة: `connectRelay`,    | `STORES.LINKED_DEVICES`      | `LINKED_DEVICES` عند وصول إشعار WS.    |
+|                               |   `confirmPairingApproval`,            | و`STORES.SECURITY_AUDIT`     | كما أن `stop()` الحالي لا ينتظر         |
+|                               |   `refreshLinkedDevicesFromRelay`,     |                              | العمليات الجارية داخله.                  |
+|                               |   `revokeLinkedDevice`, `removeLinkedDevice`|                         |                                          |
++-------------------------------+----------------------------------------+------------------------------+------------------------------------------+
+| 4. RelayTransportClient       | - `reconnectTimer` (`setTimeout`,      | لا يكتب في IndexedDB مباشرة  | **يبقى نشطاً أثناء الاستعادة!**          |
+|    (`relayTransportClient.ts`) |   الأسطر 444–450)                      | (يحفّز مستمعات `SyncEngine`  | إذا انقطع WS أو أُعيد الاتصال، يفتح جلسة |
+|                               | - `connectTimer` (WS handshake)        | و`DeviceManager`).           | جديدة أو يبث `pairing:*` و`CONNECTED`    |
+|                               | - `timeoutId` (لكل طلب HTTP `AbortController`)|                        | ويدفع أحداثاً أثناء الاستعادة.           |
+|                               | - `ws.onmessage`, `ws.onclose`         |                              |                                          |
++-------------------------------+----------------------------------------+------------------------------+------------------------------------------+
+| 5. SettingsService            | - `listeners` (من بينها                 | `STORES.SETTINGS`            | دالة `update()` متاحة للواجهة أثناء      |
+|    (`settingsService.ts`)     |   `unsubSettingsEndpoint` و`App.tsx`)  |                              | الاستعادة (عبر `onUpdateSettings` أو     |
+|                               |                                        |                              | `container.*`) دون حاجز كتابة.           |
++-------------------------------+----------------------------------------+------------------------------+------------------------------------------+
+| 6. SecurityManager            | - `listeners`                          | `STORES.SECURITY_AUDIT`      | `recordAudit()`, `clearAuditLog()`,      |
+|    (`securityManager.ts`)     |                                        | (عبر `auditRepo`)            | `verifyCryptoIntegrity()` و`assertAuthorized` |
+|                               |                                        |                              | يمكن أن تكتب سجلات محلية أثناء الاستعادة.|
++-------------------------------+----------------------------------------+------------------------------+------------------------------------------+
+| 7. BrowserDeviceDataSource /  | لا توجد أي مؤقتات أو خدمات خلفية.    | لا يكتب في IndexedDB.        | **توضيح إجباري مثبَت من الشيفرة:**       |
+|    TestFixtureDeviceDataSource| (`backgroundNotificationCaptureAvailable:|                              | `NotificationCaptureService` غير موجود  |
+|    (`deviceDataSources.ts`)   | false`؛ الإدراج التجريبي يدوي فقط من   |                              | في تطبيق الويب `src/`؛ الإدراج اليدوي    |
+|                               | `NotificationHistoryView.tsx:229`).    |                              | يمر عبر `syncEngine.enqueueNotification()`.|
++-------------------------------+----------------------------------------+------------------------------+------------------------------------------+
+| 8. App.tsx (`sessionTicker`)  | - `window.setInterval` كل 1 ثانية      | لا يكتب في IndexedDB.        | يقرأ `isSessionAuthenticated()` و        |
+|    (`App.tsx:109-114`)        |   لتحديث عدّاد الجلسة في الذاكرة فقط. |                              | `getRemainingSessionSeconds()` في الذاكرة|
+|                               |                                        |                              | فقط. لا يمثل خطر كتابة، لكن يجب تعطيل  |
+|                               |                                        |                              | أزرار الطفرة في الواجهة أثناء الاستعادة. |
++-------------------------------+----------------------------------------+------------------------------+------------------------------------------+
+| 9. ErrorManager &             | مستمعات إشعار واجهة في الذاكرة فقط.   | لا يكتب في IndexedDB         | آمن ضد سباقات IndexedDB؛ لكن يجب منع    |
+|    RotatingLogger             |                                        | (قوائم/حلقات في الذاكرة).    | أخطاء متأخرة من مهام مصرفة من تزييف الحالة.|
++-------------------------------+----------------------------------------+------------------------------+------------------------------------------+
+
+================================================================================
+القسم 3: تحليل تدفق الاستعادة الكامل وترتيب المراحل (Restore Pipeline)
+================================================================================
+3.1 التدفق المعماري المستهدف من 7 مراحل متسلسلة:
+    (1) Acquire Lock & Activate Write Barrier
+ -> (2) Quiesce Services (عكس ترتيب التشغيل)
+ -> (3) Drain In-Flight Operations (بمهلة محدودة وFail-Closed)
+ -> (4) Pre-Commit Decrypt/Validate + Atomic Restore Transaction (IndexedDB)
+ -> (5) Refresh In-Memory Services (من قاعدة البيانات المستعادة)
+ -> (6) Resume Services (وفق الإعدادات المستعادة وبترتيب الاعتمادية)
+ -> (7) Release Write Barrier & Lock (دائماً داخل `finally`)
+
+3.2 التحليل الهندسي لترتيب الخطوات (خصوصاً موضع التحقق وفك التشفير قبل أم بعد Quiesce):
+- السؤال التصميمي الحاسم:
+  هل يجب تشغيل فك التشفير والتحقق (`restoreBackup()`) قبل `Quiesce` أم بعد `Quiesce + Drain`؟
+- المقارنة:
+  * داخل `IndexedDbBackupProvider.restoreBackup()` (`repositories.ts:1515-1804`):
+    - الخطوات 1–9: تحليل JSON، فحص الحدود، فك التشفير `PBKDF2 + AES-256-GCM`،
+      التحقق من المخطط (Stateless في معظمه).
+    - الخطوة 10 (`L1656-1659`): قراءة `getIdentity()` و`getLinkedDevices()` من IndexedDB
+      لبناء `sanitizedDevices` (الحفاظ على الأجهزة المسحوبة محلياً `REVOKED`) وحساب
+      `crossDeviceRestore`.
+    - الخطوة 11 (`L1681-1719`): تشفير الأحداث المستعادة بمفتاح الجهاز المحلي.
+    - الخطوات 12–13 (`L1730-1795`): معاملة IndexedDB الذرية.
+- **القرار التصميمي المبرر:**
+  1) يمكن إجراء فحص سريع أولي للغلاف (`rawJson` غير فارغ و`format` صالح) قبل `Quiesce`
+     إن رُغب، أو الإبقاء على `backupProvider.restoreBackup()` كاملةً **بعد** `Quiesce + Drain`.
+  2) **يجب حتماً** أن يظل `Quiesce + Drain` منفَّذاً **قبل** قراءة الخطوة 10 والمعاملة
+     الذرية في الخطوة 12 حتى لا يتمكن `DeviceManager.refreshLinkedDevicesFromRelay()`
+     أو `revokeLinkedDevice()` من تغيير `LINKED_DEVICES` بين الخطوة 10 والخطوة 12
+     (TOCTOU)، وحتى يظل العقد الاختباري المثبت في `tests/unit/backupV2.test.ts:1106-1124`
+     (`['stopSync', 'restoreBackup:fail', 'startSync']`) متسقاً دون مفاجآت.
+  3) عند فشل `restoreBackup()` قبل الالتزام (عبارة مرور خاطئة، تلاعب، حدود متجاوزة،
+     فشل معاملة IDB): تنتقل الدالة إلى مسار استرداد ما قبل الالتزام الذي يعيد تشغيل
+     الخدمات التي أُوقفت (`Resume Services`) قبل تحرير القفل في `finally`.
+
+3.3 مصفوفة المراحل السبع وشروط الانتقال:
+- المرحلة 1 (`Acquire Lock`):
+  - محاولة الاستحواذ المتزامن (Synchronous JS turn) على `restoreLock`.
+  - إذا كان القفل محجوزاً -> رفض فوري (Fail-Closed) دون لمس أي خدمة أو تحرير قفل الجلسة الجارية.
+  - تفعيل `operationGate = 'RESTORING'` فوراً لمنع أي عملية كتابة جديدة من الواجهة أو الحاوية.
+- المرحلة 2 (`Quiesce Services`):
+  - إيقاف الخدمات بترتيب عكس الاعتمادية:
+    1) `schedulerParticipant.stop()` (يوقف `syncTimer` ويلغي `unsubSettingsEndpoint`).
+    2) `syncEngine.beginStop()` / `syncEngine.stop()` (يلغي مستمعات النقل ويدخل حالة `STOPPING` التي ترفض أي عمل جديد، ثم يصرّف العمليات الجارية).
+    3) `deviceManager.stop()` (يدخل حالة `STOPPING`، يلغي `unsubPairing` و`unsubTransport`، يستدعي `disconnectRelay()` الذي يغلق WS ويصفي `reconnectTimer` ويوقف الإعادة التلقائية، ثم يصرّف أي عمليات `DeviceManager` جارية).
+  - *ملاحظة هامة حول التداخل:* إذا فشل `Quiesce` أو `Drain` في المرحلة 2 أو 3، **تتوقف الاستعادة فوراً قبل المرحلة 4**، وتُحاوَل استعادة التشغيل التشغيلي (`Resume Services`) في بيئة معزولة عن التحويلات غير الملتزم بها، ثم يُحرر القفل ويرمى خطأ صريح.
+- المرحلة 3 (`Drain In-Flight Operations`):
+  - مدمجة بوضوح مع إيقاف `SyncEngine` و`DeviceManager` (عبر `InFlightTracker` بمهلة `DRAIN_TIMEOUT_MS`)؛ لا تُعتبر الخدمة في حالة `STOPPED` إلا بعد تحقق `inFlight.size === 0`، أو تنتقل إلى `ERROR` وترمي خطأ مهلة التصريف (Fail-Closed).
+- المرحلة 4 (`Atomic Restore Transaction`):
+  - تنفيذ `backupProvider.restoreBackup(rawJson, passphrase)` مع اشتراط بقاء `operationGate === 'RESTORING'` وملكية رمز القفل (`lockToken`).
+  - جميع الـ 4 مخازن المستهدفة (`SETTINGS`, `LINKED_DEVICES`, `SYNC_EVENTS`, `SECURITY_AUDIT`) تُحدَّث في معاملة واحدة، بينما يظل `IDENTITY` ومفاتيح Keystore دون مساس.
+- المرحلة 5 (`Refresh In-Memory Services`):
+  - بمجرد التزام المعاملة: إعادة تحميل الحالة في الذاكرة بترتيب صارم:
+    1) `settingsService.initialize()` -> تحدّث `cached` وتحدّث `transportClient.setBaseUrl(restoredSettings.relayEndpoint)`. (لاحظ: `unsubSettingsEndpoint` ملغاة حالياً فلا تشغّل `syncTimer` قبل أوانه!).
+    2) `securityManager.initialize()` -> إعادة تحميل `auditCache` من `SECURITY_AUDIT`.
+    3) إعادة تهيئة `DeviceManager` / تحميل `identity` و`linkedDevices` المستعادة دون فتح Relay بعد إذا كانت الإعدادات المستعادة تعطل الاتصال.
+- المرحلة 6 (`Resume Services`):
+  - في مسار **نجاح الالتزام**:
+    1) تشغيل `deviceManager.start()` ثم `syncEngine.start()` ثم `schedulerParticipant.start()` (والتي تربط `unsubSettingsEndpoint` و`syncTimer` وتفتح Relay **فقط** إذا كان `restoredSettings.role && restoredSettings.connectionServiceEnabled`).
+    2) تحديث جلسة الأمان (`issueSession` أو `clearSession`) اعتماداً على `restoredSettings` المحمّلة حديثاً فقط (انظر القسم 9 لعدم الاعتماد على لقطة قديمة إذا فشل `reloadSettings()`).
+    3) تسجيل سجل التدقيق `BACKUP_RESTORED` (ضمن نافذة السماح المخوّلة بعد انتهاء التحميل، أو قبل فتح بوابة الواجهة العامة).
+  - في مسار **فشل ما قبل الالتزام**:
+    - إعادة تشغيل الخدمات بالحالة التشغيلية السابقة دون تبديل الإعدادات.
+- المرحلة 7 (`Release Gate & Lock`):
+  - داخل `finally` (بلا استثناء): إعادة `operationGate = 'OPEN'` وتحرير `restoreLock` وإشعار المشتركين (`HealthMonitor`, `App.tsx`) بالحالة النهائية الحقيقية.
+
+================================================================================
+القسم 4: التصميم أ — قفل الاستعادة وحاجز الكتابة (Restore Lock & Write Barrier)
+================================================================================
+4.1 أين يوضع القفل؟
+- يوضع القفل في طبقة التنسيق داخل `src/application/container.ts` (ضمن وحدة مساعدة
+  مفحوصة بالوحدة مثل `RestoreCoordinator` تُمرَّر كاعتماد واضح وتُدار داخل
+  `createAppContainer()`)، **وليس** في حالة React داخل `ActionModal.tsx`.
+- حالة `backupBusy` في `ActionModal.tsx` تصبح طبقة عرض (UI feedback) ثانوية مربوطة
+  بحالة الحاوية الحقيقية (`container.isRestoreInProgress()` واشتراكها) بحيث حتى لو
+  أُغلق المودال وأُعيد فتحه يبقى زر الاستعادة معطلاً وتظهر حالة «استعادة قيد التنفيذ».
+
+4.2 تصميم Mutex الاستعادة (Single-Flight + Re-entrancy Protection):
+```ts
+export type RestoreGateState = 'OPEN' | 'RESTORING';
+
+export class RestoreCoordinator {
+  private activeToken: symbol | null = null;
+  private gateState: RestoreGateState = 'OPEN';
+  private listeners = new Set<() => void>();
+
+  isRestoreInProgress(): boolean {
+    return this.activeToken !== null;
+  }
+
+  getGateState(): RestoreGateState {
+    return this.gateState;
+  }
+
+  tryAcquire(): symbol | null {
+    // الذرية في JS أحادي الخيط: الفحص والتعيين يتمّان في نفس الدورة بدون await
+    if (this.activeToken !== null) {
+      return null;
+    }
+    const token = Symbol('restore-lock');
+    this.activeToken = token;
+    this.gateState = 'RESTORING';
+    this.notify();
+    return token;
+  }
+
+  assertActiveLock(token: symbol): void {
+    if (this.activeToken !== token || this.gateState !== 'RESTORING') {
+      throw new StorageError(
+        'RESTORE_LOCK_VIOLATION',
+        'تم إبطال قفل عملية الاستعادة.',
+        'Attempted restore commit without owning active restore lock'
+      );
+    }
+  }
+
+  release(token: symbol): void {
+    if (this.activeToken !== token) return;
+    this.activeToken = null;
+    this.gateState = 'OPEN';
+    this.notify();
+  }
+}
+```
+
+4.3 قرار التعامل مع استدعاءين متزامنين لـ `restoreBackupJson()`:
+- **القرار: الرفض الفوري (Fail-Closed Rejection)** برمز خطأ صريح:
+  `StorageError` برمز `'BACKUP_RESTORE_ALREADY_IN_PROGRESS'` ورسالة عربية:
+  «توجد عملية استعادة نسخة احتياطية قيد التنفيذ بالفعل. انتظر اكتمالها قبل بدء عملية جديدة.»
+- **لماذا الرفض الفوري أفضل من الطابور (Queueing)؟**
+  1) الاستعادة عملية تدميرية تستبدل البيانات المحلية استناداً إلى تأكيد المستخدم في تلك اللحظة.
+  2) وضع استعادة ثانية في الطابور يعني تنفيذها لاحقاً ضد حالة قاعدة بيانات تغيرت للتو
+     (مثلاً قد يغير الأول الإعدادات أو يغلق المودال ويمسح عبارة المرور).
+  3) يحمي أيضاً من **إعادة الدخول (Re-entrancy)**: إذا استدعى أي رد نداء داخلي
+     `restoreBackupJson()` مجدداً، يفشل فوراً عند `tryAcquire() === null` بدلاً من حدوث Deadlock!
+
+4.4 حاجز الكتابة (Operation Gate / Write Barrier) لمنع أي طفرة أثناء الاستعادة:
+- لا يكفي قفل `restoreBackupJson` ضد نفسه؛ يجب تفعيل حارس `assertNotRestoring(operationName)`
+  في **جميع** نقاط الدخول التي تغيّر قاعدة البيانات أو الحالة التشغيلية أثناء
+  `coordinator.isRestoreInProgress() === true`:
+  1) **في `AppContainer` (`src/application/container.ts`)**:
+     - `selectRole`, `changeRole`, `resetInitialSetup`, `toggleConnectionService`,
+       `runSyncNow`, `revokeAllAuthorizations`, `setNotificationAccess`, `setUsageAccess`,
+       `toggleSelectedApp`, `setTestFixtureMode`, `exportBackupJson`, `migrateLegacyBackupJson`,
+       `restoreBackupJson` (ترفض بالرمز الخاص بها).
+  2) **في `SyncEngine` (`src/application/sync/syncEngine.ts`)** (عبر حقن `isWriteBlocked?: () => boolean` أو حالة دورة الحياة `STOPPING | STOPPED` + `maintenanceMode`):
+     - العمليات اليدوية من الواجهة (`NotificationHistoryView` و`ActionModal`):
+       `enqueueNotification()`, `updateEventStatus()`, `manualRetryEvent()`, `deleteEvent()`, `clearAllEvents()`, `runSyncCycle()`.
+     - العمليات الخلفية/الداخلية: `pullInboundEvents()`, `ingestInboundEvent()`,
+       `retryPendingInboundAcks()`, `handleDeliveryAcks()`.
+  3) **في `DeviceManager` (`src/application/devices/deviceManager.ts`)**:
+     - `connectRelay`, `createPairingRequest`, `acceptPairingCode`, `confirmPairingApproval`,
+       `refreshLinkedDevicesFromRelay`, `revokeLinkedDevice`, `removeLinkedDevice`.
+  4) **في `SettingsService` (`src/application/settings/settingsService.ts`) و`SecurityManager`**:
+     - `settingsService.update(patch)` (يُستدعى مباشرة من `ActionModal` عبر `onUpdateSettings` في `App.tsx:287-289`!).
+     - `securityManager.clearAuditLog()`, `securityManager.verifyCryptoIntegrity()` (تكتب `VAULT_VERIFIED`),
+       والعمليات الخارجية على `recordAudit` — مع **استثناء محكوم بالـ `lockToken`** لمرحلة ما بعد الالتزام داخل `executeRestoreWithPostCommitRecovery` لتحديث الإعدادات وتسجيل `BACKUP_RESTORED` فقط بعد انتهاء المعاملة الذرية!
+  5) **آلية استثناء الخطوات الداخلية المخوّلة أثناء الاستعادة**:
+     - تُعطى الخدمات حارساً يميّز بين `normalOperation` (مرفوضة أثناء `RESTORING`) وبين
+       `restoreRefreshPhase` المحمية بتمرير أو استدعاء داخلي من `RestoreCoordinator` بعد
+       اكتمال `restoreBackup()` فقط؛ وبتفصيل أدق:
+       - `settingsService.initialize()` و`securityManager.initialize()` هما قراءة-وتحديث-ذاكرة
+         (لا تكتبان في IndexedDB) فتُسمحان في مرحلة 5.
+       - `securityManager.recordAudit` يُسمح بها في المرحلة 6 فقط بعد إزالة حالة
+         `RESTORING` (أو عبر تمرير رمز سياق الاستعادة في الخطوة الأخيرة من التنسيق بعد
+         انقضاء كل كتابات الاستعادة الذرية وقبل فتح البوابة للواجهة!). وضع `recordAudit`
+         بعد استئناف `Settings/Security/Devices/Sync` وقبل فتح `operationGate` أو مع `allowRestoreAudit`
+         يمنع أي تنازع.
+
+================================================================================
+القسم 5: التصميم ب — إيقاف وتهدئة جميع الخدمات والمؤقتات (Quiesce All Services)
+================================================================================
+الجدول التالي يجيب على الأسئلة الـ 7 الإلزامية لكل خدمة ومؤقت ومستمع مثبَت في `src/`:
+
+5.1 `schedulerParticipant` (`SyncAndSessionCoordinator` في `container.ts:395-457`)
+- من يبدأه؟ `LifecycleManager.startup()` أو منسّق الاستعادة في المرحلة 6.
+- من يوقفه؟ منسّق الاستعادة في المرحلة 2 (قبل `SyncEngine.stop()`) أو `LifecycleManager.shutdown()`.
+- العمليات غير المتزامنة النشطة لحظة الإيقاف:
+  * مؤقت `syncTimer` يطلق `void syncEngine.runSyncCycle()` و`void syncEngine.pullInboundEvents()` بدون `await`.
+  * اشتراك `unsubSettingsEndpoint` يستدعي `transportClient.setBaseUrl(...)` و`restartTimer()` عند أي `settingsService.notify()` — **وهذه ثغرة حرجة أثناء `reloadSettings()`** لأن `settingsService.initialize()` يستدعي `this.notify()` (`settingsService.ts:103`)!
+- هل ينتظرها؟ `schedulerParticipant.stop()` متزامن لمسح المؤقت وإلغاء الاشتراك؛ لكنه يجب أن **يُنفَّذ قبل** `syncEngine.stop()` بحيث لا تنطلق دورات جديدة من `syncTimer` بينما `SyncEngine` يصرّف العمليات الجارية، ويجب إلغاء `unsubSettingsEndpoint` قبل `reloadSettings()`.
+- هل يمكن بدء عمليات جديدة بعد إيقافه؟ **لا**؛ يُضاف متغير حالة `isRunning` + `startPromise`/`stopPromise` داخل `schedulerParticipant`، ويُفحص `isRunning && !coordinator.isRestoreInProgress()` داخل دالة المؤقت نفسه كدفاع مزدوج.
+- كيف يُستأنف؟
+  * في مسار فشل ما قبل الالتزام: يُستأنف بتشغيل المؤقت + إعادة ربط `unsubSettingsEndpoint` (دون تكرار `issueSession` أو تغيير الجلسة إذا لم تتغير).
+  * في مسار نجاح الاستعادة: بعد تحديث `SettingsService` و`DeviceManager` و`SyncEngine`، يُستدعى `schedulerParticipant.start()` فتُضبط مهلة `syncIntervalMs` الجديدة من الإعدادات المستعادة، ويُعاد الاتصال بالمرحل **فقط** إذا كان `restoredSettings.role && restoredSettings.connectionServiceEnabled`.
+- ماذا لو فشل الإيقاف أو الاستئناف؟
+  * `stop()` آمن بطبيعته (`try/finally` لمسح `syncTimer` وإلغاء `unsubSettingsEndpoint`).
+  * فشل `start()` بعد الالتزام يُسجَّل في `ErrorManager` بمصدر `'LIFECYCLE'` ويضاف لتحذيرات `postRestoreWarnings` دون إلغاء نجاح المعاملة.
+
+5.2 `SyncEngine` (`src/application/sync/syncEngine.ts`)
+- من يبدأه؟ `LifecycleManager.startup()` أو منسّق الاستعادة في المرحلة 6.
+- من يوقفه؟ منسّق الاستعادة في المرحلة 2 أو `LifecycleManager.shutdown()`.
+- العمليات غير المتزامنة النشطة لحظة الإيقاف:
+  * `runSyncCycle()` (تتضمن `retryPendingInboundAcks`, `fetchSyncDeliveryStatus`, `encryptForPeer`, `sendSyncBatch`, `repo.updateEvent`, `repo.getAll`).
+  * `pullInboundEvents()` (`fetchInboundEvents` ثم حلقة `ingestInboundEvent`).
+  * `ingestInboundEvent()` (قد تُستدعى مباشرةً من مستمع WS `unsubInbound`, تشمل `decryptFromPeer`, `repo.insert`, `repo.updateEvent`, `acknowledgeInboundDelivery`, `security.recordAudit`).
+  * `handleDeliveryAcks()` (من `unsubDeliveryAcks`).
+  * `handleTransportConnected()` (من `unsubTransportState`).
+  * عمليات الواجهة: `enqueueNotification`, `updateEventStatus`, `manualRetryEvent`, `deleteEvent`, `clearAllEvents`.
+- هل ينتظرها؟ **نعم (وفق التصميم ج أدناه):** ينتقل أولاً إلى `STOPPING`، يلغي المستمعات الثلاثة داخل `try/finally`، وينتظر تصريف `InFlightTracker` بالكامل بحد مهلة `DRAIN_TIMEOUT_MS` **قبل** الانتقال إلى `STOPPED` وقبل مسح/تغيير `isProcessing` أو `pullInFlight`.
+- هل يمكن بدء عمليات جديدة بعد الإيقاف أو أثناء `STOPPING`؟ **لا:**
+  * العمليات الخلفية (`runSyncCycle`, `pullInboundEvents`, `ingestInboundEvent`, `retryPendingInboundAcks`, `handleDeliveryAcks`, `handleTransportConnected`): تفحص `lifecycleState === 'RUNNING'` و`opEpoch === currentEpoch` عند الدخول وبعد نقاط `await` الحرجة. إذا لم تكن `RUNNING` تُرجع فوراً ملخصاً آمناً (`skippedReason: 'STOPPED'` أو `0`/`false`) دون أي كتابة في DB!
+  * عمليات الواجهة (`enqueueNotification`, `updateEventStatus`, `manualRetryEvent`, `deleteEvent`, `clearAllEvents`): ترفض بخطأ `SyncError('SYNC_ENGINE_NOT_RUNNING', ...)` أو `StorageError('BACKUP_RESTORE_IN_PROGRESS', ...)`.
+- كيف يُستأنف؟ عبر `syncEngine.start()` الذي يعيد قراءة `resetInProgressToPending()` و`eventsCache` و`seenE2eeNonces` (مهم جداً: إعادة بناء `seenE2eeNonces` من الأحداث المستعادة!) ويعيد ربط المستمعات وينتقل إلى `'RUNNING'`.
+- ماذا لو فشل الإيقاف أو الاستئناف؟
+  * فشل `stop()` (بسبب خطأ إلغاء اشتراك أو انتهاء مهلة التصريف): تنتقل الحالة إلى `'ERROR'`، يُرفع `opEpoch` لإبطال أي مهام متأخرة، **تُلغى عملية الاستعادة قبل لمس IndexedDB**، وتُحاوَل استعادة التشغيل التشغيلي.
+  * فشل `start()` بعد التزام الاستعادة: تظل الحالة `'ERROR'`، `syncEngineRunning = false`، لا يدعي `HealthMonitor` أبداً أن المزامنة `'HEALTHY'`.
+
+5.3 `DeviceManager` (`src/application/devices/deviceManager.ts`)
+- من يبدأه؟ `LifecycleManager.startup()` أو منسّق الاستعادة في المرحلة 5/6.
+- من يوقفه؟ منسّق الاستعادة في المرحلة 2 أو `LifecycleManager.shutdown()`.
+- العمليات غير المتزامنة النشطة لحظة الإيقاف:
+  * `refreshLinkedDevicesFromRelay()` و`refreshPendingPairingApprovals()` (سواء من `unsubPairing` أو `connectRelay` أو الواجهة).
+  * `connectRelay`, `createPairingRequest`, `acceptPairingCode`, `confirmPairingApproval`, `revokeLinkedDevice`, `removeLinkedDevice`, `revokeRelaySession`.
+- هل ينتظرها؟ **نعم (وفق التصميم ج):** يُضاف `lifecycleState` (`IDLE | STARTING | RUNNING | STOPPING | STOPPED | ERROR`) و`InFlightTracker` إلى `DeviceManager`. عند `stop()`:
+  1) يدخل `'STOPPING'` (يمنع أي نداء جديد في `unsubPairing` أو الواجهة من كتابة `LINKED_DEVICES`).
+  2) يلغي `unsubTransport` و`unsubPairing` في `try/finally`.
+  3) يستدعي `await this.disconnectRelay()` (يغلق WS ويصفي `reconnectTimer` ويوقف الإعادة التلقائية).
+  4) ينتظر تصريف جميع وعود `DeviceManager` قيد التنفيذ (`InFlightTracker.drain(DRAIN_TIMEOUT_MS)`).
+  5) ينتقل إلى `'STOPPED'`.
+- هل يمكن بدء عمليات جديدة بعد إيقافه؟ **لا**؛ `unsubPairing` ملغى، وWS مغلق، وأي استدعاء من الواجهة يُرفض لأن الحالة ليست `'RUNNING'` / حاجز الكتابة مفعّل.
+- كيف يُستأنف؟
+  * عند فشل الاستعادة قبل الالتزام: `deviceManager.start()` يعيد تحميل `identity` و`linkedDevices` ويعيد الاشتراك. وإذا كان `connectionServiceEnabled` مفعلاً قبل الاستعادة، يعاد الاتصال بالمرحل عبر `schedulerParticipant`.
+  * عند نجاح الاستعادة: `deviceManager.start()` يقرأ `linkedDevices` المستعادة من IndexedDB (`deviceRepo.getLinkedDevices()`), ويحافظ على `identity` المحلي، ويمسح `activePairingRequest` و`pendingApprovals` القديمة من الذاكرة حتى لا تبقى طلبات اقتران من جلسة/مرحل سابق في الذاكرة! ثم يتصل بالمرحل في `schedulerParticipant.start()` فقط إذا كانت الإعدادات المستعادة تفعل الخدمة.
+- ماذا لو فشل الإيقاف أو الاستئناف؟
+  * فشل `stop()`: يوقف الاستعادة قبل الالتزام (Fail-Closed).
+  * فشل `start()` بعد الالتزام: يسجل تحت `'LIFECYCLE'` ويضاف إلى `postRestoreWarnings`.
+
+5.4 `RelayTransportClient` (`src/infrastructure/transport/relayTransportClient.ts`)
+- من يبدأه؟ `deviceManager.connectRelay()`.
+- من يوقفه؟ `deviceManager.stop()` -> `disconnectRelay()` -> `transportClient.disconnect()`.
+- العمليات غير المتزامنة النشطة لحظة الإيقاف:
+  * `reconnectTimer` (`L444-450`): يوقفه `disconnect()` عبر `this.manualDisconnect = true; this.activeDevice = null; this.clearReconnectTimer();` (`L461-463`).
+  * `connect()` الجارية لحظة الاستدعاء! **ثغرة دقيقة مكتشفة في `relayTransportClient.ts:204-311`:** إذا كانت `connect()` متوقفة عند `await this.requestJson('/auth/session', ...)` ثم استُدعي `disconnect()` أثناء ذلك، فإن `connect()` قد تستكمل بعد عودتها وتنشئ `this.socket` وتضبط `state = 'CONNECTED'` بعد أن ظن المستدعي أنه أغلق الاتصال!
+    -> **الحل التصميمي:** إضافة `connectionEpoch` في `RelayTransportClient`؛ كل استدعاء `disconnect()` أو `connect()` يرفع `connectionEpoch` ويُمرّر `AbortController` لـ `connect()` بحيث إذا تغير `connectionEpoch` أو تفعّل `manualDisconnect` أثناء خطوات `connect()`, تُلغى المحاولة وتُغلق أي `WebSocket` فُتحت وتُعاد الحالة إلى `'DISCONNECTED'` فوراً.
+  * طلبات HTTP الجارية عبر `requestJson`: ترتبط بـ `AbortController` مركزي نشط (`activeControllers: Set<AbortController>`) بحيث يجهض `disconnect()` الطلبات الشبكية المعلّقة فوراً بدل الانتظار 8000ms في بعض المسارات!
+- هل يكتب `RelayTransportClient` في IndexedDB؟ لا، لكنه مصدر التغذية الأساسي لمستمعات `SyncEngine` و`DeviceManager`. إغلاقه أثناء `Quiesce` يقطع تدفق إشعارات WS ويصفي `reconnectTimer`.
+
+5.5 `SettingsService` و`SecurityManager`:
+- لا يملكان مؤقتات، لكنهما يملكان دوال كتابة متاحة للواجهة (`settingsService.update`, `securityManager.clearAuditLog`, `securityManager.verifyCryptoIntegrity`, `securityManager.recordAudit`).
+- يتم عزلهما أثناء `RESTORING` عبر حاجز الكتابة (Operation Gate)، وبعد التزام المعاملة يُحدَّثان بـ `initialize()` (قراءة فقط من IndexedDB وتحديث الذاكرة وإشعار المشتركين) بينما `unsubSettingsEndpoint` غير مرتبطة بعد.
+
+5.6 `NotificationCaptureService` و`App.tsx`:
+- **`NotificationCaptureService` غير موجود في تطبيق الويب `src/`** (تم التحقق عبر البحث في كامل `src/` وعبر `deviceDataSources.ts:38,103`). في تطبيق Android المستقبلي (`app/`), سيحتاج إلى مشاركة مماثلة في `LifecycleManager` وحاجز الاستعادة.
+- **`sessionTicker` في `App.tsx:109-114`**: يقرأ حالة الجلسة في الذاكرة كل ثانية فقط. لا يكتب إلى IndexedDB ولا يحتاج لإيقاف، لكن واجهة `App.tsx` تشترك في حالة `restoreInProgress` لتعطيل أزرار البدء/الإيقاف/المزامنة/التفويض طوال فترة الاستعادة.
+
+================================================================================
+القسم 6: التصميم ج — تصريف العمليات الجارية ومهلة التصريف (Drain & Timeout)
+================================================================================
+6.1 آلية `InFlightTracker` لمنع سباق «دخول عملية جديدة أثناء انتظار التصريف»:
+- القاعدة الجوهرية (Single-Threaded JS Turn Guarantee):
+  **يجب تعيين علم الرفض (`accepting = false` أو `lifecycleState = 'STOPPING'`)
+  تزامنياً في نفس دورة التنفيذ (Synchronous Turn) قبل فحص `inFlight.size === 0`
+  أو البدء بـ `await`!**
+- لماذا؟ إذا تغير العلم بعد أول `await` أو أُهمل الحارس في الدوال، ستنشأ نافذة TOCTOU
+  تدخل فيها عملية جديدة وتبدأ `await` بينما `stop()` تظن أنها انتهت.
+
+```ts
+export class InFlightTracker {
+  private readonly active = new Set<Promise<unknown>>();
+  private accepting = true;
+
+  pauseAccepting(): void {
+    this.accepting = false;
+  }
+
+  resumeAccepting(): void {
+    this.accepting = true;
+  }
+
+  isAccepting(): boolean {
+    return this.accepting;
+  }
+
+  getActiveCount(): number {
+    return this.active.size;
+  }
+
+  track<T>(work: () => Promise<T>): Promise<T> {
+    if (!this.accepting) {
+      return Promise.reject(
+        new SyncError(
+          'SERVICE_STOPPING_OR_STOPPED',
+          'الخدمة متوقفة أو قيد الإيقاف حالياً.',
+          'Rejected async operation while service is stopping or stopped',
+          true
+        )
+      );
+    }
+    const p = Promise.resolve().then(work);
+    const settled = p.finally(() => {
+      this.active.delete(settled);
+    });
+    this.active.add(settled);
+    return p;
+  }
+
+  async drain(timeoutMs: number): Promise<void> {
+    this.accepting = false;
+    if (this.active.size === 0) return;
+
+    const allDone = Promise.allSettled(Array.from(this.active)).then(() => 'DRAINED' as const);
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const timeoutPromise = new Promise<'TIMEOUT'>((resolve) => {
+      timer = setTimeout(() => resolve('TIMEOUT'), timeoutMs);
+    });
+
+    try {
+      const outcome = await Promise.race([allDone, timeoutPromise]);
+      if (outcome === 'TIMEOUT' && this.active.size > 0) {
+        throw new SyncError(
+          'BACKUP_RESTORE_DRAIN_TIMEOUT',
+          `تعذّر إنهاء عمليات المزامنة الجارية خلال المهلة المحددة (${timeoutMs} مللي ثانية)، لذلك أُلغيت الاستعادة حفاظاً على سلامة البيانات.`,
+          `Timed out draining ${this.active.size} in-flight operation(s) after ${timeoutMs}ms`,
+          true
+        );
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+}
+```
+
+6.2 العمليات المتتبعة داخل `SyncEngine` و`DeviceManager`:
+- في `SyncEngine`:
+  1) `runSyncCycle()` (تُدرج الوعود الفعلية داخل `tracker` — وليس الوعود المرفوضة فوراً عند `isProcessing`)
+  2) `pullInboundEvents()`
+  3) `ingestInboundEvent()` (سواء استُدعيت منفردة من WS أو من `pullInboundEvents` — لا يسبب Deadlock لأن `drain()` لا يعمل إلا من خارجها وينتظر `active` معاً!)
+  4) `retryPendingInboundAcks()`
+  5) `handleDeliveryAcks()`
+  6) `handleTransportConnected()`
+  7) عمليات الواجهة: `enqueueNotification`, `updateEventStatus`, `manualRetryEvent`, `deleteEvent`, `clearAllEvents`.
+- في `DeviceManager`:
+  1) `connectRelay`
+  2) `refreshLinkedDevicesFromRelay`
+  3) `refreshPendingPairingApprovals`
+  4) `createPairingRequest`, `acceptPairingCode`, `confirmPairingApproval`
+  5) `revokeLinkedDevice`, `removeLinkedDevice`, `revokeRelaySession`.
+
+6.3 سياسة الإلغاء الآمن (Abort vs Wait) وتحديد قيمة المهلة:
+- **عمليات الشبكة (HTTP/WS في `RelayTransportClient`)**: يمكن إجهاضها بأمان عبر
+  `AbortController` عند `deviceManager.stop() -> transport.disconnect()` (المرحلة 2)،
+  مما يحرّر الوعود المعلقة في `sendSyncBatch` / `fetchInboundEvents` / `fetchLinkedDevices`
+  خلال أجزاء من الثانية بدلاً من انتظار مهلة الشبكة كاملة!
+- **عمليات WebCrypto ومعاملات IndexedDB الجارية**: **لا تُلغى قسراً في المنتصف!**
+  يتم انتظار اكتمالها عبر `InFlightTracker.drain()`.
+  * لماذا؟ إجهاض معاملة IndexedDB في منتصفها أو ترك وعد يكتب بعد التوقف يهدد اتساق
+    الحالة أو يحرمنا من معرفة إن كانت الدفعة قد أُرسلت للمرحل فعلاً.
+- **قيمة مهلة التصريف الموصى بها (`DEFAULT_DRAIN_TIMEOUT_MS`)**:
+  `10_000` مللي ثانية (قابلة للتهيئة بالحقن في الاختبارات، وأكبر من `requestTimeoutMs = 8000`
+  بهامش 2000ms لإتمام أي معاملة IndexedDB قصيرة بعد انتهاء/إجهاض طلب HTTP).
+
+6.4 السلوك عند انتهاء مهلة التصريف (Fail-Closed + حماية ما بعد المهلة):
+1) إذا انتهت `drain(timeoutMs)` وبقيت وعود معلقة (مثلاً mock transport معلق لا يحترم `signal`):
+   - يرفع `SyncEngine` و`DeviceManager` متغير `opEpoch += 1` (generation counter)
+     ويدخلان حالة `'ERROR'`.
+   - ترمي `stop()` خطأ `BACKUP_RESTORE_DRAIN_TIMEOUT`.
+   - **تمتنع `executeRestoreWithPostCommitRecovery` عن استدعاء `restoreBackup()` نهائياً**
+     (تبقى قاعدة البيانات قبل الاستعادة سليمة دون أي تعديل!).
+   - تسجل الخطأ في `ErrorManager` تحت مصدر `'SYNC'` (أو `'LIFECYCLE'` لـ `DeviceManager`).
+2) **حماية المهمة المعلّقة إذا استيقظت لاحقاً بعد المهلة (Late Completion Protection):**
+   - تحتفظ كل عملية طويلة بـ `const entryEpoch = this.opEpoch`.
+   - قبل أي كتابة لاحقة في IndexedDB أو تحديث `this.eventsCache` أو `this.lastSuccessfulSyncAt`
+     أو `this.notify()` بعد `await` شبكة أو تشفير، تفحص الدالة:
+     `if (this.opEpoch !== entryEpoch || this.lifecycleState !== 'RUNNING') return ...;`
+   - كما أن `finally` لـ `runSyncCycle` يتحقق من `entryEpoch === this.opEpoch` قبل تعديل
+     `eventsCache` أو `isProcessing`، ويفحص أن القفل لم يتحوّل لجولة أو حالة أخرى.
+3) **ملاحظة صادقة حول حالة التشغيل التشغيلي بعد Timeout:**
+   - إذا كانت هناك مهمة معلقة في الذاكرة لم تغلق وعدها بعد، فإن محاولة `startSyncEngine()`
+     الفورية قد تنتظر أو تلاحظ بقاء المهام المعلقة؛ ولذلك يجب على `start()` نفسها أن تحترم
+     أولوية التصريف أو تبلغ بوضوح عبر `ErrorManager` و`SyncEngine.lifecycleState = 'ERROR'`
+     إذا بقي وعد معلق يتجاوز المهلة دون تعريض البيانات للاستعادة أبداً.
+
+================================================================================
+القسم 7: التصميم د — آلة حالة دورة الحياة والتنسيق (Lifecycle State Machine)
+================================================================================
+7.1 الحالات المسموحة في `SyncEngine` (و`DeviceManager`):
+`export type ServiceLifecycleState = 'IDLE' | 'STARTING' | 'RUNNING' | 'STOPPING' | 'STOPPED' | 'ERROR';`
+
+مصفوفة الانتقالات المسموحة في `SyncEngine`:
+- `IDLE`      -> `STARTING` (عبر `start()`) أو `STOPPED` (عبر `stop()` المباشر)
+- `STARTING`  -> `RUNNING` (عند نجاح التهيئة وربط جميع المستمعات دون إلغاء)
+              -> `ERROR` (عند فشل التهيئة أو فشل `subscribe` مع rollback للمستمعات)
+              -> `STOPPING` (عند استدعاء `stop()` تزامناً — بعد تسلسل الـ Promises)
+- `RUNNING`   -> `STOPPING` (عبر `stop()`)
+- `STOPPING`  -> `STOPPED` (عند نجاح إلغاء المستمعات + اكتمال `drain()`)
+              -> `ERROR` (عند فشل إلغاء مستمع أو انتهاء مهلة `drain()`)
+- `STOPPED`   -> `STARTING` (عبر `start()`)
+- `ERROR`     -> `STARTING` (عبر `start()`) أو `STOPPING` (عبر `stop()` للتعافي/التنظيف)
+
+7.2 تسلسل `start()` و`stop()` وحل السباقات الأربعة (Single-Flight + Epoch):
+يُدار التنفيذ عبر:
+- `private activeTransition: Promise<void> | null = null;`
+- `private startPromise: Promise<void> | null = null;`
+- `private stopPromise: Promise<void> | null = null;`
+- `private desiredState: 'RUNNING' | 'STOPPED' = 'STOPPED';`
+- `private opEpoch = 0;`
+
+كيف تُعالَج التداخلات الأربعة بدقة؟
+1) **`start()` مع `start()` متزامنين (`start+start`):**
+   - يضبط `desiredState = 'RUNNING'`.
+   - إذا كان `this.startPromise` قائماً -> يُرجع نفس `this.startPromise` (لا يضاعف `initialize`
+     ولا يكرر `subscribe` أبداً!).
+   - إذا كان `this.stopPromise` قائماً -> ينتظر `await this.stopPromise.catch(() => {})` أولاً،
+     ثم يفحص `if (this.desiredState !== 'RUNNING') return;`، وإذا ما زال مطلوباً يبدأ `start()`.
+2) **`stop()` مع `stop()` متزامنين (`stop+stop`):**
+   - يضبط `desiredState = 'STOPPED'`, ويرفع `opEpoch += 1` (لإلغاء أي `start()` قديم جارٍ)،
+     ويوقف قبول مهام جديدة (`inFlight.pauseAccepting()`).
+   - إذا كان `this.stopPromise` قائماً -> يُرجع نفس `this.stopPromise`.
+3) **`start()` ثم `stop()` متداخلان (`start+stop`):**
+   - `stop()` يضبط `desiredState = 'STOPPED'`, يرفع `opEpoch += 1`, ينتظر `await this.startPromise.catch(() => {})`,
+     ثم ينفذ خطوات الإيقاف الكاملة (`detachListeners + drain + STOPPED`).
+   - بالإضافة إلى ذلك، داخل `start()` نفسها: بعد كل `await` (`repo.initialize`,
+     `resetInProgressToPending`, `repo.getAll`) وقبل تسجيل المستمعات وتعيين `'RUNNING'`,
+     تفحص `if (this.opEpoch !== startEpoch || this.desiredState !== 'RUNNING')`:
+     تخرج بسلاسة دون تسجيل مستمعات ودون وضع الحالة `'RUNNING'`! بذلك يستحيل أن تتجاوز
+     `start()` متأخرة قرار `stop()`.
+4) **`stop()` ثم `start()` متداخلان (`stop+start`):**
+   - `start()` يضبط `desiredState = 'RUNNING'`, ينتظر `await this.stopPromise`، ثم يبدأ
+     بـ `opEpoch` جديد بعد أن يكون `stop()` قد صرّف كل المهام القديمة وألغى كل المستمعات.
+   - *تفصيل حاسم:* إذا فشل `stopPromise` بمهلة تصريف، فإن `await this.stopPromise` في `start()`
+     يرفض أو يفحص هل لا تزال مهام عالقة قبل السماح بـ `RUNNING`.
+
+7.3 التنظيف العكسي عند الفشل الجزئي في `start()` و`stop()`:
+- **في `start()` (`Partial Listener Rollback`):**
+  ```ts
+  const attachedUnsubs: Array<() => void> = [];
+  try {
+    // بعد التأكد من opEpoch...
+    const u1 = this.transport.subscribeEvents(...);
+    this.unsubInbound = u1; attachedUnsubs.push(u1);
+    const u2 = this.transport.subscribeDeliveryAcks(...);
+    this.unsubDeliveryAcks = u2; attachedUnsubs.push(u2);
+    const u3 = this.transport.subscribe(...);
+    this.unsubTransportState = u3; attachedUnsubs.push(u3);
+    this.inFlight.resumeAccepting();
+    this.lifecycleState = 'RUNNING';
+  } catch (err) {
+    this.inFlight.pauseAccepting();
+    this.detachListenersSafely(); // يلغي كل من u1, u2, u3 المسجلة ويعيّنها null
+    this.lifecycleState = 'ERROR';
+    throw err;
+  }
+  ```
+- **في `stop()` (`Exhaustive Unsubscribe via try/finally`):**
+  ```ts
+  private detachListenersSafely(): Error | null {
+    let firstErr: Error | null = null;
+    const slots: Array<['unsubInbound' | 'unsubDeliveryAcks' | 'unsubTransportState']> = [
+      ['unsubInbound'],
+      ['unsubDeliveryAcks'],
+      ['unsubTransportState'],
+    ];
+    for (const [key] of slots) {
+      const fn = this[key];
+      this[key] = null; // تصفير المرجع أولاً لمنع إعادة الاستدعاء
+      if (fn) {
+        try {
+          fn();
+        } catch (err) {
+          if (!firstErr) firstErr = err instanceof Error ? err : new Error(String(err));
+        }
+      }
+    }
+    return firstErr;
+  }
+  ```
+  ثم في `stop()`:
+  1) `this.lifecycleState = 'STOPPING';`
+  2) `this.inFlight.pauseAccepting();`
+  3) `const detachErr = this.detachListenersSafely();` (تُنفَّذ دائماً على الـ 3 مستمعات حتى لو رمى الأول!).
+  4) `await this.inFlight.drain(drainTimeoutMs);` (داخل `try/catch` حتى لو فشل `detachErr` نصرّف المهام الجارية أولاً قبل الانتقال لـ `'ERROR'`!).
+  5) تصفير `this.isProcessing = false; this.pullInFlight = null;` **فقط بعد نجاح التصريف**؛ وإذا وجد `detachErr` أو فشل `drain` -> `this.lifecycleState = 'ERROR'` ويرمى الخطأ. وإلا -> `this.lifecycleState = 'STOPPED'`.
+
+7.4 تحسين `LifecycleManager` (`src/application/lifecycle/lifecycleManager.ts`):
+- في `LifecycleManager.startup()` الحالية (الأسطر 30–65):
+  * لو تداخل `shutdown()` مع `startup()`, لا يوجد إلغاء متبادل أثناء حلقة `for (const participant of this.participants)` (`L44-47`). يُضاف فحص `epoch` بعد كل `await participant.start()`, وعند فشل `participant[i].start()` تُنفَّذ `stop()` عكسياً على `participants[0..i-1]` (Rollback جزئي).
+  * في `shutdown()` (`L80-94`): عند فشل إيقاف أي مشارك يُجمع الخطأ وتُستكمل بقية المشاركين، وإذا فشل مشارك يضبط `phase = 'ERROR'` أو يبلّغ بوضوح بدل تظاهر `phase = 'STOPPED'` مع ابتلاع الاستثناء.
+- تنسيق الاستعادة:
+  إما عبر دوال مخصصة في `RestoreCoordinator` تستدعي Participants بترتيب عكسي:
+  `stopScheduler -> stopSyncEngine -> stopDeviceManager` (دون إغلاق `bootstrapParticipant` لأن `database` يجب أن تبقى مفتوحة لمعاملة `restoreBackup()` ولئلا يصير `healthMonitor.databaseHealthy = false` بلا داعٍ أو بوعي تام لحالة الصيانة!).
+  **نقطة بالغة الأهمية:** لا نريد استدعاء `lifecycleManager.shutdown()` كاملاً أثناء الاستعادة لأن `bootstrapParticipant.stop()` تعيّن `databaseHealthy = false`! الأصح إيقاف المشاركين النشطين الثلاثة فقط (`schedulerParticipant`, `syncEngine`, `deviceManager`) مع تفعيل `healthMonitor.setRestoring(true)`.
+
+================================================================================
+القسم 8: التصميم هـ — دلالات `HealthMonitor` والتقارير الصحية
+================================================================================
+8.1 الحفاظ على العقد العام:
+- يظل `SubsystemStatus = 'HEALTHY' | 'DEGRADED' | 'UNAVAILABLE' | 'IDLE'`
+  و`SystemHealthSnapshot` في `src/domain/models/health.ts` متوافقَين خلفياً (يمكن إضافة
+  حقل اختياري مثل `restoreInProgress?: boolean` أو `syncLifecycleState?: ServiceLifecycleState`
+  إن احتيج دون كسر أي مستهلك قائم).
+- يحصل `HealthMonitor` عبر `deps` اختيارية على:
+  * `isRestoreInProgress?: () => boolean` (أو يستمع لتغييرات `RestoreCoordinator`)
+  * `syncEngine` (`getLifecycleState()`, `isSyncRunning()`, `getEvents()`, `getLastSuccessfulSyncAt()`, `getLastRunSummary()`)
+  * `transport` (`getState()`, `getLastSuccessfulConnectionAt()`)
+  * `errorManager` (`getLatestError()`, `getAllErrors()`).
+
+8.2 جدول القرار الكامل لحالة `syncStatus` (مصفوفة الأولوية الصارمة من الأعلى للأسفل):
+
++----+-----------------------------------+---------------------+-------------------------------+------------------+-----------------------------------------------+
+| #  | حالة `SyncEngine`                 | `transportStatus`   | حالة الطابور والأخطاء         | `syncStatus`     | التفسير الهندسي                               |
++----+-----------------------------------+---------------------+-------------------------------+------------------+-----------------------------------------------+
+| 1  | `!databaseHealthy` أو `ERROR`     | أي حالة             | أي حالة                       | `UNAVAILABLE`    | المحرك أو قاعدة البيانات في حالة عطل/تلف.     |
++----+-----------------------------------+---------------------+-------------------------------+------------------+-----------------------------------------------+
+| 2  | `isRestoreInProgress === true`    | أي حالة             | أي حالة                       | `IDLE` (أو       | أثناء الاستعادة لا يجوز إظهار `HEALTHY` أبداً.|
+|    | أو `STOPPING` أو `STARTING`       |                     |                               | `DEGRADED` إن وُجد `ERROR` / `failedCount > 0`) | (انظر الملاحظة 8.3 حول `RESTORING`).        |
++----+-----------------------------------+---------------------+-------------------------------+------------------+-----------------------------------------------+
+| 3  | `IDLE` (لم يبدأ المحرك بعد)       | أي حالة (حتى لو     | `failedCount > 0`             | `DEGRADED`       | يغلق ثغرة س16: لا يعيد `HEALTHY` أبداً        |
+|    |                                   | `CONNECTED`)        | وإلا أي عدد `pending/synced`  | `IDLE`           | قبل بدء المحرك (`start()`).                   |
++----+-----------------------------------+---------------------+-------------------------------+------------------+-----------------------------------------------+
+| 4  | `STOPPED`                         | أي حالة             | `failedCount > 0` أو          | `DEGRADED`       | المحرك متوقف وهناك أحداث تنتظر/فاشلة.         |
+|    |                                   |                     | `pendingCount > 0` أو         |                  |                                               |
+|    |                                   |                     | `inProgressCount > 0`         |                  |                                               |
++----+-----------------------------------+---------------------+-------------------------------+------------------+-----------------------------------------------+
+| 5  | `STOPPED`                         | أي حالة             | `pending=0, inProgress=0,     | `IDLE`           | متوقف بشكل نظيف ولا يوجد عمل معلق.            |
+|    |                                   |                     | failed=0`                     |                  |                                               |
++----+-----------------------------------+---------------------+-------------------------------+------------------+-----------------------------------------------+
+| 6  | `RUNNING`                         | أي حالة             | `failedCount > 0`             | `DEGRADED`       | حتى لو كان `pendingCount > 0` و`CONNECTED`؛   |
+|    |                                   |                     |                               |                  | وجود أحداث فاشلة يمنع اعتبار النظام سليماً.    |
++----+-----------------------------------+---------------------+-------------------------------+------------------+-----------------------------------------------+
+| 7  | `RUNNING`                         | أي حالة             | خطأ حديث غير محلول من مصدر    | `DEGRADED`       | يؤثر آخر خطأ `SYNC` في `ErrorManager` على     |
+|    |                                   |                     | `'SYNC'` في `ErrorManager`    |                  | `syncStatus` (س18)، و`'STORAGE'` على `databaseStatus`.|
++----+-----------------------------------+---------------------+-------------------------------+------------------+-----------------------------------------------+
+| 8  | `RUNNING`                         | `'ERROR'` أو        | أي حالة (`pending` أو `synced`| `DEGRADED`       | يغلق ثغرة س17: لا يزعم `HEALTHY` استناداً     |
+|    |                                   | `'RECONNECTING'` أو | قديمة/مستعادة)                |                  | لأحداث `SYNCED` قديمة عند تعطل أو تأرجح النقل!|
+|    |                                   | `'CONNECTING'`      |                               |                  |                                               |
++----+-----------------------------------+---------------------+-------------------------------+------------------+-----------------------------------------------+
+| 9  | `RUNNING`                         | `'DISCONNECTED'`    | `pendingCount > 0` أو         | `DEGRADED`       | هناك أحداث تنتظر الإرسال لكن النقل مفصول.     |
+|    |                                   |                     | `inProgressCount > 0`         |                  |                                               |
++----+-----------------------------------+---------------------+-------------------------------+------------------+-----------------------------------------------+
+| 10 | `RUNNING`                         | `'DISCONNECTED'`    | `pending=0, inProgress=0,     | `IDLE`           | النقل متوقف اختيارياً والطابور نظيف — ليس     |
+|    |                                   |                     | `failed=0` (ولو `synced > 0`) |                  | `HEALTHY` لأن القناة غير متصلة ولا `DEGRADED` لأن الخدمة متوقفة عمداً.|
++----+-----------------------------------+---------------------+-------------------------------+------------------+-----------------------------------------------+
+| 11 | `RUNNING`                         | `'CONNECTED'`       | `failed=0` ولا خطأ `'SYNC'`   | `HEALTHY`        | يتطابق مع اختبار `backupV2.test.ts:1326`      |
+|    |                                   |                     | نشط (مع `synced>0` أو `pending>=0` و`lastRunSummary` بدون فشل)|  | (`RUNNING + CONNECTED + SYNCED -> HEALTHY`).|
++----+-----------------------------------+---------------------+-------------------------------+------------------+-----------------------------------------------+
+
+8.3 آلية اعتبار خطأ `ErrorManager` «نشطاً/غير محلول» (Resolution Rule):
+- لا يكفي وجود خطأ `'SYNC'` تاريخي في `errors[]` لمنع عودة النظام إلى `HEALTHY` للأبد
+  بعد تعافيه! لذلك:
+  * يحتفظ `SyncEngine` بـ `lastHealthyCycleAt` (يُحدَّث عند إتمام `runSyncCycle()` بدون فشل
+    أو عند نجاح `start()` وتمرير دورة أو استعادة طبيعية بدون أخطاء، مع عدم اعتباره
+    تاريخاً لمزامنة فعلية قبل تنفيذ دورة، أي `lastSuccessfulSyncAt` يبقى فقط عند مزامنة
+    حدث فعلي!).
+  * كما يوفّر `ErrorManager` دالة مساعدة أو يفحص `HealthMonitor` آخر خطأ من مصدر `'SYNC'`
+    (أو `'STORAGE'`): يكون الخطأ `'SYNC'` «نشطاً» إذا كان `latestSyncError.timestamp >= syncEngine.getLastTransitionToRunningAt()`
+    ولم تكتمل بعده دورة `runSyncCycle()` ناجحة (`summary.failed === 0 && !summary.skippedReason`)
+    ولم يُمسح عبر `errorManager.clearLatest()`.
+  * بالمثل، إذا وُجد خطأ `'STORAGE'` أحدث من آخر تهيئة ناجحة لـ `database` -> يُخفَّض
+    `databaseStatus` من `'HEALTHY'` إلى `'DEGRADED'` (أو `'UNAVAILABLE'` إذا `!databaseHealthy`).
+
+================================================================================
+القسم 9: التصميم و — استرداد ما بعد الالتزام ومواءمة الواجهة
+================================================================================
+9.1 التمييز الواضح بين الحالات الأربع في `executeRestoreWithPostCommitRecovery` + `ActionModal`:
+1) **فشل قبل بدء الاستعادة (`stop/quiesce/drain` فشل):**
+   - لم يُمس IndexedDB إطلاقاً.
+   - إن نجح الاستئناف التشغيلي: رمي خطأ إيقاف/تصريف صريح يوضح «لم تبدأ عملية الاستعادة».
+   - إن فشل الاستئناف التشغيلي: رمي `BACKUP_RESTORE_SYNC_STOP_AND_RESTART_FAILED` مع
+     عدم تكرار النص في الواجهة.
+2) **فشل الاستعادة قبل الالتزام (عبارة مرور خاطئة / تلاعب / تجاوز حدود / إجهاض معاملة IDB):**
+   - تراجع IndexedDB ذرياً (0 تغييرات).
+   - إن نجح `Resume Services`: إعادة رمي الخطأ الأصلي **بصنفه الأصلي** (`ValidationError` / `SecurityError` / `StorageError`).
+   - إن فشل `Resume Services`: بدلاً من إنشاء `new AppError` يفقد `instanceof ValidationError`
+     أو `SecurityError` (`container.ts:190`)، تُحفظ فئة الخطأ أو يُمرَّر الخطأ الأصلي عبر
+     صنف تغليف/مصنع يحافظ على الـ Prototype أو يعلّم الواجهة عبر `err.cause` مع ضمان
+     عرض رسالة موحدة غير مكررة!
+     *تحديد تقني دقيق:* لأن `formatBackupError` في `ActionModal.tsx` يفحص `err.code` و`err instanceof AppError`،
+     يمكن الاحتفاظ بصنف `ValidationError`/`SecurityError`/`StorageError` عند الاستنساخ
+     (مثلاً عبر `preserveAppErrorSubclass(preCommitErr, { userMessage, technicalMessage, context })`
+     أو فحص `err instanceof ValidationError` في الاختبارات) فيستمر تحقق
+     `err instanceof ValidationError` و`err instanceof AppError` معاً!
+3) **نجاح التزام الاستعادة مع فشل تحديث ما بعد الالتزام:**
+   - قاعدة البيانات المستعادة ملتزمة وسليمة.
+   - **إصلاح خطأ `reloadSettings()` الحرج (`container.ts:226-238, 274-285`):**
+     * في الكود الحالي: إذا فشل `reloadSettings()`, يبقي `restoredSettings = deps.getSettingsSnapshot()`
+       (أي إعدادات *ما قبل* الاستعادة!) ثم يستعملها لتعيين `effectiveRole` و`sessionTimeoutMinutes`
+       و`relayEndpoint` القديم!
+     * **الحل التصميمي:**
+       أ) تهيئة `let settingsReloaded = false;` و`let restoredSettings: AppSettings | null = null;`.
+       ب) إذا فشل `reloadSettings()`:
+          - لا تُستعمل لقطة الإعدادات القديمة لتحديد مهلة الجلسة أو مسار المرحل!
+          - يعتمد `effectiveRole` على `result.restoredRole` المرجعة من معاملة IndexedDB الموثوقة.
+          - لأن إعدادات الجلسة و`relayEndpoint` في الذاكرة غير متزامنة مع القاعدة:
+            **Fail-Closed Session Handling**: إذا فشل `reloadSettings()`, لا تُصدر جلسة
+            بمعلمات قديمة؛ إما استدعاء `deps.clearSession()` مع تحذير صريح يدعو المستخدم
+            لإعادة تحميل الصفحة، وإما عدم تمرير `sessionTimeoutMinutes` القديم، **ويجب**
+            تجنب استئناف `schedulerParticipant` بـ `relayEndpoint` القديم!
+   - حساب `syncEngineRunning`: يعتمد على تحقق فعلي:
+     `syncEngineRunning = restartSucceeded && deps.getSyncLifecycleState() === 'RUNNING'`
+     (وليس فقط عدم رمي `startSyncEngine()` استثناءً!).
+4) **نجاح التزام الاستعادة ونجاح جميع التحديثات:**
+   - يعيد `syncEngineRunning: true` بدون `postRestoreWarnings`.
+
+9.2 إصلاحات `ActionModal.tsx` المحددة (`src/presentation/components/ActionModal.tsx`):
+1) **إزالة التكرار في `formatBackupError` (`L279-284`):**
+   - السبب المثبت: `container.ts` يضع جملة «كما تعذّر إعادة تشغيل محرك المزامنة» في
+     `err.userMessage` لحالات `BACKUP_RESTORE_SYNC_STOP_AND_RESTART_FAILED` و`BACKUP_RESTORE_AND_SYNC_RESTART_FAILED`،
+     بينما `ActionModal.tsx:283` يلحق عبارة ثانية دائماً عند `syncEngineRestartFailed === true`
+     إذا لم يكن `cause` من نوع `AppError`.
+   - الإصلاح:
+     * يزيل `formatBackupError` الإلحاق العشوائي: إذا كان `err.cause instanceof AppError`,
+       يفك تغليف `cause` ليأخذ الرسالة المختصرة النظيفة الخاصة بـ `ActionModal` لرمز الخطأ الأصلي
+       (مثل `BACKUP_AUTH_FAILED`) ثم يلحق جملة واحدة فقط لتعذر إعادة التشغيل؛ أما إذا لم
+       يكن `cause instanceof AppError` (مثل `BACKUP_RESTORE_SYNC_STOP_AND_RESTART_FAILED`),
+       فإن `err.userMessage` تحتوي بالفعل على الرسالة الكاملة غير مكررة (ويُزال الإلحاق الثاني)!
+     * إضافة حالة مخصصة في `switch (err.code)` لـ:
+       `BACKUP_RESTORE_ALREADY_IN_PROGRESS`, `BACKUP_RESTORE_DRAIN_TIMEOUT`, `BACKUP_RESTORE_IN_PROGRESS`.
+2) **فصل صندوق التحذير عن صندوق الفشل بعد الالتزام (`L1294-1310`):**
+   - في الكود الحالي: عند نجاح الاستعادة في قاعدة البيانات مع تحذير ما بعد الالتزام، يضبط الكود
+     **كلاً من** `setStatusMessage(...)` (الأزرق) و`setErrorMessage(...)` (الأحمر) في آن واحد!
+   - الإصلاح: إضافة حالة ثالثة مستقلة `warningMessage: string | null` (تُعرض في صندوق كهرماني
+     `role="status"` أو `aria-label="تحذير ما بعد الاستعادة"` بتصميم متميز باللون `#FFBE50`
+     دون استخدام الصندوق الأحمر الخاص بفشل الاستعادة):
+     * الاستعادة النظيفة -> `statusMessage` فقط (يحافظ على `getByRole('status')` في E2E).
+     * الاستعادة الملتزمة مع تحذير جزئي / توقف المحرك -> `statusMessage` للجزء الملتزم (أو
+       رسالة مركّبة واضحة في `warningMessage`) بدون `errorMessage` حمراء تدّعي فشل الاستعادة،
+       مع زر واضح «إعادة تحميل التطبيق» عند تعذّر تحديث الإعدادات أو محرك المزامنة.
+     * فشل الاستعادة قبل الالتزام -> `errorMessage` الحمراء فقط.
+3) **ربط حالة الانشغال بقفل الحاوية الحقيقي (`container.isRestoreInProgress()`):**
+   - تمرير `restoreInProgress: boolean` من `App.tsx` إلى `DashboardView`, `TopBar`,
+     `NotificationHistoryView`, و`ActionModal`.
+   - تعطيل أزرار الاستعادة والتصدير والترحيل والإدراج والمزامنة اليدوية وتبديل خدمة الاتصال
+     والاقتران وإعدادات النظام طوال مدة `restoreInProgress === true` (حتى لو أُغلق المودال
+     وأُعيد فتحه!).
+
+9.3 مواءمة `DashboardView.tsx` و`NotificationHistoryView.tsx` و`App.tsx`:
+- تمرير `syncLifecycleState: ServiceLifecycleState` و`restoreInProgress: boolean` إلى `DashboardView`.
+- في `DashboardView.tsx`:
+  * لا يُكتفى بعرض `serviceRunning={settings.connectionServiceEnabled}`؛ إذا كان
+    `settings.connectionServiceEnabled === true` لكن `syncLifecycleState === 'STOPPED' || syncLifecycleState === 'ERROR'`,
+    تظهر شارة واضحة: «خدمة الاتصال مفعّلة في الإعدادات — لكن محرك المزامنة متوقف/متعطل حالياً»
+    مع إتاحة زر «إعادة تشغيل محرك المزامنة» (أو تفعيل `toggleConnectionService(true)` لإعادة تهيئته).
+  * تعطيل زر «مزامنة الآن» و«تشغيل/إيقاف خدمة الاتصال» أثناء `restoreInProgress`.
+- في `NotificationHistoryView.tsx`:
+  * تعطيل أزرار الإدراج الاختباري، «مزامنة الآن»، «إعادة محاولة»، «حذف»، وتغيير الحالة أثناء
+    `restoreInProgress`، وعرض رسالة خطأ/تنبيه واضحة في `actionWarning` إذا تعذر التنفيذ
+    بسبب توقف المحرك (`SYNC_ENGINE_NOT_RUNNING`).
+
+================================================================================
+القسم 10: تحليل التوافق والأثر عبر المنصات والعقود القائمة
+================================================================================
+1) **E2EE وKDF والمغلفات:**
+   - لا يمس التصميم `WebCryptoProvider` ولا خوارزميات `AES-256-GCM`, `ECDSA P-256`,
+     `ECDH P-256`, `PBKDF2-HMAC-SHA-256`، ولا بنية `E2eeEnvelope` ولا `EncryptedBackupArchiveV2`.
+2) **توافق `ITransportClient` و`ILifecycleParticipant`:**
+   - `ILifecycleParticipant` يحتفظ بتوقيعه (`name`, `start()`, `stop()`)؛ تُضاف الواجهة
+     الاختيارية `getLifecycleState?()` أو الدوال الداخلية على `SyncEngine` و`DeviceManager`
+     دون كسر أي مستهلك حالي لـ `ILifecycleParticipant`.
+   - في `ITransportClient`: لا تتغير التواقيع الإلزامية لأي دالة؛ دعم `AbortController`
+     يكون داخلياً في `RelayTransportClient.disconnect()` عبر تتبع `activeControllers` و`connectionEpoch`,
+     مما يحافظ على توافق 100% مع جميع كائنات Mock لـ `ITransportClient` في الاختبارات!
+3) **توافق `BackupRestoreResult` و`SystemHealthSnapshot`:**
+   - تبقى جميع الحقول الحالية كما هي، وتبقى الإضافات اختيارية (`syncLifecycleState?`, `restoreInProgress?`).
+4) **توافق خادم المرحل (`server/`) وتطبيق Android (`app/`):**
+   - صفر تغييرات مطلوبة في بروتوكول HTTP/WebSocket للخادم أو شيفرة Android.
+   - توثيق قرار العزل والتنسيق في ADR جديد لاحقاً عند الموافقة على التنفيذ (التزاماً بقاعدة
+     القسم 12 من تعليمات النظام الدائمة، دون تعديل ADR-002 أو ADR-003).
+
+================================================================================
+القسم 11: خطة الاختبارات الشاملة (17 اختباراً محدداً بدقة)
+================================================================================
+ملاحظة تصنيف بيئات الاختبار:
+- اختبارات الوحدة (Unit — Node `node:test`): تُنفَّذ فوق `InMemory*Repository` / `InMemoryIndexedDbHarness` / Mock `ITransportClient`، وتثبت المنطق والحالات والسباقات داخل التطبيق.
+- اختبارات التكامل (Integration — Node `node:test`): تُنفَّذ عبر `createAppContainer()` الكامل أو ربط الخدمات الحقيقية معاً مع مؤقتات وتدفقات متزامنة.
+- اختبارات المتصفح الحقيقي (E2E — Chromium Playwright + Real Browser IndexedDB + WebCrypto): تثبت التنفيذ الفعلي داخل IndexedDB الحقيقي وDOM الحقيقي.
+
+--- اختبار 1 (Unit): منع استعادتين متزامنتين (Single-Flight Restore Mutex) ---
+- الملف المستهدف: `tests/unit/backupV2.test.ts`
+- الحالة الابتدائية: `RestoreCoordinator` بحالة `OPEN` ونسختان صالحتان، وعملية `restoreBackup` الأولى معلقة عند وعد يدوي (`deferredPromise`).
+- خطوات التنفيذ: إطلاق `p1 = executeRestoreWithPostCommitRecovery(...)` ثم إطلاق `p2 = executeRestoreWithPostCommitRecovery(...)` فوراً قبل حسم `p1`، ثم حسم `p1`.
+- النتيجة المتوقعة: رفض `p2` فوراً برمز `BACKUP_RESTORE_ALREADY_IN_PROGRESS` قبل استدعاء `stopSyncEngine` أو `restoreBackup` مرة ثانية؛ إتمام `p1` بنجاح وتحرير القفل بعدها بحيث ينجح استدعاء ثالث `p3`.
+- ما يثبته: ذرية القفل الأحادي وعدم تكديس استعادة ثانية في طابور وتحرير القفل في `finally`؛ ولا يثبت سلوك IndexedDB المتصفح.
+
+--- اختبار 2 (Unit): الحماية من إعادة الدخول (Re-entrancy Protection) ---
+- الملف المستهدف: `tests/unit/backupV2.test.ts`
+- الحالة الابتدائية: `deps.stopSyncEngine` أو `deps.restoreBackup` تحاول استدعاء دالة الاستعادة مجدداً من داخلها.
+- خطوات التنفيذ: تشغيل الاستعادة الرئيسية ومتابعة الاستدعاء المتداخل.
+- النتيجة المتوقعة: يرفض الاستدعاء الداخلي فوراً دون Deadlock بـ `BACKUP_RESTORE_ALREADY_IN_PROGRESS`، ولا يعلق `activeToken`.
+- ما يثبته: منع الجمود الذاتي (Self-deadlock) في المسارات العائدة.
+
+--- اختبار 3 (Unit / Integration): حاجز الكتابة لجميع عمليات التعديل أثناء الاستعادة (Write Barrier) ---
+- الملف المستهدف: `tests/unit/backupV2.test.ts` أو `tests/integration/backupRestoreIsolation.test.ts`
+- الحالة الابتدائية: حاوية تطبيق مهيأة (`Admin` + جلسة نشطة)، وعملية `restoreBackup` معلقة في المنتصف.
+- خطوات التنفيذ: أثناء تعليق الاستعادة، محاولة استدعاء: `runSyncNow()`, `toggleConnectionService(true)`, `selectRole('basic')`, `changeRole('basic')`, `setNotificationAccess(true)`, `exportBackupJson(...)`, `migrateLegacyBackupJson(...)`, `settingsService.update(...)`, `syncEngine.enqueueNotification(...)`, `syncEngine.updateEventStatus(...)`, `syncEngine.manualRetryEvent(...)`, `syncEngine.deleteEvent(...)`, `syncEngine.clearAllEvents()`, `deviceManager.revokeLinkedDevice(...)`.
+- النتيجة المتوقعة: رفض فوري لجميع هذه العمليات (Fail-Closed) دون أي تعديل على المستودعات؛ ثم بعد انتهاء الاستعادة وتحرير القفل، تعمل العمليات طبيعياً.
+- ما يثبت: تغطية حاجز الكتابة لكل نقاط الدخول البرمجية؛ ولا يثبت تعطيل أزرار DOM.
+
+--- اختبار 4 (Unit): انتظار `SyncEngine.stop()` لانتهاء `runSyncCycle()` الجارية دون تصفير مبكر ---
+- الملف المستهدف: `tests/unit/backupV2.test.ts`
+- الحالة الابتدائية: `SyncEngine` في حالة `RUNNING`؛ دالة `transport.sendSyncBatch` معلقة على وعد قابل للتحكم؛ حدث `PENDING` واحد في المستودع.
+- خطوات التنفيذ: بدء `syncPromise = syncEngine.runSyncCycle()`؛ التأكد من وصولها لـ `sendSyncBatch` وتحويل الحدث إلى `IN_PROGRESS` و`isSyncRunning() === true`؛ استدعاء `stopPromise = syncEngine.stop()`؛ فحص `getLifecycleState()` (يجب أن يكون `'STOPPING'` وليس `'STOPPED'`) وفحص أن `stopPromise` لم يكتمل بعد؛ ثم حسم `sendSyncBatch` باعتراف نجاح، فحص `stopPromise` بعد حسمه.
+- النتيجة المتوقعة: لم يكتمل `stopPromise` قبل انتهاء `sendSyncBatch` وكتابة `SYNCED`؛ بعد انتهائه تحوّلت الحالة إلى `'STOPPED'` و`isSyncRunning() === false`؛ وإذا استُدعيت `runSyncCycle()` أثناء `'STOPPING'` تُرفض/تُتخطى بـ `skippedReason: 'STOPPED'` دون التداخل مع الدورة الجارية.
+- ما يثبت: إغلاق ثغرة س2 وس3 بالكامل في `SyncEngine`.
+
+--- اختبار 5 (Unit): انتظار `SyncEngine.stop()` لـ `pullInboundEvents` و`ingestInboundEvent` و`retryPendingInboundAcks` و`handleDeliveryAcks` ---
+- الملف المستهدف: `tests/unit/backupV2.test.ts`
+- الحالة الابتدائية: `SyncEngine` `RUNNING`، مع تعليق `transport.fetchInboundEvents` أو `transport.acknowledgeInboundDelivery` عبر وعد يدوي.
+- خطوات التنفيذ: تشغيل `pullInboundEvents()` (أو إطلاق حدث عبر `subscribeEvents` callback)، ثم استدعاء `syncEngine.stop()` والتحقق من التريث؛ ثم إكمال الاستجابة الشبكية، ثم محاولة حقن حدث وارد جديد عبر `ingestInboundEvent()` بعد التوقف.
+- النتيجة المتوقعة: ينتظر `stop()` اكتمال المعالجة قبل `'STOPPED'`؛ وبعد دخول `'STOPPING'`/`'STOPPED'` ترفض `ingestInboundEvent` و`pullInboundEvents` و`handleDeliveryAcks` أي كتابة في `repo`.
+- ما يثبت: تصريف مسار الاستقبال والـ ACK وعدم استمراره أثناء الاستعادة.
+
+--- اختبار 6 (Unit): انتهاء مهلة التصريف (Drain Timeout — Fail-Closed) ومنع الكتابة المتأخرة ---
+- الملف المستهدف: `tests/unit/backupV2.test.ts`
+- الحالة الابتدائية: `SyncEngine` معلّق في `sendSyncBatch` بوعد لا يُحسم أبداً إلا بعد انتهاء المهلة (مثلاً `drainTimeoutMs = 50ms`)، وبيانات أصلية موجودة في قاعدة البيانات.
+- خطوات التنفيذ: استدعاء `executeRestoreWithPostCommitRecovery` مع `drainTimeoutMs = 50ms`؛ مراقبة انتهاء المهلة؛ ثم بعد فشل الاستعادة حسم الوعد المعلق المتأخر لـ `sendSyncBatch` ومراقبة المستودع و`eventsCache`.
+- النتيجة المتوقعة: رمي `BACKUP_RESTORE_DRAIN_TIMEOUT`، عدم استدعاء `restoreBackup()` مطلقاً، تسجيل الخطأ في `ErrorManager` تحت `'SYNC'`, انتقال `SyncEngine` إلى `'ERROR'`, بقاء قاعدة البيانات دون تغيير، وعدم قيام المهمة المتأخرة بعد استيقاظها بالكتابة في المستودع أو استعادة `'RUNNING'` بسبب عدم تطابق `opEpoch`.
+- ما يثبت: سلوك Fail-Closed الصارم وحماية الجيل (`opEpoch`) ضد الوعود اليتيمة.
+
+--- اختبار 7 (Integration): عزل `schedulerParticipant` (`syncTimer` + `unsubSettingsEndpoint`) أثناء الاستعادة وبعدها ---
+- الملف المستهدف: `tests/integration/backupRestoreIsolation.test.ts`
+- الحالة الابتدائية: حاوية حقيقية بفاصل `syncIntervalMs = 1000ms` (أو مؤقتات `mock.timers` في Node)، مع حدث `PENDING` ومحاكاة نقل.
+- خطوات التنفيذ: تشغيل `lifecycleManager.startup()`، بدء `restoreBackupJson()` مع تعليق `restoreBackup` لمدة تسمح بعدة نبضات للمؤقت وتمرير `settingsService.initialize()` أثناء `reloadSettings()` بأرشيف يغيّر `syncIntervalMs` و`relayEndpoint` و`connectionServiceEnabled: false`.
+- النتيجة المتوقعة: صفر استدعاءات لـ `runSyncCycle`/`pullInboundEvents` من `syncTimer` أثناء الاستعادة؛ عدم إعادة تشغيل `syncTimer` أثناء `reloadSettings()`؛ وبعد إتمام الاستعادة تبقى `connectionServiceEnabled = false` ولا يفتح اتصال للمرحل القديم.
+- ما يثبت: إغلاق ثغرة `schedulerParticipant` و`unsubSettingsEndpoint` في التنسيق الفعلي.
+
+--- اختبار 8 (Unit / Integration): إيقاف وتصريف `DeviceManager` و`RelayTransportClient.reconnectTimer` أثناء الاستعادة ---
+- الملف المستهدف: `tests/unit/backupV2.test.ts` أو `tests/integration/backupRestoreIsolation.test.ts`
+- الحالة الابتدائية: `DeviceManager` متصل عبر `RelayTransportClient` مع `fetchLinkedDevices` بطيء أو `ws.onclose` الذي كان سيشغل `reconnectTimer`، ونسخة تحتوي تغييرات في `linkedDevices` و`relayEndpoint`.
+- خطوات التنفيذ: إطلاق `refreshLinkedDevicesFromRelay()` متبوعاً فوراً بالاستعادة، وبالتوازي إطلاق رسالة `pairing:pending_approval` أو `ws.onclose`.
+- النتيجة المتوقعة: يتم إجهاض/تصريف التحديث الجاري قبل الخطوة 10 من `restoreBackup()`, تتوقف `reconnectTimer` ولا تعيد الاتصال خلال الاستعادة، وتُمسح `pendingApprovals` القديمة بعد الاستعادة، وتحتفظ قاعدة البيانات بنتيجة `applyLinkedDeviceTrustPolicy` الصحيحة دون تلوث من تحديث متأخر.
+- ما يثبت: إغلاق ثغرة `DeviceManager` و`reconnectTimer` وسباق TOCTOU مع الخطوة 10.
+
+--- اختبار 9 (Unit): استدعاء `SyncEngine.start()` مرتين متزامنتين (بدون `await`) ---
+- الملف المستهدف: `tests/unit/backupV2.test.ts`
+- الحالة الابتدائية: `SyncEngine` في حالة `IDLE` مع تتبع عدد مرات استدعاء `transport.subscribe`, `subscribeEvents`, `subscribeDeliveryAcks` و`repo.getAll`.
+- خطوات التنفيذ: `await Promise.all([syncEngine.start(), syncEngine.start()])`.
+- النتيجة المتوقعة: استدعاء `subscribe*` مرة واحدة فقط لكل مستمع (المجموع 3 وليس 6)، والحالة `'RUNNING'`, ثم بعد `stop()` تكون جميع `unsubscribe` قد استُدعيت ولم يبقَ أي مستمع مسرب على `transport`.
+- ما يثبت: حل ثغرة س7 (Single-Flight `startPromise`).
+
+--- اختبار 10 (Unit): استدعاء `SyncEngine.stop()` مرتين وتداخل `start()` مع `stop()` بالاتجاهين ---
+- الملف المستهدف: `tests/unit/backupV2.test.ts`
+- الحالة الابتدائية: `repo.initialize()` و`repo.getAll()` بطيئتان (معلقتان بوعد).
+- خطوات التنفيذ:
+  (أ) `pStart = syncEngine.start(); pStop = syncEngine.stop();` ثم حسم `repo.getAll()` -> فحص الحالة والمستمعات.
+  (ب) `await syncEngine.start();` ثم تشغيل `pStop = syncEngine.stop()` (مع تعليق `drain`) متبوعاً بـ `pStart2 = syncEngine.start()` ثم حسم العمل الجاري.
+  (ج) `await Promise.all([syncEngine.stop(), syncEngine.stop()])`.
+- النتيجة المتوقعة: في (أ) ينتهي الأمر بـ `'STOPPED'` وصفر مستمعات مسجلة؛ في (ب) ينتظر `pStart2` اكتمال `pStop` ثم يبدأ بنظافة إلى `'RUNNING'`؛ في (ج) تتشارك `stop()` الوعد نفسه دون خطأ.
+- ما يثبت: حل ثغرة س8 وس9 ومنع سباق `start`/`stop`.
+
+--- اختبار 11 (Unit): التنظيف العكسي (Rollback) عند الفشل الجزئي في `SyncEngine.start()` ---
+- الملف المستهدف: `tests/unit/backupV2.test.ts`
+- الحالة الابتدائية: `transport.subscribe` (الثالثة) ترمي استثناءً بينما `subscribeEvents` و`subscribeDeliveryAcks` تنجحان.
+- خطوات التنفيذ: استدعاء `await assert.rejects(() => syncEngine.start())`.
+- النتيجة المتوقعة: استدعاء دالتي الإلغاء لأول مستمعين تلقائياً، تصفير `unsubInbound` و`unsubDeliveryAcks`، انتقال `lifecycleState` إلى `'ERROR'`، والقدرة على نجاح `start()` لاحقاً عند زوال العطل دون مستمعات مكررة.
+- ما يثبت: حل ثغرة س10.
+
+--- اختبار 12 (Unit): صمود `SyncEngine.stop()` عند فشل إلغاء أحد المستمعات ---
+- الملف المستهدف: `tests/unit/backupV2.test.ts`
+- الحالة الابتدائية: `SyncEngine` في `'RUNNING'`، ودالة إلغاء `unsubInbound` ترمي خطأً، بينما الآخران طبيعيان، وهناك عملية جارية قابلة للتصريف.
+- خطوات التنفيذ: استدعاء `await assert.rejects(() => syncEngine.stop())`.
+- النتيجة المتوقعة: استدعاء دالتي إلغاء `unsubDeliveryAcks` و`unsubTransportState` رغم رمي الأولى، تصريف العملية الجارية، الانتقال إلى `'ERROR'`، وعدم إبقاء أي مستمعات عالقة.
+- ما يثبت: حل ثغرة س11.
+
+--- اختبار 13 (Unit): مصفوفة حالات `HealthMonitor.getSnapshot()` الكاملة ---
+- الملف المستهدف: `tests/unit/backupV2.test.ts` (أو ملف وحدة مخصص `tests/unit/healthMonitor.test.ts`)
+- الحالة الابتدائية: `SyncEngine` و`Transport` و`ErrorManager` و`RestoreCoordinator` بتركيبات مضبوطة.
+- خطوات التنفيذ والتحقق لكل خلية في المصفوفة:
+  1) `IDLE + pendingCount > 0 + CONNECTED` -> `syncStatus !== 'HEALTHY'` (`'IDLE'`).
+  2) `STARTING / STOPPING / restoreInProgress` -> `syncStatus !== 'HEALTHY'`.
+  3) `STOPPED` + طابور نظيف -> `'IDLE'`; `STOPPED` + (`pending > 0` أو `inProgress > 0` أو `failed > 0`) -> `'DEGRADED'`.
+  4) `ERROR` أو `!databaseHealthy` -> `syncStatus === 'UNAVAILABLE'`.
+  5) `RUNNING + SYNCED (مستعاد) + DISCONNECTED` (مع `pending=0, failed=0`) -> `'IDLE'`.
+  6) `RUNNING + SYNCED + (RECONNECTING | ERROR | CONNECTING)` -> `'DEGRADED'` (وليس `'HEALTHY'`!).
+  7) `RUNNING + CONNECTED + failedCount > 0 + pendingCount > 0` -> `'DEGRADED'`.
+  8) `RUNNING + CONNECTED + خطأ SYNC حديث في ErrorManager` -> `'DEGRADED'`، ثم زوال التدهور بعد دورة مزامنة ناجحة بلا أخطاء.
+  9) `RUNNING + CONNECTED + SYNCED + بلا أخطاء` -> `'HEALTHY'`.
+- ما يثبت: صحة جميع فروع `HealthMonitor` (س14–س18).
+
+--- اختبار 14 (Unit): فشل `reloadSettings()` بعد الالتزام والحفاظ على أصناف أخطاء ما قبل الالتزام ---
+- الملف المستهدف: `tests/unit/backupV2.test.ts`
+- الحالة الابتدائية: (أ) مسار ما بعد الالتزام يلتزم بدور `'admin'` من الأرشيف/القاعدة، لكن `reloadSettings()` يرمي خطأً بينما الذاكرة السابقة كانت تحمل `role: 'basic'` أو `relayEndpoint` خبيث/قديم. (ب) مسار ما قبل الالتزام يرمي `ValidationError` مع فشل `startSyncEngine()`.
+- خطوات التنفيذ: تشغيل `executeRestoreWithPostCommitRecovery` في الحالتين.
+- النتيجة المتوقعة: في (أ) لا تُصدر جلسة بالإعدادات القديمة ولا يُضبط `relayEndpoint` القديم، وتُطبق سياسة Fail-Closed (`clearSession()` والتحذير الصريح في `postRestoreWarnings`) مع التزام البيانات المستعادة؛ في (ب) يحافظ الخطأ المرمي على `instanceof ValidationError` (أو الرتبة الصنفية الأصلية) وعلى `context.syncEngineRestartFailed === true`.
+- ما يثبت: إغلاق ثغرة س21 وس22.
+
+--- اختبار 15 (Unit / DOM أو Integration): تنسيق أخطاء وتنبيهات `ActionModal.tsx` وحالة الانشغال المشتركة ---
+- الملف المستهدف: اختبار وحدة لدالة `formatBackupError` المستخلصة (في `tests/unit/backupV2.test.ts`) + تحقق واجهة في `tests/e2e/backupRestore.spec.ts`.
+- الحالة الابتدائية: أخطاء `BACKUP_RESTORE_SYNC_STOP_AND_RESTART_FAILED` و`BACKUP_RESTORE_AND_SYNC_RESTART_FAILED` و`BACKUP_RESTORE_ALREADY_IN_PROGRESS` ونتيجة `BackupRestoreResult` مع `syncEngineRunning: false` و`postRestoreWarnings`.
+- خطوات التنفيذ: تمرير كل خطأ إلى `formatBackupError` والتحقق من النص الناتج؛ وملاحظة اللافتات المعروضة في DOM.
+- النتيجة المتوقعة: خلو النص تماماً من تكرار عبارة «تعذّر إعادة تشغيل محرك المزامنة» (ظهورها مرة واحدة فقط)؛ وعدم ظهور صندوق خطأ أحمر يناقض نجاح الالتزام عند `postRestoreWarnings` بل لافتة تحذير كهرمانية واضحة؛ وبقاء أزرار الاستعادة معطلة إذا أُغلق المودال وأُعيد فتحه أثناء استعادة قيد التنفيذ.
+- ما يثبت: إغلاق ثغرة س24.
+
+--- اختبار 16 (Integration): اختبار تكامل كامل عبر `createAppContainer()` لتزامن الاستعادة مع `SyncTimer` والمرحل ---
+- الملف المستهدف: `tests/integration/backupRestoreIsolation.test.ts` (مع حقن اختياري في الاختبار أو استخدام `createAppContainer` مع `fetchImpl`/`webSocketFactory` + `indexedDB` أو `InMemory` عند التوثيق الصريح).
+- الحالة الابتدائية: حاوية مهيأة، خدمة الاتصال مفعلة، `syncTimer` شغالة، دورة مزامنة متوقفة في منتصف `sendSyncBatch`، وإطار `device:paired` من WebSocket.
+- خطوات التنفيذ: إطلاق `restoreBackupJson()` بأرشيف v2 يحتوي إعدادات جديدة وأحداثاً مختلفة، ثم السماح للعمليات الشبكية بالعودة أثناء/بعد الاستعادة.
+- النتيجة المتوقعة: تصفير المؤقت وإغلاق WS قبل المعاملة، عدم تسرب أي سجل قديم إلى `SYNC_EVENTS` أو `LINKED_DEVICES` المستعادة، تحديث `settings`/`audit`/`eventsCache`/`seenE2eeNonces` بعد الالتزام، وتطابق `BackupRestoreResult.syncEngineRunning` مع `syncEngine.getLifecycleState() === 'RUNNING'`.
+- ما يثبت: تكامل العزل الحقيقي بين جميع خدمات طبقة التطبيق دون Mocks معزولة للدالة وحدها.
+
+--- اختبار 17 (Browser E2E — Real Chromium + Real Browser IndexedDB): الاستعادة المتزامنة والتوقف المتعمد في المتصفح الحقيقي ---
+- الملف المستهدف: `tests/e2e/backupRestore.spec.ts`
+- البيئة: Chromium الحقيقي + Browser IndexedDB الحقيقي + WebCrypto الحقيقي + خادم تطوير حقيقي / اعتراض مسارات Playwright `page.route`.
+- الحالة الابتدائية: جهاز مهيأ كـ SUPER ADMIN مع إشعار في الطابور، وخدمة الاتصال مفعّلة مع تأخير متعمد لطلبات `/api/relay/sync` عبر `page.route` (1500ms) لمحاكاة دورة مزامنة جارية فعلاً لحظة ضغط المستخدم على الاستعادة.
+- خطوات التنفيذ:
+  1) الضغط على «مزامنة الآن» (تبقى الدورة جارية على الشبكة).
+  2) فتح نافذة «النسخ الاحتياطي» والضغط على «التحقق والاستعادة الآمنة» لنسخة v2 صالحة؛ ومحاولة الضغط مجدداً أو إغلاق المودال وفتحه أو النقر على «مزامنة الآن» في الخلفية أثناء انشغال الاستعادة.
+  3) التحقق من فحص IndexedDB الحقيقي (`readBrowserDbSnapshot`) وإعادة تحميل الصفحة `page.reload()`.
+  4) سيناريو فرعي في E2E: حقن فشل `SyncEngine.start()` (أو خطأ IndexedDB على تهيئة ما بعد الالتزام) ومراقبة الواجهة: التأكد من عرض لافتة التحذير الصحيحة في `ActionModal` دون رسالة متناقضة/مكررة، ومن إظهار `HealthMonitor` أن المزامنة ليست `HEALTHY`، ومن ظهور تنبيه توقف المحرك في `DashboardView`.
+- النتيجة المتوقعة: انتظار انتهاء دورة المزامنة بأمان قبل تعديل IndexedDB، منع أي استعادة مزدوجة أو كتابة متداخلة، عدم تلوث `sync_events` المستعادة بنتائج الدورة القديمة، وبقاء البيانات متطابقة بعد `page.reload()`، وعرض الحالة الصادقة في الواجهة في حالة فشل إعادة التشغيل.
+- ما يثبت: التحقق الفعلي من العزل الكامل ودورة الحياة داخل متصفح حقيقي وIndexedDB حقيقي (ويظل Android خارج نطاق التحقق هنا لعدم توفر بيئة Android).
+
+================================================================================
+القسم 12: المخاطر المتبقية وشروط القبول الهندسي
+================================================================================
+12.1 المخاطر المتبقية والقيود التي يجب الانتباه لها أثناء التنفيذ:
+1) **عدم وجود إلغاء قسري لوعود WebCrypto/IDB المعلقة:** إذا علقت دالة مستوردة من خارج النظام
+   دون دعم `AbortSignal` لمدة تفوق `DRAIN_TIMEOUT_MS`, سيُرفض تنفيذ الاستعادة لحماية
+   البيانات (Fail-Closed)، وتدخل الخدمة حالة `'ERROR'` حتى إعادة التهيئة/إعادة التحميل.
+2) **بيئة الحاوية بدون `.git` وبدون Android SDK:** يتطلب التحقق النهائي تطبيق التغييرات
+   على المستودع الفعلي وتشغيل Playwright وGitHub Actions CI بعد موافقة المستخدم.
+3) **الاعتماد على `ITransportClient` في الاختبارات الوهمية:** إجهاض HTTP via `AbortController`
+   سيعمل داخل `RelayTransportClient` الإنتاجي؛ أما في Mock الاختبارات، فينبغي أن تُختبر
+   حالتا الاستجابة البطيئة القابلة للإنهاء والحالة المعلقة غير القابلة للإنهاء (`drainTimeout`).
+4) **أدوار المستخدمين الصلاحية:** يجب التأكد أن `restoreInProgress` لا يعطّل أزرار القراءة البحتة
+   دون داعٍ، بينما يحجب كل عمليات الكتابة والطفرة بوضوح.
+
+12.2 شروط القبول الهندسي للتنفيذ المستقبلي (Acceptance Criteria):
+- عدم وجود أي مسار يمكنه الكتابة في `SETTINGS`, `LINKED_DEVICES`, `SYNC_EVENTS`, `SECURITY_AUDIT`
+  أثناء المرحلة 4 (`restoreBackup()`).
+- اجتياز جميع الاختبارات الـ 17 الجديدة/المحدّثة إضافة إلى جميع الاختبارات السابقة دون حذف
+  أو تليين أي شرط اختبار.
+- اجتياز `npm run format:check`, `npm run typecheck`, `npm run lint`, `npm run test:unit`,
+  `npm run test:integration`, `npm run test:e2e`, و`npm run build` بالأدلة الفعلية.
+- خلو التقارير والواجهة من الادعاء بأن المحرك `RUNNING` أو `HEALTHY` عندما يكون متوقفاً أو في `ERROR`.
+
+================================================================================
+القسم 13: خطة التنفيذ المرحلي المقترحة (بانتظار المراجعة المستقلة والموافقة)
+================================================================================
++---------+-----------------------------------+----------------------------------------------------------+---------------------------------------------+
+| المرحلة | الهدف                             | الملفات المستهدفة المتوقعة                               | شروط الإتمام والتحقق                        |
++---------+-----------------------------------+----------------------------------------------------------+---------------------------------------------+
+| 2A      | بنية التنسيق والقفل والتصريف      | - ملف جديد: `src/application/lifecycle/restoreCoordinator.ts` | - وحدة `RestoreCoordinator` + `InFlightTracker` |
+|         | (`RestoreCoordinator` & `InFlightTracker`) |   (أو داخل `application/lifecycle/`)             | - اختبارات الوحدة 1، 2، 6                   |
+|         |                                   | - `src/application/lifecycle/lifecycleManager.ts`        |                                             |
++---------+-----------------------------------+----------------------------------------------------------+---------------------------------------------+
+| 2B      | آلة حالة `SyncEngine` وحرس       | - `src/application/sync/syncEngine.ts`                   | - `STARTING`/`STOPPING` + `opEpoch` +       |
+|         | `DeviceManager` و`RelayTransportClient` | - `src/application/devices/deviceManager.ts`       |   `InFlightTracker` + `AbortController`     |
+|         |                                   | - `src/infrastructure/transport/relayTransportClient.ts` | - اختبارات الوحدة 4، 5، 8، 9، 10، 11، 12    |
++---------+-----------------------------------+----------------------------------------------------------+---------------------------------------------+
+| 2C      | ربط التنسيق الكامل وحاجز الكتابة  | - `src/application/container.ts`                         | - إيقاف `schedulerParticipant` + `SyncEngine`|
+|         | وإصلاح `reloadSettings`           | - `src/application/settings/settingsService.ts`          |   + `DeviceManager` بترتيب عكسي             |
+|         |                                   | - `src/application/security/securityManager.ts`          | - إصلاح `reloadSettings()` وحفظ صنف الخطأ   |
+|         |                                   | - `src/domain/errors/appError.ts` (إن لزم)               | - اختبارات 3، 7، 14، 16                     |
++---------+-----------------------------------+----------------------------------------------------------+---------------------------------------------+
+| 2D      | دلالات `HealthMonitor` ومواءمة    | - `src/application/health/healthMonitor.ts`              | - مصفوفة `HealthMonitor` الكاملة           |
+|         | الواجهة (`ActionModal`, `Dashboard`, | - `src/domain/models/health.ts` (حقول اختيارية فقط)  | - إزالة تكرار `formatBackupError` وفصل      |
+|         | `NotificationHistoryView`, `App`) | - `src/presentation/components/ActionModal.tsx`          |   لافتة التحذير عن الخطأ                    |
+|         |                                   | - `src/presentation/components/DashboardView.tsx`        | - اختبارات 13، 15                           |
+|         |                                   | - `src/presentation/components/NotificationHistoryView.tsx`|                                           |
+|         |                                   | - `src/App.tsx`                                          |                                             |
++---------+-----------------------------------+----------------------------------------------------------+---------------------------------------------+
+| 2E      | التحقق الشامل في المتصفح الحقيقي  | - `tests/unit/backupV2.test.ts`                          | - تشغيل `format:check`, `typecheck`, `lint`,|
+|         | واختبارات التكامل والـ Build      | - `tests/integration/backupRestoreIsolation.test.ts`     |   `test:unit`, `test:integration`,          |
+|         | وكتابة ADR التوثيقي               | - `tests/e2e/backupRestore.spec.ts`                      |   `test:e2e`, `build`                       |
+|         |                                   | - `docs/adr/ADR-004-*.md` (توثيق قرار العزل دون مساس بـ 002/003)| - اختبار 17 + تسليم التقرير والأدلة  |
++---------+-----------------------------------+----------------------------------------------------------+---------------------------------------------+
+
+================================================================================
+حالة المهمة الحالية والتوقف الإلزامي (HARD STOP)
+================================================================================
+- تم تسليم وثيقة التصميم الهندسي هذه فقط (`HYDROGEN_PHASE2_DESIGN.txt`).
+- لم يتم تعديل أي ملف شيفرة أو اختبار أو إعدادات في المشروع.
+- بانتظار المراجعة الهندسية المستقلة (ChatGPT) وموافقة المستخدم الصريحة على هذا
+  التصميم أو تعديلاته قبل الانتقال إلى المرحلة 2A.
+================================================================================
