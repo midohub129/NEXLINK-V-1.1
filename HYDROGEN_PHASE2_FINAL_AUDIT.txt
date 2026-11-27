@@ -1,0 +1,379 @@
+================================================================================
+NEXLINK V1.1 — التدقيق الهندسي المستقل النهائي لتصميم المرحلة الثانية
+FINAL INDEPENDENT PHASE 2 DESIGN AUDIT (READ-ONLY)
+================================================================================
+المشروع المستهدف: midohub129/NEXLINK-V-1.1
+الفرع المرجعي المستهدف: main
+المرجع التاريخي المذكور في الطلب (غير مثبت محلياً): 698eb505620c7c6034a9f2545b0cdb3f9d345a0f
+نطاق التدقيق: قراءة وفحص هندسي فقط (Read-Only) — لم يُعدَّل أي ملف برمجي أو تصميمي أو
+اختباري أو إعدادي، ولم يُنفَّذ أي إجراء Git أو GitHub Actions CI.
+التاريخ: 2026-11-27
+
+================================================================================
+القسم 1: التحقق من هوية المستودع والفرع وHEAD وحالة شجرة العمل
+================================================================================
+تم فحص بيئة العمل المحلية في `/app/applet` عبر أوامر Git المباشرة:
+- `git remote -v` -> رمز الخروج 128:
+  `fatal: not a git repository (or any of the parent directories): .git`
+- `git rev-parse --abbrev-ref HEAD` -> رمز الخروج 128:
+  `fatal: not a git repository (or any of the parent directories): .git`
+- `git rev-parse HEAD` -> رمز الخروج 128:
+  `fatal: not a git repository (or any of the parent directories): .git`
+- `git status --short` -> رمز الخروج 128:
+  `fatal: not a git repository (or any of the parent directories): .git`
+
+الخلاصة والتصنيف الصريح:
+- **لا تتوفر بيانات وصفية لـ Git محلياً (عدم وجود مجلد `.git` في `/app/applet` أو أي مجلد أب).**
+- بناءً على ذلك، تُصنَّف نسخة الملفات المفحوصة رسمياً على أنها:
+  **لقطة محلية غير موثَّقة عبر Git (Unverified Local Snapshot)**.
+- لا يمكن محلياً إثبات هوية المستودع البعيد (`midohub129/NEXLINK-V-1.1`)، أو الفرع الحالي (`main`)،
+  أو `HEAD SHA`، أو تطابق هذه اللقطة مع الكوميت `698eb505620c7c6034a9f2545b0cdb3f9d345a0f`
+  أو أي كوميت آخر على GitHub.
+- ما أمكن إثباته تشفيرياً على القرص المحلي هو وجود وثيقتي التصميم في جذر `/app/applet`
+  وتطابق بصمات SHA-256 للملفات البرمجية الستة المرجعية مع ما سُجّل في
+  `HYDROGEN_EXECUTION_REPORT.txt` (التقرير 6).
+
+================================================================================
+القسم 2: الإصدارات وبصمات SHA-256 الدقيقة لوثيقتي التصميم والملفات المرجعية
+================================================================================
+تمت قراءة وثيقتي التصميم كاملتين والتحقق من بصماتهما على القرص عبر `sha256sum`:
+
+1. `HYDROGEN_PHASE2_DESIGN.txt`
+   - الحالة في المستودع المحلي: موجودة في `/app/applet/HYDROGEN_PHASE2_DESIGN.txt`
+   - الوصف الداخلي: "النسخة المحدّثة والمصحّحة النهائية (تشمل إلزامية حاجز قاعدة البيانات)" (تاريخ 2026-11-26)
+   - الحجم: 67,425 بايت | عدد الأسطر: 823 سطراً
+   - بصمة SHA-256:
+     `862a8cc4b1bcdf8bcb39ea82b8d2977e2b9eb535126f33cb82ee641267e7e6de`
+
+2. `HYDROGEN_PHASE2_DESIGN_REVIEW.txt`
+   - الحالة في المستودع المحلي: موجودة في `/app/applet/HYDROGEN_PHASE2_DESIGN_REVIEW.txt`
+   - الوصف الداخلي: "تقرير مراجعة وتصحيح وثيقة تصميم المرحلة الثانية — NEXLINK V1.1" (تاريخ 2026-11-26)
+   - الحجم: 7,834 بايت | عدد الأسطر: 87 سطراً
+   - بصمة SHA-256:
+     `173062924bd5b974aabcbb8a50a6d00a08150b7bdf10117575d703ab203fd4f4`
+
+3. بصمات SHA-256 الفعلية للملفات المرجعية الستة (تطابق سجل التقرير 6 وتثبت عدم وجود أي تعديل برمجي للمرحلة الثانية):
+   - `src/application/container.ts`: `49da9bb1daf7571cb950277404d515e53d546799e2eb6d4df98783d04e179e9d`
+   - `src/domain/models/backup.ts`: `0afa743b8eff8daa7f38503ea0fcb1d3f77b2a90221161c80b829b6266d7e387`
+   - `src/application/sync/syncEngine.ts`: `e02277f5856a0907bd5ace2a8813269971b2ad8f586f44d0299516b4d63419d3`
+   - `src/application/health/healthMonitor.ts`: `086a490fd27a9030c50bafbe136a36320e1a8446eb5d86a46e78f0357aa1102a`
+   - `src/presentation/components/ActionModal.tsx`: `f5427ad9f62f1b97fe1d8b8220c1693094241fd16ef3a85dbc1cdcc8acc56e1b`
+   - `tests/unit/backupV2.test.ts`: `6e7703a1326e5139017f80c12921f381b6673dd1a4cf4bcbb8d31c6edf65eed7`
+
+================================================================================
+القسم 3: جرد الملفات والدوال التي جرى فحصها فعلياً
+================================================================================
+1. وثائق التصميم والتقارير والـ ADR:
+   - `HYDROGEN_PHASE2_DESIGN.txt` (823 سطراً — قراءة كاملة)
+   - `HYDROGEN_PHASE2_DESIGN_REVIEW.txt` (87 سطراً — قراءة كاملة)
+   - `HYDROGEN_EXECUTION_REPORT.txt` (804 أسطر — قراءة التقارير 1–6)
+   - `docs/adr/001-layered-clean-architecture-and-di.md` حتى `005-encrypted-backup-and-restore-v2.md`
+
+2. ملفات البنية التحتية والتخزين والتشفير والنقل:
+   - `src/infrastructure/storage/indexedDbDatabase.ts` (331 سطراً): `MIGRATION_DEFINITIONS`, `IndexedDbDatabase` (`constructor`, `initialize`, `cleanupLegacyLocalStorage`, `getMigrations`, `readAll`, `readOne`, `enqueueWrite`, `put`, `add`, `deleteKey`, `clearStore`, `runTransaction`, `close`)
+   - `src/infrastructure/storage/repositories.ts` (2272 سطراً): `IndexedDbSyncEventRepository` (`insert`, `findById`, `findByIdempotencyKey`, `findRecentDuplicate`, `getAll`, `getByStatus`, `getDuePendingEvents`, `updateEvent`, `resetInProgressToPending`, `delete`, `clearAll`), `IndexedDbDeviceRepository` (`getIdentity`, `saveIdentity`, `getLinkedDevices`, `upsertLinkedDevice`, `removeLinkedDevice`), `IndexedDbAuditRepository` (`append`, `getAll`, `clear`), `IndexedDbSettingsRepository` (`get`, `save`), `IndexedDbBackupProvider` (`inspectBackupJson`, `exportBackup`, `restoreBackup`, `migrateLegacyBackup`)
+   - `src/infrastructure/security/webCryptoProvider.ts` (`openKeyStore`, `readKeyRecord`, `writeKeyRecord`, `getOrCreateAesKey`, `getOrCreateEcdhPair`)
+   - `src/infrastructure/transport/relayTransportClient.ts` (716 سطراً): `setBaseUrl`, `getState`, `requestJson`, `connect`, `openWebSocket`, `scheduleReconnect`, `clearReconnectTimer`, `disconnect`, `revokeServerSession`
+   - `src/infrastructure/datasources/deviceDataSources.ts` (123 سطراً): `BrowserDeviceDataSource`, `TestFixtureDeviceDataSource`
+
+3. ملفات طبقة التطبيق والنطاق:
+   - `src/application/container.ts` (768 سطراً): `executeRestoreWithPostCommitRecovery`, `createAppContainer`, `bootstrapParticipant`, `schedulerParticipant`, وجميع عمليات `AppContainer` (`selectRole`, `changeRole`, `resetInitialSetup`, `toggleConnectionService`, `runSyncNow`, `renewSession`, `expireSession`, `revokeAllAuthorizations`, `setNotificationAccess`, `setUsageAccess`, `toggleSelectedApp`, `setTestFixtureMode`, `exportBackupJson`, `restoreBackupJson`, `migrateLegacyBackupJson`)
+   - `src/application/sync/syncEngine.ts` (1591 سطراً): `start`, `handleTransportConnected`, `stop`, `getLifecycleState`, `enqueueNotification`, `handleDeliveryAcks`, `retryPendingInboundAcks`, `pullInboundEvents`, `ingestInboundEvent`, `confirmInboundDeliveryOrKeepInProgress`, `runSyncCycle`, `scheduleRetryOrFail`, `updateEventStatus`, `manualRetryEvent`, `deleteEvent`, `clearAllEvents`
+   - `src/application/devices/deviceManager.ts` (428 سطراً): `start`, `stop`, `connectRelay`, `disconnectRelay`, `revokeRelaySession`, `createPairingRequest`, `acceptPairingCode`, `refreshPendingPairingApprovals`, `confirmPairingApproval`, `refreshLinkedDevicesFromRelay`, `revokeLinkedDevice`, `removeLinkedDevice`
+   - `src/application/lifecycle/lifecycleManager.ts` (115 سطراً): `getPhase`, `startup`, `shutdown`
+   - `src/application/health/healthMonitor.ts` (93 سطراً): `constructor`, `setDatabaseReady`, `getSnapshot`
+   - `src/application/settings/settingsService.ts` (137 سطراً): `validateAppSettings`, `initialize`, `getSnapshot`, `update`
+   - `src/application/security/securityManager.ts` (236 سطراً): `initialize`, `issueSession`, `expireSession`, `clearSession`, `assertAuthorized`, `recordAudit`, `clearAuditLog`, `verifyCryptoIntegrity`
+   - `src/application/errors/errorManager.ts` (88 سطراً): `capture`, `getLatestError`, `getAllErrors`, `clearLatest`
+   - `src/domain/interfaces/repositories.ts`, `src/domain/interfaces/services.ts`, `src/domain/models/backup.ts`, `src/domain/models/health.ts`, `src/domain/errors/appError.ts`
+
+4. طبقة العرض والإعداد والاختبارات:
+   - `src/App.tsx`, `src/presentation/components/TopBar.tsx`, `src/presentation/components/DashboardView.tsx`, `src/presentation/components/NotificationHistoryView.tsx`, `src/presentation/components/NotificationAppSelectionView.tsx`, `src/presentation/components/ActionModal.tsx`
+   - `eslint.config.js`, `package.json`
+   - `tests/unit/backupV2.test.ts`, `tests/unit/settingsHealthLifecycle.test.ts`, `tests/integration/backupEndToEnd.test.ts`, `tests/e2e/backupRestore.spec.ts`
+   - مسح شامل عبر `grep -rnE` في `src/` و`tests/` لجميع استدعاءات `IndexedDbDatabase` و`indexedDB.open` و`HealthMonitor` و`enqueueWrite` و`runTransaction` و`LifecycleManager` و`restoreBackup`.
+
+================================================================================
+القسم 4: مسار بناء قاعدة البيانات الإنتاجية (Production Database Construction Path)
+================================================================================
+أ) الوضع الفعلي الحالي في الشيفرة (ما قبل تنفيذ المرحلة الثانية):
+1. `src/application/container.ts:325`:
+   `const database = new IndexedDbDatabase();`
+   - لا يوجد أي تمرير لحاجز كتابة (`writeBarrier`) ولا يوجد صنف `RestoreCoordinator` في المشروع أصلاً.
+2. `src/infrastructure/storage/indexedDbDatabase.ts:137-139`:
+   `constructor(dbName = APP_DB_NAME)`
+   - مُنشئ مفتوح بلا أي معامل حاجز ولا فحص وقت التشغيل.
+3. تمرير المرجع في الحاوية (`container.ts:327-373`):
+   - `settingsRepo = new IndexedDbSettingsRepository(database)` (سطر 327)
+   - `deviceRepo = new IndexedDbDeviceRepository(database)` (سطر 328)
+   - `auditRepo = new IndexedDbAuditRepository(database)` (سطر 329)
+   - `syncRepo = new IndexedDbSyncEventRepository(database, crypto)` (سطر 330)
+   - `backupProvider = new IndexedDbBackupProvider({ db: database, ... })` (سطر 366)
+4. نقاط الإنشاء الأخرى المثبتة في المستودع (في الاختبارات فقط):
+   - `tests/unit/backupV2.test.ts:66` (`createRealWebCryptoStack`) و`:655` (اختبار ترقية v3->v4)
+   - `tests/integration/backupEndToEnd.test.ts:31` (`createDeviceEnvironment`)
+   - استدعاء `window.indexedDB.open` المباشر في متصفح E2E (`tests/e2e/backupRestore.spec.ts:34, 548`).
+
+ب) مسار البناء المقترح في وثيقة التصميم (`HYDROGEN_PHASE2_DESIGN.txt`، القسم 4):
+- تنشئ `createAppContainer()` مثيلاً واحداً من `RestoreCoordinator` وتمرره إلى
+  `new IndexedDbDatabase({ dbName: APP_DB_NAME, writeBarrier: restoreCoordinator })` (السطران 486–490)،
+  وإلى `executeRestoreWithPostCommitRecovery` وحراس الخدمات و`HealthMonitor`.
+- **الحالة الفعلية:** هذا المسار **مصمَّم في الوثيقة فقط ولم يُنفَّذ بعد في الشيفرة**. وعند تدقيق نص التصميم نفسه
+  ظهرت ثغرات تصميمية في آلية إلزامية الحاجز ومسار التمرير عبر `IBackupProvider` تُفصَّل في القسم 5.
+
+================================================================================
+القسم 5: نتائج تدقيق حاجز الكتابة (Write-Barrier Findings)
+================================================================================
+5.1 إلزامية الحاجز (Mandatory Barrier):
+- **في الشيفرة الحالية [CRITICAL]:**
+  * لا يوجد `IDatabaseWriteBarrier` ولا `RestoreCoordinator` في `src/`.
+  * `IndexedDbDatabase` (`src/infrastructure/storage/indexedDbDatabase.ts:137`) يقبل `dbName` فقط بلا حاجز.
+  * `enqueueWrite` (`indexedDbDatabase.ts:249`) ما زالت `public` ويمكن استدعاؤها مباشرة لتجاوز الدوال العليا.
+  * لم يُطبَّق أي فحص في `put` (258)، `add` (267)، `deleteKey` (276)، `clearStore` (284)، أو `runTransaction` (292).
+- **في التصميم المقترح [CRITICAL — خلل في التصميم نفسه]:**
+  * في `HYDROGEN_PHASE2_DESIGN.txt:388-414`، يتحقق المُنشئ عبر الدالة:
+    ```ts
+    function isValidWriteBarrier(candidate: unknown): candidate is IDatabaseWriteBarrier {
+      if (!candidate || typeof candidate !== 'object') return false;
+      const barrier = candidate as Partial<IDatabaseWriteBarrier>;
+      return (
+        typeof barrier.isWriteBlocked === 'function' &&
+        typeof barrier.assertWriteAllowed === 'function'
+      );
+    }
+    ```
+  * هذا الفحص **فحص شكلي بحت (Structural Duck-Typing)**! أي وحدة برمجية داخل `src/` تستطيع تمرير كائن وهمي مثل `{ isWriteBlocked: () => false, assertWriteAllowed: () => {} }` مباشرة إلى `new IndexedDbDatabase({ writeBarrier: fake })` فينجح المُنشئ بلا خطأ ويُعطل الحاجز تماماً دون استدعاء `createUnprotectedIndexedDbForTestsOnly` ودون مخالفة قاعدة `no-restricted-imports` في ESLint!
+  * لكي يكون الإلزام حقيقياً غير قابل للتجاوز، يجب إما اشتراط علامة سرية غير مصدرة (module-private Symbol/WeakSet أو `instanceof RestoreCoordinator` / `AuthorizedWriteBarrier` مع إنشاء الحاجز الاختباري حصراً عبر مصنع خارج `src/` أو بمصادقة داخلية محظورة بـ ESLint في `src/`).
+
+5.2 أحادية ملكية المنسّق (`createAppContainer()` Single Coordinator Ownership):
+- **في الشيفرة الحالية [CRITICAL]:** لا يوجد `RestoreCoordinator` أصلاً.
+- **في التصميم المقترح [HIGH — ثغرة تجاوز عبر `AppContainer.backupProvider`]:**
+  * رغم أن `HYDROGEN_PHASE2_DESIGN.txt:486-499` ينشئ `restoreCoordinator` واحداً في `createAppContainer()`، فإن الواجهة العامة `AppContainer` (`src/application/container.ts:47, 489`) ما زالت تصدّر `readonly backupProvider: IBackupProvider` علناً.
+  * دالة `IndexedDbBackupProvider.restoreBackup()` (`src/infrastructure/storage/repositories.ts:1515`) هي دالة `public`، بينما فحص `RestoreCoordinator.assertWriteAllowed()` (`HYDROGEN_PHASE2_DESIGN.txt:342-344`) يعيد التنفيذ فوراً إذا كان `!this.isWriteBlocked()`.
+  * النتيجة: أي استدعاء مباشر لـ `container.backupProvider.restoreBackup(...)` يلتف على `container.restoreBackupJson()` يتجاوز القفل وإيقاف الخدمات والحاجز المركزي لأن `dbBarrierActive` لم يُفعَّل أصلاً!
+  * كما أن وثيقة التصميم **لم تحدد** كيف يحصل `IndexedDbBackupProvider.restoreBackup()` على `RestoreWriteCapability` (واجهة `IBackupProvider.restoreBackup(rawInput, passphrase)` في `src/domain/interfaces/repositories.ts:98-101` لا تقبل capability ولا `options`، و`runTransaction` في التصميم يذكر `options` دون تحديد نوعه أو توقيعه أو إثبات منع استدعاء `restoreBackup()` بلا تصريح).
+
+5.3 عزل مسار الاختبار غير المحمي (Test-Only Bypass):
+- **في التصميم المقترح [HIGH — تضمين دالة التجاوز داخل `src/` وضعف التحقق البيئي]:**
+  * تضع وثيقة التصميم (`HYDROGEN_PHASE2_DESIGN.txt:438-473`) الدالة `createUnprotectedIndexedDbForTestsOnly` داخل الملف الإنتاجي `src/infrastructure/storage/indexedDbDatabase.ts`، ما يعني تضمين دالة تجاوز الحاجز داخل مصدر الإنتاج `src/` و`dist/` ما لم تُحذف تماماً من `src/` وتُنقل إلى `tests/helpers/`.
+  * يعتمد الفحص `if (isProdViteBuild || !isNodeTestEnv)` (`الأسطر 449-463`) على `import.meta.env?.PROD` و`process.env.NODE_ENV === 'test' || process.execArgv.some('--test')`:
+    - في بيئات لا تُعرّف `import.meta.env` (مثل `tsx server.ts` أو سكربتات Node) أو في `vite dev` (`PROD === false`)، إذا وُجد `NODE_ENV=test` لن يفشل الفحص رغم أن الكود ليس ضمن مشغل اختبار فعلي.
+    - قاعدة ESLint المقترحة (`eslint.config.js` الحالية لا تحتوي أي `no-restricted-imports` أصلاً، السطور 1–31) لم تُحدّد لمنع استيراد `createUnprotectedIndexedDbForTestsOnly` في `server/` و`server.ts` أيضاً، ولا تمنع الاستدعاء غير المباشر عبر كائن حاجز وهمي (انظر 5.1).
+    - والأهم: اختبارات `backupV2.test.ts:66, 655` و`backupEndToEnd.test.ts:31` لا تحتاج أصلاً لقاعدة بيانات بلا حاجز؛ يمكنها تمرير `new RestoreCoordinator()` الحقيقي مباشرةً.
+
+5.4 تغطية جميع مسارات الكتابة في IndexedDB وحرية القراءة:
+جرد كل مسار وصول إلى IndexedDB في الشيفرة الفعلية:
+1. `IndexedDbDatabase` (`src/infrastructure/storage/indexedDbDatabase.ts`):
+   - الكتابات عبر `enqueueWrite`:
+     * `put` (258–265)
+     * `add` (267–274)
+     * `deleteKey` (276–282)
+     * `clearStore` (284–290)
+     * `runTransaction(stores, 'readwrite', work)` (292–313)
+     -> في التصميم المقترح، تغدو `enqueueWrite` خاصة (`private`) وتمر الدوال الخمس عبرها مع فحصين متتاليين `this.writeBarrier.assertWriteAllowed(...)` (قبل دخول `writeQueue` وقبل فتح `db.transaction()` مباشرة).
+   - **مسارات خارج `enqueueWrite` في `IndexedDbDatabase` (غير مشمولة في تحليل التصميم):**
+     * `initialize()` (`lines 157-174`): داخل `onupgradeneeded` تُنفَّذ `MIGRATION_DEFINITIONS` ومنها `v4_audit_origin_provenance` (`lines 85-107`) التي تنفذ `auditStore.put(...)` و`migStore.put(...)` (`line 167`). إذا بقيت أي نسخة `IndexedDbDatabase` غير مهيأة قبل بدء الاستعادة وفُتحت أثناء الاستعادة، فإن ترقية المخطط ستكتب خارج `enqueueWrite`. (تُغلق هذه النافذة لأن `bootstrapParticipant.start()` يفتح DB قبل التشغيل، لكن يجب توثيق هذا الشرط صراحةً).
+     * `cleanupLegacyLocalStorage()` (`lines 199-220`): تحذف مفاتيح `localStorage` القديمة عند فتح القاعدة لأول مرة.
+   - القراءات:
+     * `getMigrations()` (222–230)، `readAll()` (232–238)، `readOne()` (240–247)، `runTransaction(stores, 'readonly', work)` (314–318) -> لا تمر عبر `enqueueWrite` فتبقى متاحة أثناء الاستعادة.
+2. المستودعات (`src/infrastructure/storage/repositories.ts`):
+   - `IndexedDbSyncEventRepository`: `insert` -> `db.add` (934)، `updateEvent` -> `db.runTransaction('readwrite')` (1042)، `resetInProgressToPending` -> `db.runTransaction('readwrite')` (1065)، `delete` -> `db.deleteKey` (1098)، `clearAll` -> `db.clearStore` (1104). القراءة `findByIdempotencyKey` (963) تستخدم `'readonly'`.
+   - `IndexedDbDeviceRepository`: `saveIdentity` -> `db.put` (1141)، `upsertLinkedDevice` -> `db.put` (1154)، `removeLinkedDevice` -> `db.deleteKey` (1159).
+   - `IndexedDbAuditRepository`: `append` -> `db.add` (1199)، `clear` -> `db.clearStore` (1216).
+   - `IndexedDbSettingsRepository`: `save` -> `db.put` (1253).
+   - `IndexedDbBackupProvider`: `restoreBackup` -> `db.runTransaction([SETTINGS, LINKED_DEVICES, SYNC_EVENTS, SECURITY_AUDIT], 'readwrite')` (1730–1795).
+3. **وصول مباشر لـ `indexedDB.open` خارج `IndexedDbDatabase` (`WebCryptoProvider` — غير مذكور في وثيقة التصميم!) [MEDIUM]:**
+   - الملف: `src/infrastructure/security/webCryptoProvider.ts:140-190`.
+   - الدالة `openKeyStore()` (140) تفتح قاعدة بيانات منفصلة هي `nexlink_keystore` (الإصدار 2)، والدالة `writeKeyRecord()` (177–190) تكتب فيها مفاتيح `AES-GCM` و`ECDSA` و`ECDH`.
+   - رغم أن `nexlink_keystore` مستقلة عن `nexlink_app_db` ولا تُمس أثناء الاستعادة (وفق ADR-005)، فإن التصميم لم يوثّق هذا المسار المباشر لـ IndexedDB ولم يثبت غياب تداخله إذا استُدعي `getOrCreateAesKey()` / `getOrCreateDeviceKeyPair()` بالتوازي مع الاستعادة.
+
+================================================================================
+القسم 6: نتائج تدقيق عزل الاستعادة ودورة حياتها (Restore Isolation — 7 Stages)
+================================================================================
+التسلسل المطلوب:
+`Acquire Lock -> Quiesce Services -> Drain In-flight Operations -> Restore Transaction -> Refresh Services -> Resume Services -> Release Lock`
+
+أ) حالة الشيفرة الفعلية الحالية (`src/application/container.ts:118-319, 395-457, 709-739`):
+- لا يوجد Mutex للاستعادة (`restoreBackupJson` يعتمد فقط على حالة React المحلية `backupBusy` في `ActionModal.tsx:237` التي تزول أو لا تمنع الأزرار الأخرى).
+- `executeRestoreWithPostCommitRecovery` توقف `syncEngine.stop()` فقط (سطر 122)؛ ولا توقف `schedulerParticipant` (`syncTimer` في `container.ts:429-438` و`unsubSettingsEndpoint` في 442–445)، ولا توقف `deviceManager` (سطر 118 في `deviceManager.ts`), ولا توقف `transportClient` (`reconnectTimer` في `relayTransportClient.ts:444-450`).
+- `SyncEngine.stop()` (`syncEngine.ts:175-200`) لا تنتظر `runSyncCycle` أو `pullInFlight` أو `ingestInboundEvent` أو `retryPendingInboundAcks` أو `handleDeliveryAcks`، بل تصفّر `isProcessing` و`pullInFlight` فوراً.
+- دوال `SyncEngine` (`runSyncCycle`, `pullInboundEvents`, `ingestInboundEvent`, `retryPendingInboundAcks`, `handleDeliveryAcks`, `enqueueNotification`, `updateEventStatus`, `manualRetryEvent`, `deleteEvent`, `clearAllEvents`) ودوال `DeviceManager` و`SettingsService.update()` و`SecurityManager.recordAudit()`/`clearAuditLog()` ليس فيها أي حارس استعادة أو `lifecycleState` أو `opEpoch`.
+
+ب) تقييم التصميم المقترح في `HYDROGEN_PHASE2_DESIGN.txt` عبر المراحل السبع:
+1. **Mutex ومنع التزامن:** محدد بوضوح (`tryAcquire()` -> `BACKUP_RESTORE_ALREADY_IN_PROGRESS`).
+2. **إيقاف `schedulerParticipant` ومنع الكتابات المجدولة:** محدد بوضوح؛ لكنه يعتمد على إضافة دوال `stopScheduler`/`startScheduler`/`stopDeviceManager` في `RestoreRecoveryDeps` وهو غير مفصل في الكود داخل القسم 9.
+3. **تصريف `SyncEngine` (`InFlightTracker`):** تصميم `InFlightTracker` (`lines 538-616`) يحل بالفعل مشكلة `UnhandledPromiseRejection` بفصل `trackerPromise` عن `opPromise` وتنظيف `this.active` في `finally`. **لكن** `SyncEngine.runSyncCycle()` (`syncEngine.ts:1464-1468`) لم يُذكر صراحةً وجوب حماية كتلة `finally` فيه بفحص `opEpoch === entryEpoch` قبل تحديث `eventsCache` و`isProcessing`.
+4. **تهدئة `DeviceManager` ومستمعات الاقتران:** لا يحدد التصميم آلية إجهاض أو حارس `opEpoch` داخل حلقات `refreshLinkedDevicesFromRelay()` (`deviceManager.ts:333-344`) ولا تفاصيل `InFlightTracker` داخل `DeviceManager`.
+5. **مؤقتات `RelayTransportClient`:** `relayTransportClient.ts:337` يحتوي على `connectTimer` غير مخزّن على الكائن، ولا تتحقق `ws.onopen`/`ws.onerror`/`ws.onclose` من `connectionEpoch`؛ تصميم القسم 5.4 يشير فقط لـ `connectionEpoch` و`activeControllers` دون تفاصيل إغلاق `connectTimer` وحراسة أحداث `WebSocket` المتأخرة.
+6. **تعارض المرحلة 5 و6 مع `operationGate` [HIGH — خلل تصميمي]:**
+   - يُبقي التصميم `gateState = 'RESTORING'` (`isRestoreInProgress() === true`) حتى المرحلة 7 (`release(lockToken)` في السطور 205–206، 371–377)، بينما يفتح الحاجز على مستوى DB في المرحلة 6 (`endDbBarrierForResumption`).
+   - في الوقت نفسه، يفترض التصميم في القسم 4.4 (495) والقسم 5.5 (530) أن `SyncEngine` و`DeviceManager` و`SettingsService` و`SecurityManager` تتحقق من بوابة الاستعادة (`operationGate` / `isRestoreInProgress()`).
+   - إذا كانت تلك الخدمات تمنع التشغيل أو التعديل عند `gateState === 'RESTORING'`، فإن استدعاء `deviceManager.start()` و`syncEngine.start()` و`securityManager.recordAudit('BACKUP_RESTORED')` و`settingsService.initialize()` داخل المرحلتين 5 و6 **سيرفض نفسه بنفسه** ما لم تُعرَّف بوابة منفصلة للعمليات الداخلية المخولة بحيازة القفل أو مرحلة صريحة (`gateState: 'OPEN' | 'QUIESCING_OR_RESTORING' | 'RESUMING'`).
+7. **استئناف `schedulerParticipant` بعد استعادة `connectionServiceEnabled: true` [HIGH — ثغرة غير معالجة]:**
+   - دالة `restoreBackup()` (`repositories.ts:1759-1762`) تستعيد `connectionServiceEnabled` و`relayEndpoint` و`targetDeviceId` من النسخة الاحتياطية (لا تحفظ إلا `role`).
+   - عند تشغيل `schedulerParticipant.start()` (`container.ts:409-421`) بعد استعادة نسخة كانت فيها `connectionServiceEnabled === true`، يبدأ تلقائياً `deviceManager.connectRelay(current.role)` و`pullInboundEvents()` و`runSyncCycle()`. لم يحدد التصميم كيف تتوافق هذه الخطوة مع بوابة الاستعادة إذا نُفذت قبل المرحلة 7، ولا ما إذا كانت `connectionServiceEnabled` تُعاد كما هي أم تحتاج معالجة صريحة مع `schedulerParticipant`.
+8. **بقاء ذاكرة `SettingsService` / `SecurityManager` / `DeviceManager` قديمة عند فشل تحديث ما بعد الالتزام [HIGH]:**
+   - رغم تنبيه القسم 9 (`lines 54-55`) إلى عدم استخدام إعدادات ما قبل الاستعادة عند فشل `reloadSettings()`، فإن `SettingsService.cached` (`settingsService.ts:91, 99-112`) يحتفظ عملياً بالإعدادات القديمة في الذاكرة إذا رمى `initialize()` خطأً؛ فيعود `settingsService.getSnapshot()` للواجهة و`SyncEngine` و`TopBar` ببيانات قديمة مناقضة لما في IndexedDB! التصميم لم يحدد دالة لإبطال/تصفير `cached` (وذاكرة `auditCache` و`linkedDevices`) عند فشل التحديث بعد الالتزام.
+9. **مسار الفشل قبل الالتزام مع `DeviceManager` و`schedulerParticipant`:**
+   - في `container.ts:175-221` الحالي، إذا فشلت `restoreBackup()` قبل الالتزام يعاد تشغيل `syncEngine` فقط. في التصميم الجديد، تم إيقاف `schedulerParticipant` و`deviceManager` و`syncEngine` في المرحلة 2؛ يجب تحديد استئناف الخدمات الثلاث بترتيب التشغيل عند فشل ما قبل الالتزام النظيف (وليس `syncEngine` فقط)، ومنعه تماماً عند فشل `Drain`.
+
+================================================================================
+القسم 7: نتائج تدقيق دورة الحياة و`HealthMonitor`
+================================================================================
+1. **سباقات `start()` و`stop()` و`Single-Flight` في `SyncEngine`:**
+   - **الشيفرة الحالية:** لا توجد `startPromise` أو `stopPromise` أو `desiredState` أو `opEpoch` في `SyncEngine` (`syncEngine.ts:111-200`).
+   - **التصميم المقترح:** يفرض قواعد سليمة مبدئياً (إزالة `.catch(() => {})` عن `stopPromise`، رفع `opEpoch` تزامنياً في `stop()`، حظر `start()` عند `hasUnsettledDrainFailure || activeCount > 0`، وفصل `trackerPromise`).
+   - **فجوة التصميم:** لم يُقدَّم نص الكود الدقيق لـ `SyncEngine.start()`/`stop()`، خصوصاً: (أ) انتظار `stop()` لـ `startPromise` الجارية عند `stop()` متزامن مع `start()` دون ابتلاع خطأ البدء أو معالجته معمارياً، (ب) فحص `isStaleStart` قبل `resetInProgressToPending()` في `start()` كي لا يبدأ `resetInProgressToPending()` بعد وصول `stop()`.
+2. **`LifecycleManager` (`src/application/lifecycle/lifecycleManager.ts`) [HIGH]:**
+   - الشيفرة الفعلية في `lifecycleManager.ts:73` تحتوي `await this.startPromise.catch(() => undefined);`، وفي الأسطر `85-93` تلتقط أخطاء `participant.stop()` لكل مشارك ثم تضبط `this.phase = 'STOPPED'` قسراً حتى لو فشل التصريف!
+   - التصميم (`القسم 7.5، الأسطر 16-18`) يذكر تحسين `LifecycleManager` في سطرين فقط دون تحديد عقد صريح، ودون إضافة أي اختبار لـ `LifecycleManager` في القسم 11!
+3. **الفشل الجزئي في تسجيل المستمعات وتنظيف `unsubscribe` الرامي للأخطاء:**
+   - الشيفرة الحالية (`syncEngine.ts:177-188`، `deviceManager.ts:120-127`): إذا رمى المستمع الأول خطأً في `stop()`، لا تُلغى بقية الاشتراكات؛ وإذا رمى خطأً أثناء `start()` لا تُزال المستمعات المسجلة قبله.
+   - التصميم (`القسم 7.3`): يحدد `detachListenersSafely()` و`Epoch-Bound Listeners`، وهو تصميم جيد إذا التزم التنفيذ بجمع الأخطاء وإلغاء جميع المستمعات في `try/finally`.
+4. **`HealthMonitor` وغياب آلية إغلاق أخطاء `SYNC` في `ErrorManager` [HIGH — خلل تصميمي]:**
+   - **الشيفرة الحالية (`healthMonitor.ts:44-56`):**
+     * تعيد `'HEALTHY'` عندما `syncedCount > 0 && syncLifecycle === 'RUNNING'` (سطر 54) حتى عند `transportStatus === 'DISCONNECTED' | 'ERROR' | 'RECONNECTING'`!
+     * تعيد `'HEALTHY'` عندما `pendingCount > 0 && transportStatus === 'CONNECTED'` (سطر 52) حتى لو كان `syncLifecycle === 'IDLE'`!
+     * لا تفحص `isRestoreInProgress()` ولا `dbWriteBarrier.isWriteBlocked()` ولا `DeviceManager`.
+   - **التصميم المقترح (`القسم 8.1–8.2`):**
+     * يفرض 6 شروط لـ `'HEALTHY'` ويمنع `'HEALTHY'` بناءً على `SYNCED` قديمة فقط.
+     * **الخلل التصميمي غير المحلول:** الشرط الرابع يشترط «عدم وجود أخطاء مزامنة نشطة (`ErrorManager` مصدر `'SYNC'`)». لكن `ErrorManager` (`src/application/errors/errorManager.ts:18-79`) يحتفظ بقائمة تاريخية من آخر 50 خطأ (`this.errors`) ولا يملك أي دالة مسح حسب المصدر (`clearBySource('SYNC')`) ولا حالة `resolved`/`active` ولا مقارنة زمنية (`latestSyncError.timestamp > lastSuccessfulSyncAt`). وبناءً عليه، فإن أي خطأ `'SYNC'` واحد يقع في عمر الجلسة سيبقي `syncStatus === 'DEGRADED'` إلى الأبد حتى بعد نجاح دورات مزامنة لاحقة!
+     * **إغفال في خطة الاختبار/التحديث:** يتطلب التصميم حقن `DeviceManager` و`RestoreCoordinator` في `HealthMonitor`, ما يؤثر في `tests/unit/settingsHealthLifecycle.test.ts:161` أيضاً (وليس `tests/unit/backupV2.test.ts:1326` فقط).
+
+================================================================================
+القسم 8: مصفوفة تغطية الاختبارات (Test Coverage Matrix)
+================================================================================
+ملاحظة التصنيف الصادق:
+- لم يُنفَّذ أي كود من المرحلة الثانية حتى الآن؛ ولذلك فإن جميع اختبارات المرحلة الثانية الجديدة
+  حالتها الحالية هي: **`SPECIFIED` فقط** (موصوفة في `HYDROGEN_PHASE2_DESIGN.txt` القسم 11)، وليست
+  `IMPLEMENTED` ولا `EXECUTED`.
+- ترد في الجدول أدناه العناصر الـ 17 المطلوبة في التدقيق (مربوطة باختبارات التصميم 1..17):
+
++----+------------------------------------------+--------------------------+-------------+------------------------------------------------------------+
+| #  | خاصية الأمان المطلوب إثباتها (الطلب)     | الاختبار المقابل في التصميم | الحالة الحالية | ما يثبته فعلياً والثغرات/الفجوات في استراتيجية الاختبار    |
++----+------------------------------------------+--------------------------+-------------+------------------------------------------------------------+
+| 1  | فشل إنشاء قاعدة بيانات إنتاجية بدون حاجز| اختبار 1A (Unit)         | SPECIFIED   | يثبت فشل `undefined`/`{}`/`{ dbName }` والوضع الإنتاجي؛    |
+|    |                                          |                          |             | **ثغرة:** لا يختبر تمرير كائن مقلّد `{isWriteBlocked,      |
+|    |                                          |                          |             | assertWriteAllowed}` بسبب ضعف فحص البنية في التصميم.       |
++----+------------------------------------------+--------------------------+-------------+------------------------------------------------------------+
+| 2  | حماية جميع مسارات الكتابة الإنتاجية      | اختبار 1B (Unit/Integ)   | SPECIFIED   | يثبت مرور `put/add/deleteKey/clearStore/runTransaction`    |
+|    | بالحاجز                                  |                          |             | وكتابات `writeQueue` عبر `assertWriteAllowed` ورفض         |
+|    |                                          |                          |             | `IDENTITY`/`MIGRATIONS`. لا يغطي `WebCryptoProvider` keystore.|
++----+------------------------------------------+--------------------------+-------------+------------------------------------------------------------+
+| 3  | بقاء عمليات القراءة متاحة أثناء الاستعادة| اختبار 1B (الجزء الأخير)| SPECIFIED   | يثبت نجاح `readAll/readOne/getMigrations/readonly` أثناء   |
+|    |                                          |                          |             | تفعيل الحاجز دون استدعاء `assertWriteAllowed`.             |
++----+------------------------------------------+--------------------------+-------------+------------------------------------------------------------+
+| 4  | تداخل مزامنة جارية مع `stop()` والاستعادة | اختبار 4 و5 و6 (Unit)    | SPECIFIED   | يثبت انتظار `runSyncCycle` و`pull/ingest/ack` وتصريفها أو  |
+|    |                                          |                          |             | الفشل Fail-Closed عند انتهاء المهلة ومنع `restoreBackup`.  |
++----+------------------------------------------+--------------------------+-------------+------------------------------------------------------------+
+| 5  | نشاط `schedulerParticipant` أثناء الاستعادة| اختبار 7 و16 (Integ)   | SPECIFIED   | يثبت إيقاف `syncTimer` وفصل `unsubSettingsEndpoint` أثناء  |
+|    |                                          |                          |             | الاستعادة وعدم إعادة تشغيل المؤقت أثناء `reloadSettings()`. |
++----+------------------------------------------+--------------------------+-------------+------------------------------------------------------------+
+| 6  | طلبات استعادة متزامنة                    | اختبار 1 و2 (Unit)       | SPECIFIED   | يثبت رفض الاستعادة الثانية فوراً بـ                        |
+|    |                                          |                          |             | `BACKUP_RESTORE_ALREADY_IN_PROGRESS` ومنع Deadlock.        |
++----+------------------------------------------+--------------------------+-------------+------------------------------------------------------------+
+| 7  | نشاط `DeviceManager` أثناء الاستعادة     | اختبار 8 و16 (Unit/Integ)| SPECIFIED   | يثبت إيقاف `DeviceManager` وتصريفه؛ **ثغرة:** يجب النص    |
+|    |                                          |                          |             | صراحةً على محاكاة وصول إشعار `pairing:*` عبر WS أثناء الاستعادة.|
++----+------------------------------------------+--------------------------+-------------+------------------------------------------------------------+
+| 8  | مؤقتات إعادة اتصال `RelayTransportClient`| اختبار 8 (Unit/Integ)    | SPECIFIED   | يثبت إلغاء `reconnectTimer` وإجهاض HTTP و`connectionEpoch`. |
+|    |                                          |                          |             | **ثغرة:** لم ينص على حراسة `connectTimer` أو `ws.onclose` المتأخرة.|
++----+------------------------------------------+--------------------------+-------------+------------------------------------------------------------+
+| 9  | عمليات تعديل يدوية/واجهة أثناء الاستعادة | اختبار 3 و15             | SPECIFIED   | يثبت منع طفرات الخدمات وتعطيل أزرار الواجهة؛ **ثغرة:** لم  |
+|    |                                          |                          |             | تُحصر جميع طفرات `AppContainer` (`toggleSelectedApp`, إلخ).|
++----+------------------------------------------+--------------------------+-------------+------------------------------------------------------------+
+| 10 | رفض/إجهاض Fail-Closed عند انتهاء مهلة Drain| اختبار 6 و10B (Unit)   | SPECIFIED   | يثبت عدم بدء الاستعادة، عدم إعادة تشغيل `SyncEngine`، بقاء |
+|    |                                          |                          |             | `'ERROR'`، ومنع الكتابة المتأخرة عبر `opEpoch` + الحاجز.   |
++----+------------------------------------------+--------------------------+-------------+------------------------------------------------------------+
+| 11 | فشل التحديث بعد الالتزام وبقاء إعدادات   | اختبار 14 (Unit — جزئياً | PARTIAL /   | **ملاحظة:** `backupV2.test.ts:976-1336` يختبر فقط موك      |
+|    | قديمة في الذاكرة                         | مبدئياً ثم SPECIFIED)    | SPECIFIED   | قديم بلا `RestoreCoordinator` ولا يختبر رفض `getSnapshot()` |
+|    |                                          |                          |             | القديم بعد فشل `reloadSettings()` أو إعادة تشغيل `scheduler`.|
++----+------------------------------------------+--------------------------+-------------+------------------------------------------------------------+
+| 12 | استدعاءات `start()` و`stop()` المتزامنة  | اختبار 9 و10 و10B (Unit) | SPECIFIED   | يثبت single-flight ومنع ابتلاع `stopPromise`؛ **ثغرة:**   |
+|    |                                          |                          |             | لا يوجد أي اختبار محدد لسباقات `LifecycleManager.shutdown()`.|
++----+------------------------------------------+--------------------------+-------------+------------------------------------------------------------+
+| 13 | فشل جزئي في `start()` وفشل `unsubscribe` | اختبار 11 و12 (Unit)     | SPECIFIED   | يثبت التنظيف العكسي في `start()` واستمرار `stop()` عند رمي |
+|    |                                          |                          |             | أحد دوال الإلغاء خطأً.                                    |
++----+------------------------------------------+--------------------------+-------------+------------------------------------------------------------+
+| 14 | صفر `UnhandledPromiseRejection` في `InFlightTracker`| اختبار 6B (Unit)| SPECIFIED   | يثبت عزل `trackerPromise` وعودة خطأ `opPromise` وتنظيف     |
+|    |                                          |                          |             | `active` مع مراقبة `process.on('unhandledRejection')`.     |
++----+------------------------------------------+--------------------------+-------------+------------------------------------------------------------+
+| 15 | منع `HealthMonitor` من `'HEALTHY'` الكاذب| اختبار 13 (Unit)         | SPECIFIED   | يثبت الشروط الـ 6؛ **ثغرة:** الاختبار الحالي `backupV2:1326` |
+|    |                                          |                          |             | يفترض السلوك القديم، ولم يُختبر مسح خطأ `'SYNC'` بعد التعافي،|
+|    |                                          |                          |             | كما لم يُذكر `settingsHealthLifecycle.test.ts:161`.        |
++----+------------------------------------------+--------------------------+-------------+------------------------------------------------------------+
+| 16 | انعكاس الحالة بالواجهة ومنع التكرار     | اختبار 15 (Unit/DOM)     | SPECIFIED   | يثبت تنسيق `formatBackupError`، فصل التحذير الكهرماني،    |
+|    |                                          |                          |             | واستمرار القفل بعد إغلاق المودال.                          |
++----+------------------------------------------+--------------------------+-------------+------------------------------------------------------------+
+| 17 | اختبار متصفح حقيقي E2E بـ IndexedDB حقيقي| اختبار 17 (Playwright)   | SPECIFIED   | موجود 4 اختبارات E2E قديمة في `backupRestore.spec.ts` بدون |
+|    |                                          |                          |             | عزل `/api/relay/sync` وتزامن المزامنة؛ سيناريو 17 الجديد   |
+|    |                                          |                          |             | موصوف فقط ولم يُكتب أو يُشغّل بعد.                        |
++----+------------------------------------------+--------------------------+-------------+------------------------------------------------------------+
+ملاحظة إضافية: ورد تناقض عددي طفيف في `HYDROGEN_PHASE2_DESIGN.txt:76, 72` حيث يذكر "22 اختباراً" بينما القائمة المرقمة تحوي **21 بنداً** (1، 1A، 1B، 2، 3، 4، 5، 6، 6B، 7، 8، 9، 10، 10B، 11، 12، 13، 14، 15، 16، 17).
+
+================================================================================
+القسم 9: تصنيف الملاحظات حسب الخطورة (Critical / High / Medium / Low)
+================================================================================
+9.1 ملاحظات حرجة (CRITICAL):
+- [C1 — الشيفرة الحالية] غياب أي حاجز كتابة أو قفل استعادة أو تتبع/تصريف للعمليات الجارية في الشيفرة الفعلية (`container.ts:325`, `indexedDbDatabase.ts:137, 249`, `syncEngine.ts:175-200`, `deviceManager.ts:118-128`).
+- [C2 — التصميم المقترح] ضعف التحقق في مُنشئ `IndexedDbDatabase` (`HYDROGEN_PHASE2_DESIGN.txt:388-414`): دالة `isValidWriteBarrier()` تفحص فقط وجود دالتين بالاسم (`typeof isWriteBlocked === 'function' && typeof assertWriteAllowed === 'function'`)، ما يسمح بتمرير أي كائن وهمي لتجاوز الحاجز دون أي عائق برمجي أو تحذير ESLint.
+
+9.2 ملاحظات عالية الخطورة (HIGH):
+- [H1 — التصميم المقترح] عدم تحديد توقيع وتمرير `RestoreWriteCapability` في `IBackupProvider` و`IndexedDbBackupProvider.restoreBackup()` و`runTransaction()`، وبقاء `container.backupProvider` (`container.ts:47`) مكشوفاً للاستدعاء المباشر بلا قفل وبلا منع حين يكون `isWriteBlocked() === false`.
+- [H2 — التصميم المقترح] تضمين `createUnprotectedIndexedDbForTestsOnly` داخل الملف الإنتاجي `src/infrastructure/storage/indexedDbDatabase.ts` (`lines 438-473`) والاعتماد على `import.meta.env?.PROD` و`NODE_ENV=test` بدلاً من حصر المساعدات الاختبارية خارج `src/` بالكامل.
+- [H3 — التصميم المقترح] تعارض المرحلة 5 و6 مع `operationGate`: إبقاء `gateState = 'RESTORING'` حتى المرحلة 7 بينما تستدعي المرحلتان 5 و6 خدمات `SettingsService`, `SecurityManager`, `DeviceManager`, `SyncEngine`, و`recordAudit` المحروسة بنفس البوابة دون تحديد آلية امتياز داخلية لحائز القفل.
+- [H4 — التصميم المقترح] غياب آلية تصفية/حل أخطاء `'SYNC'` النشطة في `ErrorManager` (`errorManager.ts:16-87`) مقارنةً بالشرط الرابع من `'HEALTHY'` في `HealthMonitor` (`القسم 8.1`)، ما يؤدي إلى بقاء `syncStatus === 'DEGRADED'` للأبد بعد أول خطأ `'SYNC'`.
+- [H5 — التصميم المقترح] بقاء `SettingsService.cached` (`settingsService.ts:91`) (وكذلك ذاكرة `SecurityManager`/`DeviceManager`) حاملة لبيانات ما قبل الاستعادة عند فشل التحديث بعد الالتزام (`reloadSettings()`), وعدم معالجة إعادة تشغيل `schedulerParticipant.start()` عندما تكون `connectionServiceEnabled === true` في النسخة المستعادة.
+- [H6 — الشيفرة الحالية والتصميم] `LifecycleManager.shutdown()` (`lifecycleManager.ts:73, 85-93`) يبتلع أخطاء `startPromise` وأخطاء `participant.stop()` ويضبط `phase = 'STOPPED'` قسراً، والتصميم (القسم 7.5) لم يقدّم مواصفة كاملة ولا اختباراً له.
+
+9.3 ملاحظات متوسطة الخطورة (MEDIUM):
+- [M1 — التصميم] عدم توثيق الوصول المباشر لـ `indexedDB.open('nexlink_keystore')` في `WebCryptoProvider` (`webCryptoProvider.ts:140-190`) وتأثيره عند الاستدعاء المتزامن.
+- [M2 — التصميم] عدم تفصيل حماية كتلة `finally` في `SyncEngine.runSyncCycle()` (`syncEngine.ts:1464-1468`) بالـ `opEpoch`، وعدم تفصيل إغلاق `connectTimer` وحراسة `ws.onopen/onclose` بالـ `connectionEpoch` في `RelayTransportClient` (`relayTransportClient.ts:337-420`).
+- [M3 — التصميم والاختبارات] إغفال تحديث `tests/unit/settingsHealthLifecycle.test.ts:161` عند تغيير تبعيات `HealthMonitor`، وإغفال اختبار وصول إشعار `pairing:*` أو طفرات `AppContainer` المتعددة أثناء الاستعادة، وخطر `onupgradeneeded` (`indexedDbDatabase.ts:85-107`) إذا لم تُفتح القاعدة مسبقاً.
+- [M4 — الشيفرة الحالية] تكرار نص `syncEngineRestartFailed` في `ActionModal.tsx:283` + `container.ts:193`، وعرض `statusMessage` و`errorMessage` متزامنين (`ActionModal.tsx:1294-1310`)، وغياب تعطيل الطفرات عبر `DashboardView`/`NotificationHistoryView`/`NotificationAppSelectionView`/`TopBar`.
+
+9.4 ملاحظات منخفضة الخطورة (LOW):
+- [L1 — التوثيق] عدم تطابق العدد المعلن في العنوان ("22 اختباراً" في `HYDROGEN_PHASE2_DESIGN.txt:76, 72`) مع عدد البنود الفعلية (21 بنداً في القسم 11).
+- [L2 — التوثيق] عدم وضوح موضع `createUnprotectedIndexedDbForTestsOnly` هل هو في `indexedDbDatabase.ts` (سطر 438) أم في `tests/helpers/` (احتمال المذكور في سطر 245).
+
+================================================================================
+القسم 10: الأسئلة غير المحلولة وفجوات التصميم الواجب حسمها قبل 2A
+================================================================================
+1. كيف ستُحصّن `IndexedDbDatabase` مُنشئها ضد تمرير كائنات حاجز مقلَّدة (`{ isWriteBlocked, assertWriteAllowed }`) بدلاً من التحقق الشكلي الضعيف؟ (مثلاً: تصدير `IDatabaseWriteBarrier` كصنف/رمز موثَّق أو قفل إنشاء المصنع الاختباري خارج `src/` عبر symbol خاص غير مصدر؟)
+2. ما التوقيع الدقيق لـ `IBackupProvider.restoreBackup()` و`IndexedDbBackupProvider.restoreBackup()` و`IndexedDbDatabase.runTransaction()` لتمرير `RestoreWriteCapability`؟ وكيف يُمنع استدعاء `container.backupProvider.restoreBackup()` مباشرة من خارج `RestoreCoordinator` (أو يُجبر على طلب قدرة صالحة أو إزالة تعريض `backupProvider.restoreBackup` على الواجهة العامة؟)
+3. كيف تفرّق الخدمات (`SyncEngine.start()`, `DeviceManager.start()`, `SettingsService.initialize()`, `SecurityManager.initialize()`, `SecurityManager.recordAudit()`) في المرحلتين 5 و6 بين العمليات المصرح بها داخلياً لاستعادة النظام وبين الطلبات الخارجية/الواجهة الممنوعة طوال بقاء `gateState === 'RESTORING'`؟
+4. كيف تُبطَل أو تُحدَّث ذاكرة `SettingsService.cached` و`SecurityManager.auditCache` و`DeviceManager.linkedDevices` عند فشل إعادة التحميل بعد التزام معاملة IndexedDB حتى لا تخدم `getSnapshot()` قيماً ما قبل الاستعادة؟
+5. كيف يُتعامل مع `connectionServiceEnabled: true` المستعاد من نسخة احتياطية عند تشغيل `schedulerParticipant.start()` في المرحلة 6؟
+6. ما الآلية الدقيقة في `ErrorManager` لتمييز أخطاء `'SYNC'` النشطة عن الأخطاء التاريخية التي تلتها دورة مزامنة ناجحة حتى لا يعلق `HealthMonitor` على `'DEGRADED'`؟
+7. ما السلوك الدقيق المطلوب في `LifecycleManager.shutdown()` إذا فشل `participant.stop()` (خصوصاً `BACKUP_RESTORE_DRAIN_TIMEOUT`)؟ هل ينتقل إلى `'ERROR'` ويرمي الخطأ بدلاً من `'STOPPED'`؟
+
+================================================================================
+القسم 11: القرار النهائي للتدقيق (FINAL VERDICT)
+================================================================================
+**NOT APPROVED — DESIGN REQUIRES CORRECTION**
+
+سبب القرار بالأدلة:
+على الرغم من أن البنية المعمارية المستهدفة للمرحلة الثانية (تسلسل المراحل السبع، وإصلاح
+`InFlightTracker`، وربط القدرة بـ `WeakMap` + `symbol`، والشروط الستة لـ `HealthMonitor`) تسير
+في الاتجاه الهندسي الصحيح، فإن:
+1. الشيفرة الإنتاجية الحالية لم تُعدَّل بعد ولا تطبق أي جزء من عزل الاستعادة أو حاجز الكتابة.
+2. وثيقة التصميم نفسها (`HYDROGEN_PHASE2_DESIGN.txt` + `HYDROGEN_PHASE2_DESIGN_REVIEW.txt`)
+   تحتوي ثغرات وفجوات تنفيذية حرجة وعالية في المرحلة 2A وما بعدها — أبرزها إمكانية تجاوز
+   مُنشئ `IndexedDbDatabase` بكائن حاجز مقلَّد (`isValidWriteBarrier`)، وغياب مسار وتفويض
+   `RestoreWriteCapability` داخل `IBackupProvider`/`IndexedDbBackupProvider` وبقاء
+   `backupProvider.restoreBackup()` مكشوفاً دون قفل، وتضمين دالة التجاوز الاختبارية داخل `src/`،
+   وتعارض `operationGate` مع المرحلتين 5–6، وغياب آلية حل أخطاء `'SYNC'` في `ErrorManager`،
+   وعدم معالجة إبطال `SettingsService.cached` وعقد `LifecycleManager.shutdown()`.
+
+التصحيحات المطلوبة تحديداً قبل إجازة المرحلة 2A:
+1. استبدال `isValidWriteBarrier` الشكلي بتحقق غير قابل للتقليد في `IndexedDbDatabase`، ونقل أي
+   خيار اختباري غير محمي إلى `tests/helpers/` خارج `src/` و`dist/`.
+2. إغلاق ثغرة `container.backupProvider.restoreBackup()` وتحديد عقد تمرير `RestoreWriteCapability`
+   والتحقق منها داخل `IndexedDbBackupProvider.restoreBackup()` و`runTransaction()`.
+3. حل تعارض `operationGate` أثناء استئناف المرحلتين 5 و6، وتحديد إبطال الكاش في `SettingsService`
+   وآلية معالجة `connectionServiceEnabled` بعد الاستعادة.
+4. تحديد آلية الأخطاء النشطة في `ErrorManager`، وعقد `LifecycleManager.shutdown()`، وحماية `finally`
+   في `SyncEngine.runSyncCycle()`، وإكمال تغطية الاختبارات للفجوات المذكورة في القسم 8.
+
+================================================================================
+نهاية تقرير التدقيق الهندسي النهائي — بانتظار المراجعة المستقلة وتوجيهات المستخدم
+================================================================================
